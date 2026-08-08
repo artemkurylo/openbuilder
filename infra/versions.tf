@@ -7,7 +7,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.60"
+      version = "~> 6.23"
     }
   }
 
@@ -34,6 +34,12 @@ terraform {
   #   3. Run `terraform init -migrate-state` and answer "yes" when it offers to
   #      copy the existing local state up.
   #   4. Delete the local `terraform.tfstate*` files afterwards.
+  #
+  # CAUTION if you authenticate with `aws login`: Terraform's own S3 backend does
+  # not read those credentials (hashicorp/terraform#37976) even though the AWS
+  # provider does. Enabling this block would leave `plan`/`apply` working while
+  # state access fails. Until that lands, either stay on the local backend or use
+  # a static access-key profile for the backend.
   #
   # backend "s3" {
   #   bucket         = "openbuilder-tfstate-REPLACE_ME"

@@ -71,26 +71,55 @@ brew install --cask session-manager-plugin        # macOS
 Use a **dedicated profile** for this project. Do not rely on whatever `AWS_PROFILE` your shell happens
 to export — that is frequently a work SSO profile for an unrelated account, and Terraform obeys it.
 
-`aws configure sso` is for IAM Identity Center, which most personal accounts do not have; if the only
-SSO start URL you own belongs to an employer, that is the wrong account for this. For a personal
-account, create an IAM user and use a static key:
+`aws configure sso` is **not** the command you want: that is for IAM Identity Center, which most
+personal accounts do not have. If the only SSO start URL on your machine belongs to an employer, it
+points at exactly the account this must not deploy into.
 
-1. Console → **IAM → Users → Create user**, name it `openbuilder-deploy`. Do not give it console access.
-2. **Attach policies directly.** This module creates a VPC, an EC2 instance, an IAM role and instance
-   profile, four SSM parameters and a budget, so it needs `AdministratorAccess`, or
-   `PowerUserAccess` **plus** `IAMFullAccess` (power user alone cannot create the instance role).
-   `AdministratorAccess` on a personal sandbox account is the pragmatic choice; scope it down later
-   from the actual CloudTrail calls if you care.
-3. Open the user → **Security credentials → Create access key → Command Line Interface (CLI)**.
-4. Configure the profile, entering the key, the secret, `eu-central-1`, and `json`:
+##### Recommended: `aws login`, no stored secret
 
-```sh
-aws configure --profile openbuilder-deploy
-aws sts get-caller-identity --profile openbuilder-deploy      # confirm the account id is yours
+AWS CLI 2.32.0+ can mint temporary credentials from a browser sign-in and refresh them automatically,
+so no long-lived access key ever lands on disk. This module requires `hashicorp/aws` **>= 6.23.0** for
+it, which is what `versions.tf` pins — support was added in that release.
+
+1. Console → **IAM → Users → Create user**, `openbuilder-deploy`, **with** console access (you sign in
+   as this user in the browser).
+2. **Attach policies directly:** `AdministratorAccess` **and** `SignInLocalDevelopmentAccess`.
+   The second is what permits `aws login` itself; the first is because this module creates a VPC, an
+   EC2 instance, an IAM role and instance profile, four SSM parameters and a budget.
+   `PowerUserAccess` is *not* enough — it cannot create the instance role. Signing in as the account
+   root needs no extra policy, but prefer the IAM user.
+3. Declare the profile in `~/.aws/config`, naming that user's ARN:
+
+```ini
+[profile openbuilder-deploy]
+login_session = arn:aws:iam::<your-account-id>:user/openbuilder-deploy
+region        = eu-central-1
 ```
 
-Then put that profile name in **two** places, so neither Terraform nor the CLI can wander into
-another account: `aws_profile` in `infra/terraform.tfvars`, and `OPENBUILDER_AWS_PROFILE` in
+4. Sign in and confirm the account:
+
+```sh
+aws login --profile openbuilder-deploy
+aws sts get-caller-identity --profile openbuilder-deploy   # must be YOUR account id
+```
+
+The session lasts up to 12 hours; re-run `aws login` when it lapses, and `aws logout --profile
+openbuilder-deploy` to end it early. Tokens are cached in `~/.aws/login/cache/`, never in
+`~/.aws/credentials`. A `terraform apply` running longer than the session will fail on expiry — not a
+concern here, since this module applies in a couple of minutes.
+
+##### Fallback: static access key
+
+If you would rather not use `aws login`, create the same user without console access, skip
+`SignInLocalDevelopmentAccess`, then **Security credentials → Create access key → CLI** and run
+`aws configure --profile openbuilder-deploy`, answering with the key, the secret, `eu-central-1` and
+`json`. This works with any provider version. The tradeoff is a long-lived secret sitting in
+`~/.aws/credentials`, which is precisely what the console warns you about.
+
+##### Either way
+
+Put the profile name in **two** places, so neither Terraform nor the CLI can wander into another
+account: `aws_profile` in `infra/terraform.tfvars`, and `OPENBUILDER_AWS_PROFILE` in
 `.openbuilder.local`.
 
 Your laptop separately needs Amazon Bedrock access to `us.anthropic.claude-opus-5`, because the planner

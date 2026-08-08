@@ -54,7 +54,7 @@ data "aws_iam_policy_document" "instance" {
     ]
 
     resources = [
-      "arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:parameter${var.ssm_prefix}/*",
+      "arn:aws:ssm:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:parameter${var.ssm_prefix}/*",
     ]
   }
 
@@ -70,7 +70,7 @@ data "aws_iam_policy_document" "instance" {
     condition {
       test     = "StringEquals"
       variable = "kms:ViaService"
-      values   = ["ssm.${data.aws_region.current.name}.amazonaws.com"]
+      values   = ["ssm.${data.aws_region.current.region}.amazonaws.com"]
     }
   }
 
