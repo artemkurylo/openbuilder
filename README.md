@@ -49,15 +49,53 @@ Everything below is copy-pasteable. Replace `you/your-repo` with the repo you wa
 
 | Tool | Minimum | Check |
 |---|---|---|
-| Terraform | `>= 1.9` | `terraform version` |
+| Terraform | `>= 1.6.0` | `terraform version` |
 | AWS CLI | v2 | `aws --version` |
 | GitHub CLI | any recent | `gh auth status` |
 | omp | `17.2.11` | `omp --version` |
-| An AWS account | — | `aws sts get-caller-identity` |
+| `jq` | 1.6+ | `jq --version` |
+| `git` | any recent | `git --version` |
+| Session Manager plugin | any | `session-manager-plugin --version` |
+| An AWS account | — | see below |
 | An OpenRouter API key | — | https://openrouter.ai/keys |
 
-Your laptop also needs Amazon Bedrock access to `us.anthropic.claude-opus-5` in the region you use for
-Bedrock, because the planner and reviewer run locally against that model.
+The Session Manager plugin is what makes `openbuilder shell` work; without it every other subcommand
+still functions, because they use `ssm send-command` rather than an interactive session.
+
+```sh
+brew install --cask session-manager-plugin        # macOS
+```
+
+#### AWS credentials for the deploy
+
+Use a **dedicated profile** for this project. Do not rely on whatever `AWS_PROFILE` your shell happens
+to export — that is frequently a work SSO profile for an unrelated account, and Terraform obeys it.
+
+`aws configure sso` is for IAM Identity Center, which most personal accounts do not have; if the only
+SSO start URL you own belongs to an employer, that is the wrong account for this. For a personal
+account, create an IAM user and use a static key:
+
+1. Console → **IAM → Users → Create user**, name it `openbuilder-deploy`. Do not give it console access.
+2. **Attach policies directly.** This module creates a VPC, an EC2 instance, an IAM role and instance
+   profile, four SSM parameters and a budget, so it needs `AdministratorAccess`, or
+   `PowerUserAccess` **plus** `IAMFullAccess` (power user alone cannot create the instance role).
+   `AdministratorAccess` on a personal sandbox account is the pragmatic choice; scope it down later
+   from the actual CloudTrail calls if you care.
+3. Open the user → **Security credentials → Create access key → Command Line Interface (CLI)**.
+4. Configure the profile, entering the key, the secret, `eu-central-1`, and `json`:
+
+```sh
+aws configure --profile openbuilder-deploy
+aws sts get-caller-identity --profile openbuilder-deploy      # confirm the account id is yours
+```
+
+Then put that profile name in **two** places, so neither Terraform nor the CLI can wander into
+another account: `aws_profile` in `infra/terraform.tfvars`, and `OPENBUILDER_AWS_PROFILE` in
+`.openbuilder.local`.
+
+Your laptop separately needs Amazon Bedrock access to `us.anthropic.claude-opus-5`, because the planner
+and reviewer run locally against that model. That is a different account and region from the instance,
+and it keeps using your normal `AWS_PROFILE`/`AWS_REGION` — the CLI never touches those.
 
 ### 1. Get this repo onto GitHub
 
