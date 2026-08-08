@@ -68,7 +68,13 @@ app_jwt() {
   printf '%s.%s' "$signing_input" "$signature"
 }
 
-# write_cache <response-json> — store {token, expires_at} at mode 0600, atomically.
+# write_cache <response-json> — store the token, its expiry and the grants that
+# came with it, at mode 0600, atomically.
+#
+# `permissions` is kept because it is the only authoritative statement of what
+# this installation may do. `GET /repos/{owner}/{repo}` answers an installation
+# token with a permissions block that is all false: that field describes a USER
+# role, and an App token has no user. Consumers must read the grants from here.
 write_cache() {
   local response="$1" cache tmp
   cache="${OPENBUILDER_HOME}/cache/gh-token.json"
@@ -76,7 +82,9 @@ write_cache() {
   (
     umask 077
     printf '%s' "$response" |
-      jq -c '{token:.token, expires_at:.expires_at}' >"$tmp"
+      jq -c '{token:.token, expires_at:.expires_at,
+              permissions:(.permissions // {}),
+              repository_selection:(.repository_selection // "unknown")}' >"$tmp"
   )
   chmod 0600 "$tmp"
   mv -f "$tmp" "$cache"

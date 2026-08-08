@@ -104,21 +104,30 @@ check_github() {
 
 check_repos() {
   local -a repos=()
-  local repo push branch
+  local repo branch
   mapfile -t repos < <(ob_repos)
   if ((${#repos[@]} == 0)); then
     check "repos: configured" FAIL "OPENBUILDER_REPOS is empty"
     return 0
   fi
+  # An installation token has no user, so `GET /repos/{owner}/{repo}` answers
+  # with a permissions block that is entirely false — it reports a USER role,
+  # not an App grant. Checking `.permissions.push` there reported every repo as
+  # unwritable on a correctly configured installation. The authoritative pair is
+  # (a) the repo answers with the installation token, and (b) the installation
+  # itself was granted contents:write, which ob-token records in its cache.
+  local contents
+  contents="$(jq -r '.permissions.contents // empty' \
+    <"${OPENBUILDER_HOME}/cache/gh-token.json" 2>/dev/null || printf '')"
   for repo in "${repos[@]}"; do
-    push="$(ob_gh api "repos/${repo}" --jq '.permissions.push // false' 2>/dev/null || printf '')"
-    if [[ "$push" == "true" ]]; then
-      branch="$(ob_default_branch "$repo" 2>/dev/null || printf '?')"
-      check "repo: ${repo}" PASS "writable, default branch ${branch}"
-    elif [[ "$push" == "false" ]]; then
-      check "repo: ${repo}" FAIL "reachable but the App has no push permission"
-    else
+    if ! ob_gh api "repos/${repo}" --jq '.full_name' >/dev/null 2>&1; then
       check "repo: ${repo}" FAIL "not reachable with the App installation token"
+    elif [[ "$contents" != "write" ]]; then
+      check "repo: ${repo}" FAIL \
+        "reachable, but the App grants contents=${contents:-none}; needs write"
+    else
+      branch="$(ob_default_branch "$repo" 2>/dev/null || printf '?')"
+      check "repo: ${repo}" PASS "writable (contents=write), default branch ${branch}"
     fi
   done
 }
