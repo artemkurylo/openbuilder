@@ -307,7 +307,7 @@ sudo -u openbuilder bash -lc '
 
   ```sh
   aws ssm put-parameter --overwrite --name /openbuilder/openrouter_api_key \
-    --type SecureString --value 'sk-or-v1-REPLACE_ME' --region us-east-1
+    --type SecureString --value 'sk-or-v1-REPLACE_ME' --region eu-central-1
   ```
 
 - `402` / a zero balance — top up at <https://openrouter.ai/credits>.
@@ -403,11 +403,17 @@ sudo cat /opt/openbuilder/etc/openbuilder.env
 Every line must be `KEY=value`, no `export`, no stray quotes. If it is wrong, fix
 `infra/terraform.tfvars` and `make apply` — the file is rendered by cloud-init from Terraform vars.
 
-Run one pass in the foreground to see what it decides:
+Run one pass in the foreground to see what it decides. `--dry-run` prints one
+`DECISION repo=... slug=... rule=<n> action=... reason=...` line per slug and a final `ACTIONABLE=<n>`,
+and takes no action:
 
 ```sh
 sudo -u openbuilder /opt/openbuilder/bin/ob-poll --dry-run
 ```
+
+`ACTIONABLE=0` with a plan branch you expected to be picked up means a refusal rule matched — read the
+`rule=` number against the table in [architecture.md](architecture.md#2-the-state-machine). The common
+answers are rule 2/3 (an `approved` or `blocked` label you forgot about) and rule 4 (attempts capped).
 
 ## 10. Disk full
 
@@ -475,8 +481,17 @@ sudo resize2fs /dev/nvme0n1p1
 
 ## 11. Reading the logs
 
-**Operational log** — one append-only file, ISO-8601 UTC timestamps, secrets redacted
-(`sk-or-`, `ghs_`, `github_pat_`, PEM bodies):
+**Operational log** — `/opt/openbuilder/log/openbuilder.log`. One strictly append-only file (every writer
+uses `>>`), ISO-8601 UTC timestamps, and everything passes through the redactor (`sk-or-`, `ghs_`,
+`github_pat_`, PEM bodies) — so it is safe to paste into a ticket as-is. Nothing rotates or recreates it;
+no logrotate config is installed.
+
+**An idle box writes nothing to it, and that is healthy.** Uneventful poll passes and routine "not idle
+yet" checks go to the journal only. This is deliberate, not an oversight: `ob-idle-stop`'s third idle
+condition measures this file's mtime, so a chatty logger would keep the instance awake forever and defeat
+auto-stop. Silence here means no work happened — use `journalctl` for the noisy view. Do not "fix" it by
+adding heartbeat logging, and if you ever trim it, rotate rather than truncate in place
+([§10](#10-disk-full)).
 
 ```sh
 openbuilder logs                 # tail it over SSM
@@ -493,14 +508,27 @@ grep -F '<slug>' /opt/openbuilder/log/openbuilder.log
 grep -E 'ERROR|WARN'  /opt/openbuilder/log/openbuilder.log | tail -50
 ```
 
-**Per-job omp transcript** — `state/<key>/run.ndjson`, one JSON object per line, `.type` in
-`session|agent_start|turn_start|message_start|message_update|message_end|turn_end|agent_end`:
+**Per-round forensics** — `/opt/openbuilder/state/<key>/rounds/<NNN>/`, one directory per round actually
+run, each holding:
+
+| File | Contents |
+|---|---|
+| `prompt.md` | exactly what the model was given, after `{{PLACEHOLDER}}` substitution |
+| `run.ndjson` | the full NDJSON, one JSON object per line, `.type` in `session\|agent_start\|turn_start\|message_start\|message_update\|message_end\|turn_end\|agent_end` |
+| `final.md` | the agent's own report — the extracted final assistant text |
+| `feedback.md` | the review comments and threads fed in (respond rounds only) |
+| `pr-body.md` | the PR body as posted |
+
+`prompt.md` next to `final.md` is the highest-signal pair in the whole system: it is exactly what you
+asked for and exactly what you got. Read those before touching the NDJSON.
 
 ```sh
 openbuilder shell
-cd /opt/openbuilder/state/<key>
+cd "$(sudo -u openbuilder bash -lc 'ls -d /opt/openbuilder/state/<key>/rounds/*/ | tail -1')"
+cat final.md
+cat prompt.md
 
-# what the agent finally said
+# the same text, straight from the NDJSON — use this if final.md is missing
 jq -rs 'map(select(.type=="agent_end"))|last|.messages|map(select(.role=="assistant"))|last
         |.content|map(select(.type=="text"))|map(.text)|join("\n")' run.ndjson
 
@@ -520,12 +548,22 @@ Cost across every job on the box:
 openbuilder cost
 ```
 
-**systemd journal** — for the wrapper, not the agent:
+**systemd journal** — the per-decision view, and the only place uneventful passes appear. `ob-poll` prints
+one line per slug plus a total:
 
 ```sh
 sudo journalctl -u openbuilder-poll.service  --since '2 hours ago' --no-pager
 sudo journalctl -u openbuilder-idle.service  --since '1 day ago'   --no-pager
+
+# just the decisions
+sudo journalctl -u openbuilder-poll.service --since today --no-pager | grep -E 'DECISION|ACTIONABLE'
 ```
+
+A decision line looks like
+`DECISION repo=you/your-repo slug=healthz-endpoint rule=7 action=skip reason=<...>`, and each pass ends
+with `ACTIONABLE=<n>`. That `rule=` number maps straight onto the state-machine table in
+[architecture.md](architecture.md#2-the-state-machine), so it tells you exactly why the box did or did not
+act — which is usually the answer to "why is nothing happening".
 
 ## 12. Re-run a single job by hand
 
@@ -691,4 +729,6 @@ omp --version
 | Update the box | `sudo -u openbuilder /opt/openbuilder/bin/ob-selfupdate` |
 | Hand the PR back to the box | `openbuilder request-changes you/your-repo <pr>` |
 | Tell the box to stop touching a PR | `openbuilder approve you/your-repo <pr>` |
-| Reset attempts | `sudo -u openbuilder rm -f /opt/openbuilder/state/<key>/attempts` |
+| Reset attempts | `printf '0\n' \| sudo -u openbuilder tee /opt/openbuilder/state/<key>/attempts` then `rm -f .../blocked-reported` |
+| Read the newest round's report | `cat /opt/openbuilder/state/<key>/rounds/*/final.md \| tail -40` |
+| Why did the poller skip my slug? | `sudo journalctl -u openbuilder-poll.service --since today \| grep DECISION` |

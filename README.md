@@ -104,15 +104,18 @@ This runs `terraform init` in `infra/` and creates `infra/terraform.tfvars` from
 Open `infra/terraform.tfvars` and set at minimum:
 
 ```hcl
-region             = "us-east-1"
+region             = "eu-central-1"
 repos              = ["you/your-repo"]
 control_repo       = "artemkurylo/openbuilder"
 budget_alert_email = "you@example.com"
 ```
 
 `repos` is the allowlist. The box will only ever look at plan branches in these repositories, and the
-App installation token is scoped to them. Everything else has a sane default (`t4g.medium`, 100 GB gp3,
-`/openbuilder` SSM prefix, 45m max runtime, 6 max attempts, 30 min idle stop).
+App installation token is scoped to them. Everything else has a sane default (`t4g.medium`, 40 GiB gp3,
+`/openbuilder` SSM prefix, 45m max runtime, 6 max attempts, 30 min idle stop, `monthly_budget_usd = 20`).
+
+The budget that `budget_alert_email` arms covers **AWS spend only** — OpenRouter bills the model
+separately and the AWS budget can never see it. Set a hard spend limit on the OpenRouter key too.
 
 ### 5. Create the infrastructure
 
@@ -135,16 +138,16 @@ That prints the exact commands with placeholders. Run them with your real values
 
 ```sh
 aws ssm put-parameter --overwrite --name /openbuilder/openrouter_api_key \
-  --type SecureString --value 'sk-or-v1-REPLACE_ME' --region us-east-1
+  --type SecureString --value 'sk-or-v1-REPLACE_ME' --region eu-central-1
 
 aws ssm put-parameter --overwrite --name /openbuilder/github_app_id \
-  --type String --value 'REPLACE_ME' --region us-east-1
+  --type String --value 'REPLACE_ME' --region eu-central-1
 
 aws ssm put-parameter --overwrite --name /openbuilder/github_app_installation_id \
-  --type String --value 'REPLACE_ME' --region us-east-1
+  --type String --value 'REPLACE_ME' --region eu-central-1
 
 aws ssm put-parameter --overwrite --name /openbuilder/github_app_private_key \
-  --type SecureString --value "$(cat ~/Downloads/openbuilder-bot.private-key.pem)" --region us-east-1
+  --type SecureString --value "$(cat ~/Downloads/openbuilder-bot.private-key.pem)" --region eu-central-1
 ```
 
 Nothing secret is ever written to `/opt/openbuilder/etc/openbuilder.env`. The runner fetches these with
@@ -155,10 +158,18 @@ Nothing secret is ever written to `/opt/openbuilder/etc/openbuilder.env`. The ru
 ```sh
 cat > .openbuilder.local <<'EOF'
 OPENBUILDER_INSTANCE_ID=i-REPLACE_ME
-OPENBUILDER_REGION=us-east-1
+OPENBUILDER_REGION=eu-central-1
 OPENBUILDER_TARGET_REPO=you/your-repo
+# Only needed when your shell's AWS_PROFILE points somewhere else — e.g. at an
+# account that just serves the local planner/reviewer model. EC2/SSM calls for
+# the box use this profile; the local `omp` session is left completely alone.
+OPENBUILDER_AWS_PROFILE=your-personal-profile
 EOF
 ```
+
+The CLI deliberately ignores `AWS_REGION` and `AWS_DEFAULT_REGION` when deciding where the box lives:
+those belong to your local model provider and are frequently a different region entirely. Only
+`OPENBUILDER_REGION`, the cached value, or the `region` Terraform output can set it.
 
 `terraform output instance_id` (or the tail of `make apply`) gives you the instance id. Then put the CLI
 on your `PATH`:
@@ -271,22 +282,30 @@ per-slug lock, so parallel plan branches make progress round-robin instead of st
 
 ## What it costs
 
-Approximate `us-east-1` on-demand pricing, 730 hours/month. AWS prices are approximate and
-region-dependent; see [docs/cost.md](docs/cost.md) for the full arithmetic.
+Approximate `eu-central-1` on-demand pricing, 730 hours/month. The `t4g.medium` hourly rate is verified
+against AWS's published EU (Frankfurt) pricing; the gp3 rate is **approximate and unverified**. See
+[docs/cost.md](docs/cost.md) for the full arithmetic.
 
 | Item | Assumption | Monthly (approx.) |
 |---|---|---|
-| EC2 `t4g.medium`, always on | 730 h @ ~$0.0336/h | ~$24.53 |
-| EC2 `t4g.medium`, idle auto-stop | 240 h @ ~$0.0336/h | ~$8.06 |
+| EC2 `t4g.medium`, always on | 730 h @ $0.0384/h (verified) | ~$28.03 |
+| EC2 `t4g.medium`, idle auto-stop | 240 h @ $0.0384/h (verified) | ~$9.22 |
 | Public IPv4 address | ~$0.005/h while running, 240 h | ~$1.20 |
-| EBS 100 GB gp3 | ~$0.08/GB-month, billed while stopped | ~$8.00 |
+| EBS 40 GiB gp3 | ~$0.095/GB-month (approximate), billed 24/7 while stopped | ~$3.80 |
 | DeepSeek V4 Flash tokens | 20 stories @ 350k in / 45k out | ~$0.79 |
 | SSM Session Manager, Parameter Store (standard), KMS, CloudWatch metrics | — | ~$0.00 |
-| **Total with idle auto-stop** (8 h/day awake) | | **~$18.05/mo** |
-| **Total always-on** (730 h) | | **~$36.97/mo** |
+| **Total with idle auto-stop** (8 h/day awake, assumed) | 240 h | **~$15.01/mo** |
+| **Total always-on** (730 h) | 730 h | **~$36.27/mo** |
 
 The model is not the expensive part. The instance is — which is why idle auto-stop exists, and why
-there is no NAT gateway (~$32/mo) or interface endpoint pair (~$22/mo) in the design.
+there is no NAT gateway (~$32/mo) or interface endpoint pair (~$22/mo) in the design. The gp3 volume is
+the one line auto-stop cannot touch: $3.80/month whether the box runs or not, which is the whole bill of
+a stopped month.
+
+The default `monthly_budget_usd = 20` is enough for an auto-stopping box (~$14.22 of AWS spend, 71% of
+budget, so the 80% alert at $16 never fires) and **not** enough always-on (~$35.48 of AWS spend). Either
+way the budget covers **AWS spend only** — the DeepSeek tokens are billed by OpenRouter and are invisible
+to it.
 
 ## Repo layout
 
@@ -316,13 +335,19 @@ Full playbook in [docs/runbook.md](docs/runbook.md). The fast table:
 |---|---|---|
 | `openbuilder dispatch` pushed but no PR after 5 min | box stopped, or poll timer not firing | `openbuilder status` then `openbuilder start`, then `openbuilder shell` and `systemctl list-timers 'openbuilder-*'` |
 | PR stuck on `openbuilder:in-progress` | job died mid-run, stale lock, or `OPENBUILDER_MAX_RUNTIME` hit | `openbuilder logs` then `openbuilder shell` and `ls -l /opt/openbuilder/run/` |
-| `openbuilder:blocked` appeared | max attempts reached, or a hard failure — reason is in the PR comment | `gh pr view <pr> --repo you/your-repo --comments` |
+| `openbuilder:blocked` appeared | max attempts reached, or a hard failure — the reason is in a PR comment, or in a `openbuilder blocked: <slug>` issue if it failed before the PR existed | `gh pr view <pr> --repo you/your-repo --comments` |
 | No commits, agent "explained" instead | story card was ambiguous; the agent is told to stop rather than guess | read `.openbuilder/backlog/<slug>/worklog.md` on the work branch, tighten the card, re-dispatch |
 | `gh` calls fail with 401 | App token expired or the App is not installed on that repo | `openbuilder shell` then `sudo -u openbuilder /opt/openbuilder/bin/ob-doctor` |
 | omp exits instantly, no tokens spent | bad or out-of-credit `OPENROUTER_API_KEY` (429 / 402) | `openbuilder doctor`, then re-put `/openbuilder/openrouter_api_key` |
 | Box never stops, bill keeps growing | idle timer not firing, or work is genuinely queued | `openbuilder shell` then `sudo -u openbuilder /opt/openbuilder/bin/ob-poll --dry-run` |
 | Disk full, git operations fail | accumulated worktrees, caches and `run.ndjson` files | `openbuilder shell` then `df -h /opt/openbuilder` |
 | Box running old scripts after a control-repo push | box has not self-updated | `openbuilder shell` then `sudo -u openbuilder /opt/openbuilder/bin/ob-selfupdate` |
+
+One thing that looks like a fault and is not: **`openbuilder logs` is empty on an idle box.** Only real
+work writes to `/opt/openbuilder/log/openbuilder.log`; uneventful poll passes go to the journal only, on
+purpose, because idle auto-stop watches that file's mtime. For the noisy per-decision view use
+`openbuilder shell` and
+`sudo journalctl -u openbuilder-poll.service --since today | grep DECISION`.
 
 ## Where to read next
 

@@ -11,8 +11,16 @@
 #                             If unset, falls back to
 #                             `terraform -chdir=infra output -raw instance_id`
 #                             and caches the answer.
-#   OPENBUILDER_REGION        AWS region. Falls back to AWS_REGION,
-#                             AWS_DEFAULT_REGION, then the `region` TF output.
+#   OPENBUILDER_REGION        Region the box lives in. Falls back to the cached
+#                             value, then the `region` TF output, then
+#                             eu-central-1. Deliberately ignores AWS_REGION:
+#                             that variable belongs to your local model
+#                             provider and is usually a different region.
+#   OPENBUILDER_AWS_PROFILE   Profile used for EC2/SSM calls against the box.
+#                             Set this when your ambient AWS_PROFILE points at
+#                             a different account (e.g. one that only serves
+#                             the local planner/reviewer model). Unset means
+#                             "use whatever the environment already has".
 #   OPENBUILDER_TARGET_REPO   Default <owner>/<repo> for `status`.
 #   OPENBUILDER_WORKSPACE     Where target repos are cloned.
 #                             Default: $HOME/.openbuilder/repos
@@ -91,6 +99,7 @@ ob_load_local_config() {
     local saved_region=${OPENBUILDER_REGION:-}
     local saved_repo=${OPENBUILDER_TARGET_REPO:-}
     local saved_workspace=${OPENBUILDER_WORKSPACE:-}
+    local saved_profile=${OPENBUILDER_AWS_PROFILE:-}
     local candidate previous=''
 
     for candidate in "$PWD/.openbuilder.local" "$OB_ROOT/.openbuilder.local"; do
@@ -107,11 +116,13 @@ ob_load_local_config() {
     [[ -n $saved_region ]] && OPENBUILDER_REGION=$saved_region
     [[ -n $saved_repo ]] && OPENBUILDER_TARGET_REPO=$saved_repo
     [[ -n $saved_workspace ]] && OPENBUILDER_WORKSPACE=$saved_workspace
+    [[ -n $saved_profile ]] && OPENBUILDER_AWS_PROFILE=$saved_profile
 
     OPENBUILDER_INSTANCE_ID=${OPENBUILDER_INSTANCE_ID:-}
     OPENBUILDER_REGION=${OPENBUILDER_REGION:-}
     OPENBUILDER_TARGET_REPO=${OPENBUILDER_TARGET_REPO:-}
     OPENBUILDER_WORKSPACE=${OPENBUILDER_WORKSPACE:-$HOME/.openbuilder/repos}
+    OPENBUILDER_AWS_PROFILE=${OPENBUILDER_AWS_PROFILE:-}
     return 0
 }
 
@@ -121,25 +132,72 @@ ob_tf_output() {
     [[ -d $OB_ROOT/infra ]] || return 1
     value=$(terraform -chdir="$OB_ROOT/infra" output -raw "$name" 2>/dev/null) || return 1
     [[ -n $value ]] || return 1
+    # Before the first apply, `terraform output -raw` prints a multi-line
+    # "No outputs found" warning on STDOUT and still exits 0. Treating that as a
+    # value produced a malformed --region on every aws call, so reject anything
+    # containing whitespace: no output this CLI reads is ever multi-word.
+    [[ $value != *[[:space:]]* ]] || return 1
     printf '%s\n' "$value"
 }
 
+# Where the BOX lives. Deliberately NOT derived from AWS_REGION or
+# AWS_DEFAULT_REGION: those describe the account and region serving the LOCAL
+# planner/reviewer model (a Bedrock account in another region, for instance), and
+# leaking them here would send every SSM/EC2 call hunting for the instance in the
+# wrong region. Only an explicit OPENBUILDER_REGION, the cache, or the Terraform
+# output may decide this.
+ob_is_region() {
+    [[ $1 =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]]
+}
+
 ob_region() {
-    if [[ -z $OPENBUILDER_REGION ]]; then
-        OPENBUILDER_REGION=${AWS_REGION:-${AWS_DEFAULT_REGION:-}}
+    local candidate=''
+
+    # An explicit setting wins, but a malformed one is an operator mistake worth
+    # shouting about rather than silently papering over with the default.
+    if [[ -n $OPENBUILDER_REGION ]]; then
+        ob_is_region "$OPENBUILDER_REGION" ||
+            ob_die "OPENBUILDER_REGION is not a region: '$OPENBUILDER_REGION'"
+        printf '%s\n' "$OPENBUILDER_REGION"
+        return 0
     fi
-    if [[ -z $OPENBUILDER_REGION && -f $OB_CACHE_DIR/region ]]; then
-        OPENBUILDER_REGION=$(<"$OB_CACHE_DIR/region")
+
+    # The cache is validated too: a bad value written once would otherwise be
+    # trusted forever, long after the cause was fixed.
+    if [[ -f $OB_CACHE_DIR/region ]]; then
+        candidate=$(<"$OB_CACHE_DIR/region")
+        ob_is_region "$candidate" || candidate=''
     fi
-    if [[ -z $OPENBUILDER_REGION ]]; then
-        OPENBUILDER_REGION=$(ob_tf_output region || true)
-        if [[ -n $OPENBUILDER_REGION ]]; then
+
+    if [[ -z $candidate ]]; then
+        candidate=$(ob_tf_output region || true)
+        ob_is_region "$candidate" || candidate=''
+        if [[ -n $candidate ]]; then
             mkdir -p "$OB_CACHE_DIR"
-            printf '%s\n' "$OPENBUILDER_REGION" >"$OB_CACHE_DIR/region"
+            printf '%s\n' "$candidate" >"$OB_CACHE_DIR/region"
         fi
     fi
-    [[ -n $OPENBUILDER_REGION ]] || OPENBUILDER_REGION=us-east-1
-    printf '%s\n' "$OPENBUILDER_REGION"
+
+    [[ -n $candidate ]] || candidate=eu-central-1
+    OPENBUILDER_REGION=$candidate
+    printf '%s\n' "$candidate"
+}
+
+# Every AWS call for the box goes through here, explicitly scoped to the box's
+# account and region. The surrounding shell is often pinned to a different
+# profile/region for the local model provider, and that must not bleed into
+# instance management. Set OPENBUILDER_AWS_PROFILE when the box lives in an
+# account other than your ambient AWS_PROFILE.
+ob_aws() {
+    local region
+    region=$(ob_region)
+    if [[ -n ${OPENBUILDER_AWS_PROFILE:-} ]]; then
+        AWS_PROFILE="$OPENBUILDER_AWS_PROFILE" \
+            AWS_REGION="$region" AWS_DEFAULT_REGION="$region" \
+            command aws "$@"
+    else
+        AWS_REGION="$region" AWS_DEFAULT_REGION="$region" command aws "$@"
+    fi
 }
 
 # Resolve the instance id: environment, then cache, then Terraform output.
@@ -156,6 +214,10 @@ ob_instance_id() {
         fi
     fi
     OPENBUILDER_INSTANCE_ID=$(ob_tf_output instance_id || true)
+    # Never cache anything that is not actually an instance id.
+    if [[ ! $OPENBUILDER_INSTANCE_ID =~ ^i-[0-9a-f]{8,}$ ]]; then
+        OPENBUILDER_INSTANCE_ID=''
+    fi
     if [[ -n $OPENBUILDER_INSTANCE_ID ]]; then
         mkdir -p "$OB_CACHE_DIR"
         printf '%s\n' "$OPENBUILDER_INSTANCE_ID" >"$OB_CACHE_DIR/instance-id"
@@ -232,7 +294,7 @@ ob_ssm_exec() {
             Parameters: { commands: [$script] }
         }')
 
-    command_id=$(aws ssm send-command \
+    command_id=$(ob_aws ssm send-command \
         --region "$region" \
         --cli-input-json "$payload" \
         --query 'Command.CommandId' \
@@ -240,7 +302,7 @@ ob_ssm_exec() {
         ob_die "aws ssm send-command failed (is the instance running and SSM-managed? try '$OB_PROG start')"
 
     while :; do
-        json=$(aws ssm list-command-invocations \
+        json=$(ob_aws ssm list-command-invocations \
             --region "$region" \
             --command-id "$command_id" \
             --instance-id "$instance" \
@@ -289,7 +351,7 @@ ob_instance_state() {
     local region instance
     region=$(ob_region)
     instance=$(ob_instance_id)
-    aws ec2 describe-instances \
+    ob_aws ec2 describe-instances \
         --region "$region" \
         --instance-ids "$instance" \
         --query 'Reservations[0].Instances[0].State.Name' \
@@ -300,7 +362,7 @@ ob_ssm_online() {
     local region instance count
     region=$(ob_region)
     instance=$(ob_instance_id)
-    count=$(aws ssm describe-instance-information \
+    count=$(ob_aws ssm describe-instance-information \
         --region "$region" \
         --filters "Key=InstanceIds,Values=$instance" \
         --query 'length(InstanceInformationList[?PingStatus==`Online`])' \
@@ -333,16 +395,16 @@ ob_ensure_running() {
         ;;
     pending)
         ob_info "instance $instance is starting; waiting"
-        aws ec2 wait instance-running --region "$region" --instance-ids "$instance"
+        ob_aws ec2 wait instance-running --region "$region" --instance-ids "$instance"
         ;;
     stopped | stopping)
         if [[ $state == stopping ]]; then
             ob_info "instance $instance is stopping; waiting for it to settle"
-            aws ec2 wait instance-stopped --region "$region" --instance-ids "$instance"
+            ob_aws ec2 wait instance-stopped --region "$region" --instance-ids "$instance"
         fi
         ob_info "starting instance $instance"
-        aws ec2 start-instances --region "$region" --instance-ids "$instance" >/dev/null
-        aws ec2 wait instance-running --region "$region" --instance-ids "$instance"
+        ob_aws ec2 start-instances --region "$region" --instance-ids "$instance" >/dev/null
+        ob_aws ec2 wait instance-running --region "$region" --instance-ids "$instance"
         ;;
     *)
         ob_die "instance $instance is in state '$state'; cannot use it"
@@ -484,7 +546,7 @@ usage: openbuilder <command> [args]
   cost                              per-slug model spend from the box's run.ndjson
   help                              this table
 
-environment: OPENBUILDER_INSTANCE_ID, OPENBUILDER_REGION,
+environment: OPENBUILDER_INSTANCE_ID, OPENBUILDER_REGION, OPENBUILDER_AWS_PROFILE,
              OPENBUILDER_TARGET_REPO, OPENBUILDER_WORKSPACE
              (./.openbuilder.local is sourced when present; it is gitignored)
 EOF
@@ -962,7 +1024,14 @@ cmd_shell() {
     instance=$(ob_instance_id)
     ob_info "opening an SSM session on $instance ($region)"
     printf 'tip: sudo -iu %s, then tail -f %s\n' "$OB_REMOTE_USER" "$OB_REMOTE_LOG" >&2
-    exec aws ssm start-session --region "$region" --target "$instance"
+    # `exec` needs a real binary, so the wrapper's env scoping is inlined here
+    # rather than calling the ob_aws function.
+    if [[ -n ${OPENBUILDER_AWS_PROFILE:-} ]]; then
+        exec env AWS_PROFILE="$OPENBUILDER_AWS_PROFILE" AWS_REGION="$region" \
+            AWS_DEFAULT_REGION="$region" aws ssm start-session --target "$instance"
+    fi
+    exec env AWS_REGION="$region" AWS_DEFAULT_REGION="$region" \
+        aws ssm start-session --target "$instance"
 }
 
 cmd_doctor() {
@@ -1008,12 +1077,12 @@ cmd_stop() {
         ;;
     stopping)
         ob_info "instance $instance already stopping; waiting"
-        aws ec2 wait instance-stopped --region "$region" --instance-ids "$instance"
+        ob_aws ec2 wait instance-stopped --region "$region" --instance-ids "$instance"
         ;;
     *)
         ob_info "stopping instance $instance"
-        aws ec2 stop-instances --region "$region" --instance-ids "$instance" >/dev/null
-        aws ec2 wait instance-stopped --region "$region" --instance-ids "$instance"
+        ob_aws ec2 stop-instances --region "$region" --instance-ids "$instance" >/dev/null
+        ob_aws ec2 wait instance-stopped --region "$region" --instance-ids "$instance"
         ;;
     esac
     printf 'state: %s\n' "$(ob_instance_state)"

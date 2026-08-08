@@ -98,7 +98,7 @@ ob_load_env() {
   : "${OPENBUILDER_LABEL_PREFIX:=openbuilder}"
   : "${OPENBUILDER_GIT_USER_NAME:=openbuilder-bot}"
   : "${OPENBUILDER_GIT_USER_EMAIL:=openbuilder-bot@users.noreply.github.com}"
-  : "${AWS_REGION:=us-east-1}"
+  : "${AWS_REGION:=eu-central-1}"
   : "${PI_CODING_AGENT_DIR:=${OPENBUILDER_HOME}/.omp}"
 
   export OPENBUILDER_HOME OPENBUILDER_SSM_PREFIX OPENBUILDER_REPOS \

@@ -125,19 +125,19 @@ aws ssm put-parameter --overwrite \
   --name /openbuilder/github_app_id \
   --type String \
   --value '1234567' \
-  --region us-east-1
+  --region eu-central-1
 
 aws ssm put-parameter --overwrite \
   --name /openbuilder/github_app_installation_id \
   --type String \
   --value '87654321' \
-  --region us-east-1
+  --region eu-central-1
 
 aws ssm put-parameter --overwrite \
   --name /openbuilder/github_app_private_key \
   --type SecureString \
   --value "$(cat ~/Downloads/openbuilder-bot.2026-08-08.private-key.pem)" \
-  --region us-east-1
+  --region eu-central-1
 ```
 
 Notes on that last command, because it is the one that goes wrong:
@@ -160,14 +160,14 @@ aws ssm put-parameter --overwrite \
   --name /openbuilder/openrouter_api_key \
   --type SecureString \
   --value 'sk-or-v1-REPLACE_ME' \
-  --region us-east-1
+  --region eu-central-1
 ```
 
 Confirm all four exist and none still says `REPLACE_ME`:
 
 ```sh
 aws ssm get-parameters-by-path --path /openbuilder --recursive \
-  --query 'Parameters[].Name' --output table --region us-east-1
+  --query 'Parameters[].Name' --output table --region eu-central-1
 ```
 
 That query deliberately does not pass `--with-decryption`, so it prints names only.

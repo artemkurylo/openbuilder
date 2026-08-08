@@ -16,13 +16,15 @@ repos = [
 
 # --- Placement ----------------------------------------------------------------
 
-# region      = "us-east-1"
+# region      = "eu-central-1"
 # name_prefix = "openbuilder"
 
 # --- Instance shape -----------------------------------------------------------
 
-# instance_type  = "t4g.medium"   # 2 vCPU / 4 GiB arm64, ~$24/mo always-on
-# root_volume_gb = 100            # gp3, encrypted; ~$8/mo
+# instance_type  = "t4g.medium"   # 2 vCPU / 4 GiB arm64, ~$28/mo always-on
+# root_volume_gb = 40             # gp3, encrypted; ~$3.80/mo (approximate rate),
+#                                 # billed 24/7 on the provisioned size whether
+#                                 # the instance is running or stopped
 
 # --- Runtime configuration ----------------------------------------------------
 
@@ -43,7 +45,7 @@ repos = [
 
 # --- Cost guardrails ----------------------------------------------------------
 
-# monthly_budget_usd = 100
+# monthly_budget_usd = 20         # AWS spend only; OpenRouter model spend is invisible to it
 # budget_alert_email = "you@example.com"   # empty string disables the budget
 # enable_budget      = true
 

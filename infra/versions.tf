@@ -23,13 +23,13 @@ terraform {
   # To migrate to remote state later:
   #   1. Create the bucket and lock table once, by hand:
   #        aws s3api create-bucket --bucket openbuilder-tfstate-REPLACE_ME \
-  #          --region us-east-1
+  #          --region eu-central-1
   #        aws s3api put-bucket-versioning --bucket openbuilder-tfstate-REPLACE_ME \
   #          --versioning-configuration Status=Enabled
   #        aws dynamodb create-table --table-name openbuilder-tflock \
   #          --attribute-definitions AttributeName=LockID,AttributeType=S \
   #          --key-schema AttributeName=LockID,KeyType=HASH \
-  #          --billing-mode PAY_PER_REQUEST --region us-east-1
+  #          --billing-mode PAY_PER_REQUEST --region eu-central-1
   #   2. Uncomment the block below and fill in the bucket name.
   #   3. Run `terraform init -migrate-state` and answer "yes" when it offers to
   #      copy the existing local state up.
@@ -38,7 +38,7 @@ terraform {
   # backend "s3" {
   #   bucket         = "openbuilder-tfstate-REPLACE_ME"
   #   key            = "openbuilder/terraform.tfstate"
-  #   region         = "us-east-1"
+  #   region         = "eu-central-1"
   #   dynamodb_table = "openbuilder-tflock"
   #   encrypt        = true
   # }

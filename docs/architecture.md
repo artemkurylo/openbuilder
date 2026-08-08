@@ -6,7 +6,7 @@
 
 | Component | Path | What it is |
 |---|---|---|
-| `openbuilder` CLI | `local/bin/openbuilder` | Bash. The only thing you type. Reads `OPENBUILDER_INSTANCE_ID`, `OPENBUILDER_REGION`, `OPENBUILDER_TARGET_REPO`, sourcing `.openbuilder.local` if present. Subcommands: `plan`, `dispatch`, `review`, `approve`, `request-changes`, `status`, `logs`, `shell`, `doctor`, `start`, `stop`, `cost`. |
+| `openbuilder` CLI | `local/bin/openbuilder` | Bash. The only thing you type. Reads `OPENBUILDER_INSTANCE_ID`, `OPENBUILDER_REGION`, `OPENBUILDER_AWS_PROFILE`, `OPENBUILDER_TARGET_REPO`, sourcing `.openbuilder.local` if present. Ignores ambient `AWS_REGION`/`AWS_PROFILE` for box calls so the local model provider's account cannot be targeted by mistake. Subcommands: `plan`, `dispatch`, `review`, `approve`, `request-changes`, `status`, `logs`, `shell`, `doctor`, `start`, `stop`, `cost`. |
 | `Makefile` | `Makefile` | Wrappers for the one-time setup and the observation commands: `help` (default), `init`, `plan-tf`, `apply`, `destroy`, `secrets`, `doctor`, `shell`, `logs`, `status`, `fmt`, `lint`, `repo-create`. |
 | planner agent | `agent/local/agents/planner.md` | Opus 5. Emits story cards per `backlog/SCHEMA.md`. |
 | reviewer agent | `agent/local/agents/reviewer.md` | Opus 5. Emits `approve` or `changes-requested` plus line-anchored comments. Read-only tools plus `github` and `bash`. |
@@ -73,7 +73,7 @@ profile with `AmazonSSMManagedInstanceCore` plus an inline policy for the four S
 `kms:Decrypt` on `alias/aws/ssm` (via a `kms:ViaService` condition), tag-conditioned `ec2:StopInstances`,
 read-only `ec2:DescribeInstances`/`ec2:DescribeTags`, and `cloudwatch:PutMetricData` scoped to the
 `OpenBuilder` namespace. Four SSM parameters under `/openbuilder`. One `t4g.medium` instance with
-`http_tokens = "required"` and an encrypted 100 GB gp3 root volume. One optional monthly cost budget.
+`http_tokens = "required"` and an encrypted 40 GB gp3 root volume. One optional monthly cost budget.
 
 Every resource is tagged `openbuilder:managed = "true"`, `Project = "openbuilder"`,
 `Name = "<name_prefix>-<resource>"`.

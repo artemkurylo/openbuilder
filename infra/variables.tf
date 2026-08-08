@@ -5,7 +5,7 @@
 variable "region" {
   description = "AWS region hosting the openbuilder instance and its SSM parameters."
   type        = string
-  default     = "us-east-1"
+  default     = "eu-central-1"
 }
 
 variable "name_prefix" {
@@ -25,9 +25,15 @@ variable "instance_type" {
 }
 
 variable "root_volume_gb" {
-  description = "Size of the encrypted gp3 root volume in GiB. Holds target-repo clones, worktrees and node_modules."
+  # gp3 storage is billed 24/7 on provisioned size, whether the instance is
+  # running or stopped — idle auto-stop does NOT reduce it. At ~$0.095/GB-month
+  # in eu-central-1 this is the single largest fixed cost, so keep it small:
+  # 40 GiB holds the Ubuntu image, the omp binary (~154 MB), a repo clone, its
+  # worktrees and node_modules with room to spare. Raise it only if ob-doctor's
+  # disk check starts warning.
+  description = "Size of the encrypted gp3 root volume in GiB. Holds target-repo clones, worktrees and node_modules. Billed 24/7 regardless of instance state."
   type        = number
-  default     = 100
+  default     = 40
 }
 
 # -----------------------------------------------------------------------------
@@ -134,9 +140,9 @@ variable "subnet_cidr" {
 # -----------------------------------------------------------------------------
 
 variable "monthly_budget_usd" {
-  description = "Monthly AWS cost budget in USD. Alerts fire at 80% and 100% of actual spend."
+  description = "Monthly AWS cost budget in USD. Alerts fire at 80% and 100% of actual spend. NOTE: this covers AWS only — OpenRouter model spend is billed by OpenRouter and is invisible to AWS Budgets."
   type        = number
-  default     = 100
+  default     = 20
 }
 
 variable "budget_alert_email" {
