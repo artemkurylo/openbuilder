@@ -132,23 +132,47 @@ check_repos() {
   done
 }
 
+# Ask the provider directly what is wrong. omp returns exit 0 with an empty
+# assistant message when OpenRouter rejects the request (a 402 for insufficient
+# credits looks identical to a healthy-but-silent run), so the useful diagnosis
+# only exists in the HTTP body. Echoing it here turns "produced no assistant
+# text" into the provider's own sentence.
+probe_openrouter() {
+  local key body err
+  key="$(ob_ssm openrouter_api_key 2>/dev/null)" || return 1
+  [[ -n "$key" && "$key" != "REPLACE_ME" ]] || return 1
+  body="$(curl -sS --max-time 30 -X POST https://openrouter.ai/api/v1/chat/completions \
+    -H "Authorization: Bearer ${key}" -H 'Content-Type: application/json' \
+    -d "$(jq -cn --arg m "$OPENBUILDER_SMOL_MODEL" \
+      '{model:($m|sub("^openrouter/";"")),messages:[{role:"user",content:"ok"}],max_tokens:1}')" \
+    2>/dev/null)" || return 1
+  err="$(printf '%s' "$body" | jq -r '.error.message // empty' 2>/dev/null)"
+  [[ -n "$err" ]] || return 1
+  printf '%s' "$err"
+}
+
 check_model() {
-  local dir prompt text rc=0
+  local dir prompt text detail rc=0
   dir="$(mktemp -d)"
   prompt="${dir}/probe.md"
   printf 'Reply with exactly one word and nothing else: ok\n' >"$prompt"
   ob_run_omp "$dir" "$prompt" "${dir}/run.ndjson" "$OPENBUILDER_SMOL_MODEL" "2m" \
     >/dev/null 2>&1 || rc=$?
-  if ((rc != 0)); then
-    check "model: ${OPENBUILDER_SMOL_MODEL}" FAIL "omp exited ${rc} (bad OPENROUTER_API_KEY, model id or egress)"
+  text="$(ob_omp_final_text "${dir}/run.ndjson" 2>/dev/null | tr -d '\n' | cut -c1-40)"
+  if ((rc == 0)) && [[ -n "$text" ]]; then
+    check "model: ${OPENBUILDER_SMOL_MODEL}" PASS \
+      "replied \"${text}\", cost $(ob_omp_cost "${dir}/run.ndjson") USD"
     rm -rf "$dir"
     return 0
   fi
-  text="$(ob_omp_final_text "${dir}/run.ndjson" | tr -d '\n' | cut -c1-40)"
-  if [[ -n "$text" ]]; then
-    check "model: ${OPENBUILDER_SMOL_MODEL}" PASS "replied \"${text}\", cost $(ob_omp_cost "${dir}/run.ndjson") USD"
+  detail="$(probe_openrouter || true)"
+  if [[ -n "$detail" ]]; then
+    check "model: ${OPENBUILDER_SMOL_MODEL}" FAIL "provider says: ${detail}"
+  elif ((rc != 0)); then
+    check "model: ${OPENBUILDER_SMOL_MODEL}" FAIL "omp exited ${rc}; provider returned no error text"
   else
-    check "model: ${OPENBUILDER_SMOL_MODEL}" FAIL "omp exited 0 but produced no assistant text"
+    check "model: ${OPENBUILDER_SMOL_MODEL}" FAIL \
+      "omp exited 0 with an empty reply and the provider reported no error"
   fi
   rm -rf "$dir"
 }
