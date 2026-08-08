@@ -32,18 +32,34 @@ will create root-owned files in `/opt/openbuilder` and break the next poll pass.
 
 `ob-implement` and `ob-respond` both **require at least one new commit**. If the model finished without
 committing, the job fails loudly: `openbuilder:blocked` goes on, a comment with the log tail goes on the
-PR, and the attempts counter has already been incremented.
+PR, and the attempts counter has already been incremented. If the failure happened *before* any PR
+existed, there is no PR to comment on, so `ob-implement` opens a tracking issue titled
+`openbuilder blocked: <slug>` instead — look for that:
+
+```sh
+gh issue list --repo you/your-repo --search 'openbuilder blocked in:title'
+```
 
 Diagnose in this order.
 
-**a. Read what the agent said.** The final assistant text is the agent explaining itself. Extract it from
-the run's NDJSON:
+**a. Read what the agent said.** Each round leaves its own forensics directory,
+`/opt/openbuilder/state/<key>/rounds/<NNN>/`, holding `prompt.md` (exactly what the model was given),
+`run.ndjson` (the full NDJSON), `final.md` (the agent's own report), `feedback.md` (respond rounds only)
+and `pr-body.md`. Start with `final.md` of the newest round — it is the agent explaining itself, already
+extracted:
 
 ```sh
 openbuilder shell
+cd "$(sudo -u openbuilder bash -lc 'ls -d /opt/openbuilder/state/<key>/rounds/*/ | tail -1')"
+sudo -u openbuilder cat final.md
+sudo -u openbuilder cat prompt.md      # what it was actually asked, after substitution
+```
+
+If `final.md` is missing — the run died before it could be written — extract the text from the NDJSON:
+
+```sh
 sudo -u openbuilder jq -rs 'map(select(.type=="agent_end"))|last|.messages|map(select(.role=="assistant"))|last
-        |.content|map(select(.type=="text"))|map(.text)|join("\n")' \
-  /opt/openbuilder/state/<key>/run.ndjson
+        |.content|map(select(.type=="text"))|map(.text)|join("\n")' run.ndjson
 ```
 
 **b. Read the worklog** on the work branch — this is where the agent records dead ends across rounds:
@@ -119,7 +135,8 @@ A `t4g.medium` is 4 GB. A big `npm install` plus a test run plus omp can exhaust
 ## 3. `openbuilder:blocked` appeared
 
 `blocked` is terminal from the box's point of view: rule 3 skips the slug **forever**. It is always
-accompanied by a PR comment explaining why.
+accompanied by an explanation — a PR comment, or a `openbuilder blocked: <slug>` tracking issue if the
+failure predates the PR.
 
 ```sh
 gh pr view <pr> --repo you/your-repo --comments
@@ -141,14 +158,23 @@ gh pr edit <pr> --repo you/your-repo --remove-label openbuilder:blocked \
 ```
 
 Rule 3 stops matching, rule 6 matches, `ob-respond` runs on the next pass. **Reset the attempts counter
-too**, or rule 4 will immediately re-block it:
+too**, or rule 4 will immediately re-block it — and clear the `blocked-reported` marker, or rule 4's
+report will not fire again the next time the cap is genuinely hit:
 
 ```sh
 openbuilder shell
-sudo -u openbuilder rm -f /opt/openbuilder/state/<key>/attempts
+printf '0\n' | sudo -u openbuilder tee /opt/openbuilder/state/<key>/attempts >/dev/null
+sudo -u openbuilder rm -f /opt/openbuilder/state/<key>/blocked-reported
 ```
 
-(`ob_attempts_reset` writes the same file; deleting it is equivalent and is what you can do by hand.)
+Write `0` rather than deleting the file, and write it as the `openbuilder` user: a re-created root-owned
+`attempts` is exactly the kind of thing that breaks the next poll pass. If the slug never got a PR, close
+the `openbuilder blocked: <slug>` tracking issue instead of editing PR labels:
+
+```sh
+gh issue list --repo you/your-repo --search 'openbuilder blocked in:title' --json number,title
+gh issue close <n> --repo you/your-repo
+```
 
 ## 4. Attempts hit `OPENBUILDER_MAX_ATTEMPTS`
 
@@ -160,7 +186,9 @@ Read the counter:
 
 ```sh
 openbuilder shell
-cat /opt/openbuilder/state/<key>/attempts
+cat /opt/openbuilder/state/<key>/attempts          # a plain integer
+ls /opt/openbuilder/state/<key>/blocked-reported   # exists once the cap has been reported
+ls -d /opt/openbuilder/state/<key>/rounds/*/       # one directory per round actually run
 ```
 
 **Think before you reset.** Six failed rounds on one story almost always means the story card is wrong,
@@ -171,7 +199,8 @@ If you do want more rounds:
 
 ```sh
 openbuilder shell
-sudo -u openbuilder rm -f /opt/openbuilder/state/<key>/attempts
+printf '0\n' | sudo -u openbuilder tee /opt/openbuilder/state/<key>/attempts >/dev/null
+sudo -u openbuilder rm -f /opt/openbuilder/state/<key>/blocked-reported
 gh pr edit <pr> --repo you/your-repo --remove-label openbuilder:blocked \
                                      --add-label openbuilder:changes-requested
 ```
@@ -255,8 +284,9 @@ provider.
 
 ```sh
 openbuilder shell
-sudo -u openbuilder tail -c 4000 /opt/openbuilder/state/<key>/run.ndjson
-sudo -u openbuilder grep -c . /opt/openbuilder/state/<key>/run.ndjson    # a handful of lines = failed early
+cd "$(sudo -u openbuilder bash -lc 'ls -d /opt/openbuilder/state/<key>/rounds/*/ | tail -1')"
+sudo -u openbuilder tail -c 4000 run.ndjson
+sudo -u openbuilder grep -c . run.ndjson     # a handful of lines = failed before doing any work
 ```
 
 Check the key end-to-end without printing it:
@@ -391,12 +421,16 @@ sudo du -sh /opt/openbuilder/state/* | sort -h
 ```
 
 The usual suspects, in order: `work/` worktrees, `src/` clones with big histories and `node_modules`,
-`state/<key>/run.ndjson` files, and the apt/npm caches.
+`state/<key>/rounds/<NNN>/run.ndjson` transcripts, and the apt/npm caches.
+`/opt/openbuilder/log/openbuilder.log` is almost never the problem — only real work writes to it, so it
+grows on the order of kilobytes per day.
 
 Reclaim, safest first:
 
 ```sh
-# 1. old NDJSON transcripts for slugs that are done (approved/merged)
+# 1. old round transcripts for slugs that are done (approved/merged).
+#    Each rounds/<NNN>/ also holds prompt.md, final.md, feedback.md and pr-body.md — those are small,
+#    and they are the forensics you want to keep, so delete the NDJSON only.
 sudo -u openbuilder find /opt/openbuilder/state -name 'run.ndjson' -mtime +14 -delete
 
 # 2. worktrees for finished slugs — remove through git so the clone's metadata stays consistent
@@ -414,6 +448,18 @@ sudo -u openbuilder npm cache clean --force
 # 5. journal
 sudo journalctl --vacuum-time=7d
 ```
+
+If you ever do need to trim the log, **rotate and recreate — never truncate in place.**
+`openbuilder logs -f` follows that exact path by byte offset: it copes with a fresh, smaller file, but an
+in-place truncation leaves it reading past the end.
+
+```sh
+openbuilder shell
+sudo -u openbuilder bash -c 'cd /opt/openbuilder/log &&
+  mv openbuilder.log "openbuilder.log.$(date -u +%Y%m%dT%H%M%SZ)" && : > openbuilder.log'
+```
+
+No logrotate config is installed, by design — see [§11](#11-reading-the-logs).
 
 Never `rm -rf` a `work/` directory without `git worktree remove`/`prune` — the clone in `src/` keeps
 metadata pointing at it and the next `ob-implement` for that slug will fail confusingly.

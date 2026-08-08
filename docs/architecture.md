@@ -34,7 +34,7 @@ no database — if it is not a branch, a commit, a comment or a label, it does n
 
 | Component | Path | What it is |
 |---|---|---|
-| `ob-poll` | `/opt/openbuilder/bin/ob-poll` | The clock. Runs the §2 state machine. `--dry-run` prints decisions without acting. Global `poll` lock so passes never overlap. Ensures the six labels exist once per pass. |
+| `ob-poll` | `/opt/openbuilder/bin/ob-poll` | The clock. Runs the §2 state machine. Emits one `DECISION repo=<r> slug=<s> rule=<n> action=<implement\|respond\|block\|skip> reason=<...>` line per slug plus a final `ACTIONABLE=<n>`, to the journal. `--dry-run` prints those decisions and takes no action. Global `poll` lock so passes never overlap. Ensures the six labels exist once per pass. |
 | `ob-implement` | `/opt/openbuilder/bin/ob-implement` | `<owner/repo> <slug>`. Clone/fetch to `src/`, branch off the plan branch's merge-base with the default branch, create the worktree, read every `story-*.md` in slug order, render `prompts/implement.md`, run omp, require ≥1 new commit, append to `worklog.md`, push, `gh pr create`. |
 | `ob-respond` | `/opt/openbuilder/bin/ob-respond` | `<owner/repo> <slug> <pr>`. Pull the PR body, review comments and review threads via `gh api --paginate`, render `prompts/respond.md`, run a **fresh** omp session in the existing worktree, require ≥1 new commit, append the round to `worklog.md`, push, comment. |
 | `ob-idle-stop` | `/opt/openbuilder/bin/ob-idle-stop` | Stops the instance when no lock is held, `ob-poll --dry-run` reports no actionable work, and the newest mtime across `state/` and the log is older than `OPENBUILDER_IDLE_STOP_MINUTES`. |
@@ -57,7 +57,9 @@ no database — if it is not a branch, a commit, a comment or a label, it does n
 /opt/openbuilder/repo/                           checkout of this control repo (self-update source)
 /opt/openbuilder/src/<owner>__<repo>/            git clone of a target repo
 /opt/openbuilder/work/<owner>__<repo>__<slug>/   git worktree for one story set
-/opt/openbuilder/state/<owner>__<repo>__<slug>/  run.ndjson, sessions/, attempt counters
+/opt/openbuilder/state/<owner>__<repo>__<slug>/               attempts counter, blocked-reported marker
+/opt/openbuilder/state/<owner>__<repo>__<slug>/rounds/<NNN>/  per-round forensics: prompt.md, run.ndjson,
+                                                              final.md, feedback.md, pr-body.md
 /opt/openbuilder/log/openbuilder.log             append-only operational log
 /opt/openbuilder/run/                            lockfiles
 /opt/openbuilder/cache/gh-token.json             cached installation token, mode 0600
@@ -171,7 +173,7 @@ sequenceDiagram
     B->>G: add openbuilder:in-progress, remove openbuilder:queued
     B->>B: ob-implement: clone/fetch, worktree, render prompts/implement.md
     B->>M: omp -p --no-pty --mode json --approval-mode yolo --no-session
-    M-->>B: NDJSON to state/<key>/run.ndjson
+    M-->>B: NDJSON to state/<key>/rounds/<NNN>/run.ndjson
     B->>B: require >=1 new commit, append worklog.md, commit
     B->>G: push openbuilder/work/healthz-endpoint, gh pr create
     B->>G: add openbuilder:awaiting-review, remove openbuilder:in-progress

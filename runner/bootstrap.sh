@@ -15,7 +15,14 @@ OB_HOME="/opt/openbuilder"
 # Cloud-init owns this file; the override exists so the functions below can be
 # exercised against a sandbox env file.
 OB_ENV_FILE="${OPENBUILDER_ENV_FILE:-${OB_HOME}/etc/openbuilder.env}"
-OMP_ASSET="omp-linux-arm64"
+# Pick the omp release asset for the machine we actually booted on. The default
+# instance_type is Graviton, but it is a Terraform variable — hardcoding arm64
+# would silently install an unrunnable binary on an x86 instance type.
+case "$(uname -m)" in
+  aarch64 | arm64) OMP_ASSET="omp-linux-arm64" ;;
+  x86_64 | amd64) OMP_ASSET="omp-linux-x64" ;;
+  *) printf 'bootstrap: unsupported architecture: %s\n' "$(uname -m)" >&2; exit 1 ;;
+esac
 OMP_REPO="can1357/oh-my-pi"
 # runner/bootstrap.sh -> the control repo checkout root.
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"

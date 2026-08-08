@@ -1,12 +1,25 @@
+# The omp release asset and the AMI must agree with the instance type's CPU
+# architecture, otherwise the box boots an image it cannot run (or runs an
+# unrunnable omp binary). instance_type is a variable, so derive the arch from
+# it instead of pinning arm64 and hoping nobody edits it. runner/bootstrap.sh
+# performs the mirror-image detection via `uname -m`.
+locals {
+  instance_family = split(".", var.instance_type)[0]
+
+  # Graviton families carry a `g` in the generation suffix: t4g, c7g, m7gd,
+  # x2gd, im4gn, c6gn. Anything else is Intel/AMD, which Canonical calls amd64.
+  ami_architecture = can(regex("^[a-z]+[0-9]+[a-z]*g[a-z]*$", local.instance_family)) ? "arm64" : "amd64"
+}
+
 # Canonical's public parameter always points at the current Ubuntu 24.04 LTS
-# arm64 gp3 image. `nonsensitive` keeps the AMI id readable in plan output —
-# it is a public value.
-data "aws_ssm_parameter" "ubuntu_2404_arm64" {
-  name = "/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id"
+# gp3 image for the selected architecture. `nonsensitive` keeps the AMI id
+# readable in plan output — it is a public value.
+data "aws_ssm_parameter" "ubuntu_2404" {
+  name = "/aws/service/canonical/ubuntu/server/24.04/stable/current/${local.ami_architecture}/hvm/ebs-gp3/ami-id"
 }
 
 resource "aws_instance" "box" {
-  ami           = nonsensitive(data.aws_ssm_parameter.ubuntu_2404_arm64.value)
+  ami           = nonsensitive(data.aws_ssm_parameter.ubuntu_2404.value)
   instance_type = var.instance_type
 
   subnet_id              = aws_subnet.public.id

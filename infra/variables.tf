@@ -19,7 +19,7 @@ variable "name_prefix" {
 # -----------------------------------------------------------------------------
 
 variable "instance_type" {
-  description = "EC2 instance type. Must be arm64 (Graviton) to match the omp-linux-arm64 binary."
+  description = "EC2 instance type. Graviton (t4g/c7g/...) and x86 (t3/m5/...) both work; the AMI architecture and the omp binary are both derived from this value."
   type        = string
   default     = "t4g.medium"
 }
