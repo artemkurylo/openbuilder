@@ -254,11 +254,17 @@ configure_git() {
   runuser -u "$OB_USER" -- env HOME="$OB_HOME" git config --global safe.directory '*'
   runuser -u "$OB_USER" -- env HOME="$OB_HOME" git config --global advice.detachedHead false
 
-  # root needs the same identity for the ob-selfupdate path.
-  git config --global user.name "$name"
-  git config --global user.email "$email"
-  git config --global credential.helper "$helper"
-  git config --global safe.directory '*'
+  # root needs the same identity for the ob-selfupdate path. HOME must be given
+  # explicitly: cloud-init's runcmd executes with no HOME at all, and
+  # `git config --global` then dies with "fatal: $HOME not set", which under
+  # `set -e` aborted this script before the systemd units were installed.
+  local root_home
+  root_home="$(getent passwd root | cut -d: -f6)"
+  [[ -n "$root_home" ]] || root_home=/root
+  env HOME="$root_home" git config --global user.name "$name"
+  env HOME="$root_home" git config --global user.email "$email"
+  env HOME="$root_home" git config --global credential.helper "$helper"
+  env HOME="$root_home" git config --global safe.directory '*'
   log "configured git identity and the ob-token credential helper"
 }
 
