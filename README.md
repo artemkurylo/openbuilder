@@ -86,22 +86,26 @@ it, which is what `versions.tf` pins — support was added in that release.
 2. **Attach policies directly:** `AdministratorAccess` **and** `SignInLocalDevelopmentAccess`.
    The second is what permits `aws login` itself; the first is because this module creates a VPC, an
    EC2 instance, an IAM role and instance profile, four SSM parameters and a budget.
-   `PowerUserAccess` is *not* enough — it cannot create the instance role. Signing in as the account
-   root needs no extra policy, but prefer the IAM user.
-3. Declare the profile in `~/.aws/config`, naming that user's ARN:
+   `PowerUserAccess` is *not* enough — it cannot create the instance role.
+3. Declare the profile in `~/.aws/config`. **Substitute your real 12-digit account id** — it is in the
+   console's top-right account menu. The literal `ACCOUNT_ID` below will not work:
 
 ```ini
 [profile openbuilder-deploy]
-login_session = arn:aws:iam::<your-account-id>:user/openbuilder-deploy
+login_session = arn:aws:iam::ACCOUNT_ID:user/openbuilder-deploy
 region        = eu-central-1
 ```
 
-4. Sign in and confirm the account:
+4. In the browser, sign in **as `openbuilder-deploy`**, not as the account root. Then:
 
 ```sh
 aws login --profile openbuilder-deploy
 aws sts get-caller-identity --profile openbuilder-deploy   # must be YOUR account id
 ```
+
+`aws login` derives the session from whoever is signed into the browser. If you are signed in as root
+it will offer to rewrite the profile to `arn:aws:iam::<id>:root` — answer **n**, switch the browser to
+the IAM user, and rerun. Root works, but it cannot be scoped or revoked granularly.
 
 The session lasts up to 12 hours; re-run `aws login` when it lapses, and `aws logout --profile
 openbuilder-deploy` to end it early. Tokens are cached in `~/.aws/login/cache/`, never in
