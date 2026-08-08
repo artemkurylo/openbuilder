@@ -3,9 +3,9 @@
 A control plane for autonomous coding that splits the job across two machines and uses GitHub as the
 message bus. Your laptop runs a strong, expensive model (Claude Opus 5 via `omp`) to do the two things
 humans are bad at delegating — deciding *what* to build and judging whether the result is acceptable.
-A small always-on arm64 EC2 box runs a cheap, fast model (DeepSeek V4 Flash via OpenRouter) to do the
+A small always-on arm64 EC2 instance runs a cheap, fast model (DeepSeek V4 Flash via OpenRouter) to do the
 typing: it picks up plan branches, implements the stories, opens a pull request, and answers review
-rounds until the reviewer approves. There is no webhook, no queue, no inbound port and no SSH — the box
+rounds until the reviewer approves. There is no webhook, no queue, no inbound port and no SSH — the instance
 polls GitHub every 60 seconds, and stops itself when there is nothing to do. Every artifact of every
 step is a branch, a commit, a PR comment or a label, so the whole system is auditable with `git log`
 and `gh`.
@@ -14,18 +14,18 @@ and `gh`.
 
 ```mermaid
 flowchart TD
-    A["Laptop: openbuilder plan<br/>Opus 5 writes story cards"] --> B["Laptop: openbuilder dispatch<br/>starts box, pushes openbuilder/plan/slug"]
+    A["Laptop: openbuilder plan<br/>Opus 5 writes story cards"] --> B["Laptop: openbuilder dispatch<br/>starts instance, pushes openbuilder/plan/slug"]
     B --> C["GitHub: plan branch + label openbuilder:queued"]
-    C --> D["Box: ob-poll every 60s<br/>rule 5 matches"]
-    D --> E["Box: ob-implement<br/>DeepSeek V4 Flash writes code"]
+    C --> D["Instance: ob-poll every 60s<br/>rule 5 matches"]
+    D --> E["Instance: ob-implement<br/>DeepSeek V4 Flash writes code"]
     E --> F["GitHub: PR from openbuilder/work/slug<br/>label openbuilder:awaiting-review"]
     F --> G["Laptop: openbuilder review<br/>Opus 5 reads the diff"]
     G -->|changes needed| H["Laptop: openbuilder request-changes<br/>label openbuilder:changes-requested"]
-    H --> I["Box: ob-poll rule 6<br/>ob-respond, fresh session + worklog"]
+    H --> I["Instance: ob-poll rule 6<br/>ob-respond, fresh session + worklog"]
     I --> F
     G -->|looks good| J["Laptop: openbuilder approve<br/>label openbuilder:approved"]
     J --> K["Human: gh pr merge --squash"]
-    F -.->|nothing to do for 30 min| L["Box: ob-idle-stop<br/>instance stops itself"]
+    F -.->|nothing to do for 30 min| L["Instance: ob-idle-stop<br/>instance stops itself"]
 ```
 
 Three roles, three different cost profiles:
@@ -36,10 +36,10 @@ Three roles, three different cost profiles:
 | implementer | EC2 `t4g.medium` | `openrouter/deepseek/deepseek-v4-flash-0731` | implement stories, open a PR, answer review rounds |
 | reviewer | laptop | `amazon-bedrock/us.anthropic.claude-opus-5` | review the PR, post comments, gate the merge |
 
-The box **auto-stops when idle** (no lock held, no actionable work, nothing touched for
+The instance **auto-stops when idle** (no lock held, no actionable work, nothing touched for
 `OPENBUILDER_IDLE_STOP_MINUTES`, default 30). That is safe because the laptop CLI **starts the instance
 before it creates work** — `openbuilder dispatch` and `openbuilder review` both call
-`aws ec2 start-instances` and wait for the box to come up. A stopped box is never a missed trigger.
+`aws ec2 start-instances` and wait for the instance to come up. A stopped instance is never a missed trigger.
 
 ## Quickstart: zero to first merged PR
 
@@ -61,7 +61,7 @@ Bedrock, because the planner and reviewer run locally against that model.
 
 ### 1. Get this repo onto GitHub
 
-Cloud-init clones the control repo onto the box over plain HTTPS, so the simplest setup is a public
+Cloud-init clones the control repo onto the instance over plain HTTPS, so the simplest setup is a public
 control repo.
 
 ```sh
@@ -110,7 +110,7 @@ control_repo       = "artemkurylo/openbuilder"
 budget_alert_email = "you@example.com"
 ```
 
-`repos` is the allowlist. The box will only ever look at plan branches in these repositories, and the
+`repos` is the allowlist. The instance will only ever look at plan branches in these repositories, and the
 App installation token is scoped to them. Everything else has a sane default (`t4g.medium`, 40 GiB gp3,
 `/openbuilder` SSM prefix, 45m max runtime, 6 max attempts, 30 min idle stop, `monthly_budget_usd = 20`).
 
@@ -153,7 +153,7 @@ aws ssm put-parameter --overwrite --name /openbuilder/github_app_private_key \
 Nothing secret is ever written to `/opt/openbuilder/etc/openbuilder.env`. The runner fetches these with
 `aws ssm get-parameter --with-decryption` at job start and exports them into the `omp` child process only.
 
-### 7. Point the laptop CLI at the box
+### 7. Point the laptop CLI at the instance
 
 ```sh
 cat > .openbuilder.local <<'EOF'
@@ -162,12 +162,12 @@ OPENBUILDER_REGION=eu-central-1
 OPENBUILDER_TARGET_REPO=you/your-repo
 # Only needed when your shell's AWS_PROFILE points somewhere else — e.g. at an
 # account that just serves the local planner/reviewer model. EC2/SSM calls for
-# the box use this profile; the local `omp` session is left completely alone.
+# the instance use this profile; the local `omp` session is left completely alone.
 OPENBUILDER_AWS_PROFILE=your-personal-profile
 EOF
 ```
 
-The CLI deliberately ignores `AWS_REGION` and `AWS_DEFAULT_REGION` when deciding where the box lives:
+The CLI deliberately ignores `AWS_REGION` and `AWS_DEFAULT_REGION` when deciding where the instance lives:
 those belong to your local model provider and are frequently a different region entirely. Only
 `OPENBUILDER_REGION`, the cached value, or the `region` Terraform output can set it.
 
@@ -178,7 +178,7 @@ on your `PATH`:
 export PATH="$PWD/local/bin:$PATH"
 ```
 
-### 8. Verify the box
+### 8. Verify the instance
 
 ```sh
 make doctor
@@ -236,10 +236,10 @@ Opus 5 reads the diff, the plan, the worklog and the repo, then posts line-ancho
 verdict. Act on the verdict:
 
 ```sh
-openbuilder request-changes you/your-repo 42   # -> box runs ob-respond on the next poll
+openbuilder request-changes you/your-repo 42   # -> instance runs ob-respond on the next poll
 ```
 
-Each `request-changes` costs one attempt. After `OPENBUILDER_MAX_ATTEMPTS` (6) the box labels the PR
+Each `request-changes` costs one attempt. After `OPENBUILDER_MAX_ATTEMPTS` (6) the instance labels the PR
 `openbuilder:blocked` and stops touching it.
 
 ### 13. Approve and merge
@@ -249,11 +249,11 @@ openbuilder approve you/your-repo 42
 gh pr merge 42 --repo you/your-repo --squash --delete-branch
 ```
 
-`openbuilder:approved` is the box's stop sign: rule 2 in the state machine skips that slug forever.
+`openbuilder:approved` is the instance's stop sign: rule 2 in the state machine skips that slug forever.
 **Only a human merges.** The remote agent is blocked from merging, force-pushing and pushing to a
 default branch by the guardrails hook, and never has a reason to try.
 
-Thirty minutes later `ob-idle-stop` powers the box down and your spend drops to the EBS volume.
+Thirty minutes later `ob-idle-stop` powers the instance down and your spend drops to the EBS volume.
 
 ## The daily loop
 
@@ -261,7 +261,7 @@ Once the setup above is done, a normal day is four commands:
 
 ```sh
 openbuilder plan     you/your-repo add-rate-limit   # think, then edit the story cards
-openbuilder dispatch you/your-repo add-rate-limit   # starts the box, pushes the plan branch
+openbuilder dispatch you/your-repo add-rate-limit   # starts the instance, pushes the plan branch
 openbuilder review   you/your-repo 43               # Opus 5 reviews; you read its verdict
 openbuilder approve  you/your-repo 43               # then gh pr merge
 ```
@@ -272,9 +272,9 @@ Everything else is observation:
 |---|---|
 | `openbuilder status [owner/repo]` | table of slugs, branches, PRs, labels, last action |
 | `openbuilder logs [-f]` | tail `/opt/openbuilder/log/openbuilder.log` over SSM |
-| `openbuilder cost` | sum `.message.usage.cost.total` across the box's `run.ndjson` files |
-| `openbuilder doctor` | run `ob-doctor` on the box |
-| `openbuilder shell` | `aws ssm start-session` onto the box |
+| `openbuilder cost` | sum `.message.usage.cost.total` across the instance's `run.ndjson` files |
+| `openbuilder doctor` | run `ob-doctor` on the instance |
+| `openbuilder shell` | `aws ssm start-session` onto the instance |
 | `openbuilder start` / `openbuilder stop` | instance power, by hand |
 
 You can queue several slugs at once. `ob-poll` takes **one action per slug per pass** and holds a
@@ -299,10 +299,10 @@ against AWS's published EU (Frankfurt) pricing; the gp3 rate is **approximate an
 
 The model is not the expensive part. The instance is — which is why idle auto-stop exists, and why
 there is no NAT gateway (~$32/mo) or interface endpoint pair (~$22/mo) in the design. The gp3 volume is
-the one line auto-stop cannot touch: $3.80/month whether the box runs or not, which is the whole bill of
+the one line auto-stop cannot touch: $3.80/month whether the instance runs or not, which is the whole bill of
 a stopped month.
 
-The default `monthly_budget_usd = 20` is enough for an auto-stopping box (~$14.22 of AWS spend, 71% of
+The default `monthly_budget_usd = 20` is enough for an auto-stopping instance (~$14.22 of AWS spend, 71% of
 budget, so the 80% alert at $16 never fires) and **not** enough always-on (~$35.48 of AWS spend). Either
 way the budget covers **AWS spend only** — the DeepSeek tokens are billed by OpenRouter and are invisible
 to it.
@@ -316,7 +316,7 @@ openbuilder/
 ├── docs/                     architecture, day-2 runbook, GitHub App setup, cost math
 ├── infra/                    Terraform: VPC, public subnet, IAM, SSM params, instance, budget
 ├── infra/templates/          cloud-init template that renders openbuilder.env and calls bootstrap.sh
-├── runner/                   everything that runs ON the box
+├── runner/                   everything that runs ON the instance
 ├── runner/bin/               ob-common.sh, ob-token, ob-poll, ob-implement, ob-respond, ob-idle-stop, ob-doctor, ob-selfupdate
 ├── runner/systemd/           the poll timer (60s) and the idle timer (5m) and their oneshot services
 ├── runner/prompts/           implement.md / respond.md templates fed to omp with {{PLACEHOLDER}} markers
@@ -333,17 +333,17 @@ Full playbook in [docs/runbook.md](docs/runbook.md). The fast table:
 
 | Symptom | Likely cause | Command to run |
 |---|---|---|
-| `openbuilder dispatch` pushed but no PR after 5 min | box stopped, or poll timer not firing | `openbuilder status` then `openbuilder start`, then `openbuilder shell` and `systemctl list-timers 'openbuilder-*'` |
+| `openbuilder dispatch` pushed but no PR after 5 min | instance stopped, or poll timer not firing | `openbuilder status` then `openbuilder start`, then `openbuilder shell` and `systemctl list-timers 'openbuilder-*'` |
 | PR stuck on `openbuilder:in-progress` | job died mid-run, stale lock, or `OPENBUILDER_MAX_RUNTIME` hit | `openbuilder logs` then `openbuilder shell` and `ls -l /opt/openbuilder/run/` |
 | `openbuilder:blocked` appeared | max attempts reached, or a hard failure — the reason is in a PR comment, or in a `openbuilder blocked: <slug>` issue if it failed before the PR existed | `gh pr view <pr> --repo you/your-repo --comments` |
 | No commits, agent "explained" instead | story card was ambiguous; the agent is told to stop rather than guess | read `.openbuilder/backlog/<slug>/worklog.md` on the work branch, tighten the card, re-dispatch |
 | `gh` calls fail with 401 | App token expired or the App is not installed on that repo | `openbuilder shell` then `sudo -u openbuilder /opt/openbuilder/bin/ob-doctor` |
 | omp exits instantly, no tokens spent | bad or out-of-credit `OPENROUTER_API_KEY` (429 / 402) | `openbuilder doctor`, then re-put `/openbuilder/openrouter_api_key` |
-| Box never stops, bill keeps growing | idle timer not firing, or work is genuinely queued | `openbuilder shell` then `sudo -u openbuilder /opt/openbuilder/bin/ob-poll --dry-run` |
+| Instance never stops, bill keeps growing | idle timer not firing, or work is genuinely queued | `openbuilder shell` then `sudo -u openbuilder /opt/openbuilder/bin/ob-poll --dry-run` |
 | Disk full, git operations fail | accumulated worktrees, caches and `run.ndjson` files | `openbuilder shell` then `df -h /opt/openbuilder` |
-| Box running old scripts after a control-repo push | box has not self-updated | `openbuilder shell` then `sudo -u openbuilder /opt/openbuilder/bin/ob-selfupdate` |
+| Instance running old scripts after a control-repo push | instance has not self-updated | `openbuilder shell` then `sudo -u openbuilder /opt/openbuilder/bin/ob-selfupdate` |
 
-One thing that looks like a fault and is not: **`openbuilder logs` is empty on an idle box.** Only real
+One thing that looks like a fault and is not: **`openbuilder logs` is empty on an idle instance.** Only real
 work writes to `/opt/openbuilder/log/openbuilder.log`; uneventful poll passes go to the journal only, on
 purpose, because idle auto-stop watches that file's mtime. For the noisy per-decision view use
 `openbuilder shell` and

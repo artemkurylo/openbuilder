@@ -1,16 +1,16 @@
 output "instance_id" {
-  description = "EC2 instance id of the openbuilder box. Export as OPENBUILDER_INSTANCE_ID for the laptop CLI."
-  value       = aws_instance.box.id
+  description = "EC2 instance id of the openbuilder instance. Export as OPENBUILDER_INSTANCE_ID for the laptop CLI."
+  value       = aws_instance.openbuilder.id
 }
 
 output "region" {
-  description = "Region the box and its parameters live in. Export as OPENBUILDER_REGION for the laptop CLI."
+  description = "Region the instance and its parameters live in. Export as OPENBUILDER_REGION for the laptop CLI."
   value       = var.region
 }
 
 output "ssm_session_command" {
-  description = "Interactive shell on the box. No SSH, no key pair, no inbound rule involved."
-  value       = "aws ssm start-session --target ${aws_instance.box.id} --region ${var.region}"
+  description = "Interactive shell on the instance. No SSH, no key pair, no inbound rule involved."
+  value       = "aws ssm start-session --target ${aws_instance.openbuilder.id} --region ${var.region}"
 }
 
 output "ssm_parameter_names" {

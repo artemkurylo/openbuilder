@@ -12,7 +12,7 @@ here costs a whole round.
 
 Two outcomes only:
 
-- `openbuilder:approved` → the box stops touching the PR forever. A human merges.
+- `openbuilder:approved` → the instance stops touching the PR forever. A human merges.
 - `openbuilder:changes-requested` → the next poll pass runs `ob-respond` and the
   agent does another round.
 
@@ -287,7 +287,7 @@ Make sure both terminal labels exist (idempotent; the `|| true` swallows the
 
 ```sh
 gh label create "openbuilder:approved" --repo "$REPO" \
-  --color 0E8A16 --description "openbuilder: human may merge; the box stops here" || true
+  --color 0E8A16 --description "openbuilder: human may merge; the instance stops here" || true
 
 gh label create "openbuilder:changes-requested" --repo "$REPO" \
   --color D93F0B --description "openbuilder: reviewer wants another round" || true
@@ -322,14 +322,14 @@ gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name'
 | Label | Meaning | Set by |
 |---|---|---|
 | `openbuilder:queued` | plan pushed, not yet picked up | laptop |
-| `openbuilder:in-progress` | remote agent working | box |
-| `openbuilder:awaiting-review` | PR ready for Opus 5 | box |
+| `openbuilder:in-progress` | remote agent working | instance |
+| `openbuilder:awaiting-review` | PR ready for Opus 5 | instance |
 | `openbuilder:changes-requested` | reviewer wants another round | laptop |
-| `openbuilder:approved` | human may merge; box stops touching it | laptop |
-| `openbuilder:blocked` | agent gave up, needs a human | box |
+| `openbuilder:approved` | human may merge; instance stops touching it | laptop |
+| `openbuilder:blocked` | agent gave up, needs a human | instance |
 
 Never set `openbuilder:in-progress`, `openbuilder:awaiting-review`, or
-`openbuilder:blocked` from a review — those belong to the box, and writing them from
+`openbuilder:blocked` from a review — those belong to the instance, and writing them from
 the laptop confuses the state machine.
 
 ---

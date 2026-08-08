@@ -13,19 +13,19 @@ Two conventions throughout:
 ```sh
 openbuilder status you/your-repo     # slugs, branches, PRs, labels, last action
 openbuilder logs                     # tail /opt/openbuilder/log/openbuilder.log over SSM
-openbuilder doctor                   # ob-doctor PASS/FAIL table on the box
+openbuilder doctor                   # ob-doctor PASS/FAIL table on the instance
 ```
 
-If `status` shows nothing and `logs` returns nothing, the box is probably stopped — jump to
-[§5](#5-box-is-stopped-and-not-picking-up-work).
+If `status` shows nothing and `logs` returns nothing, the instance is probably stopped — jump to
+[§5](#5-instance-is-stopped-and-not-picking-up-work).
 
 To get a shell for anything below:
 
 ```sh
-openbuilder shell                    # aws ssm start-session onto the box
+openbuilder shell                    # aws ssm start-session onto the instance
 ```
 
-Everything on the box runs as the `openbuilder` user. Always prefix with `sudo -u openbuilder`, or you
+Everything on the instance runs as the `openbuilder` user. Always prefix with `sudo -u openbuilder`, or you
 will create root-owned files in `/opt/openbuilder` and break the next poll pass.
 
 ## 1. Agent produced nothing / no commits
@@ -88,7 +88,7 @@ openbuilder shell
 sudo sed -i 's/^OPENBUILDER_MAX_RUNTIME=.*/OPENBUILDER_MAX_RUNTIME=90m/' /opt/openbuilder/etc/openbuilder.env
 ```
 
-That edit is local to the box and will be reverted the next time cloud-init renders the file. For a
+That edit is local to the instance and will be reverted the next time cloud-init renders the file. For a
 durable change, set `max_runtime` in `infra/terraform.tfvars` and `make apply`.
 
 ## 2. PR stuck in `openbuilder:in-progress`
@@ -117,7 +117,7 @@ gh pr edit <pr> --repo you/your-repo --remove-label openbuilder:in-progress \
                                      --add-label openbuilder:changes-requested
 ```
 
-Adding `changes-requested` makes rule 6 fire, so the box runs `ob-respond` and continues the round it
+Adding `changes-requested` makes rule 6 fire, so the instance runs `ob-respond` and continues the round it
 lost. If it lost the *initial* implement and never pushed a work branch, there is no PR — see
 [§13](#13-force-a-re-implement-from-scratch).
 
@@ -134,7 +134,7 @@ A `t4g.medium` is 4 GB. A big `npm install` plus a test run plus omp can exhaust
 
 ## 3. `openbuilder:blocked` appeared
 
-`blocked` is terminal from the box's point of view: rule 3 skips the slug **forever**. It is always
+`blocked` is terminal from the instance's point of view: rule 3 skips the slug **forever**. It is always
 accompanied by an explanation — a PR comment, or a `openbuilder blocked: <slug>` tracking issue if the
 failure predates the PR.
 
@@ -150,7 +150,7 @@ Two distinct causes, distinguishable from the comment text:
 - **Any failure path** — a push rejected, `gh` 401, omp non-zero exit, no new commit. Fix the underlying
   cause, then resume.
 
-To resume after fixing the cause, remove the label and give the box something to match:
+To resume after fixing the cause, remove the label and give the instance something to match:
 
 ```sh
 gh pr edit <pr> --repo you/your-repo --remove-label openbuilder:blocked \
@@ -207,13 +207,13 @@ gh pr edit <pr> --repo you/your-repo --remove-label openbuilder:blocked \
 
 To raise the ceiling durably, set `max_attempts` in `infra/terraform.tfvars` and `make apply`.
 
-## 5. Box is stopped and not picking up work
+## 5. Instance is stopped and not picking up work
 
 Expected: `ob-idle-stop` stops the instance after `OPENBUILDER_IDLE_STOP_MINUTES` (default 30) of no lock
 held, no actionable work from `ob-poll --dry-run`, and no mtime change under `state/` or the log.
 
 The laptop CLI starts it for you — `openbuilder dispatch` and `openbuilder review` both call
-`aws ec2 start-instances` and wait. So a stopped box is only a problem if you pushed a plan branch by
+`aws ec2 start-instances` and wait. So a stopped instance is only a problem if you pushed a plan branch by
 hand.
 
 ```sh
@@ -221,7 +221,7 @@ openbuilder start                    # ec2 start-instances + wait
 openbuilder status you/your-repo
 ```
 
-If `start` returns but the box never picks up work, the timers did not come back — see
+If `start` returns but the instance never picks up work, the timers did not come back — see
 [§9](#9-poll-timer-not-firing).
 
 If the instance will not start at all, look at the API's reason:
@@ -251,7 +251,7 @@ persistent 401 means the *credential inputs* are wrong, not that the token aged 
 openbuilder doctor
 ```
 
-Then, on the box:
+Then, on the instance:
 
 ```sh
 openbuilder shell
@@ -359,7 +359,7 @@ gh pr close <pr> --repo you/your-repo
 gh pr edit <pr> --repo you/your-repo --add-label openbuilder:blocked
 ```
 
-`blocked` is the honest label: rule 3 makes the box skip the slug forever without pretending the work was
+`blocked` is the honest label: rule 3 makes the instance skip the slug forever without pretending the work was
 accepted.
 
 ## 9. Poll timer not firing
@@ -486,7 +486,7 @@ uses `>>`), ISO-8601 UTC timestamps, and everything passes through the redactor 
 `github_pat_`, PEM bodies) — so it is safe to paste into a ticket as-is. Nothing rotates or recreates it;
 no logrotate config is installed.
 
-**An idle box writes nothing to it, and that is healthy.** Uneventful poll passes and routine "not idle
+**An idle instance writes nothing to it, and that is healthy.** Uneventful poll passes and routine "not idle
 yet" checks go to the journal only. This is deliberate, not an oversight: `ob-idle-stop`'s third idle
 condition measures this file's mtime, so a chatty logger would keep the instance awake forever and defeat
 auto-stop. Silence here means no work happened — use `journalctl` for the noisy view. Do not "fix" it by
@@ -498,7 +498,7 @@ openbuilder logs                 # tail it over SSM
 openbuilder logs -f              # follow
 ```
 
-On the box directly:
+On the instance directly:
 
 ```sh
 openbuilder shell
@@ -542,7 +542,7 @@ jq -r .type run.ndjson | sort | uniq -c
 jq -rc 'select(.type=="message_end")|.message.content[]?|select(.type=="tool_use")|[.name,(.input|tostring)[0:160]]|@tsv' run.ndjson
 ```
 
-Cost across every job on the box:
+Cost across every job on the instance:
 
 ```sh
 openbuilder cost
@@ -562,7 +562,7 @@ sudo journalctl -u openbuilder-poll.service --since today --no-pager | grep -E '
 A decision line looks like
 `DECISION repo=you/your-repo slug=healthz-endpoint rule=7 action=skip reason=<...>`, and each pass ends
 with `ACTIONABLE=<n>`. That `rule=` number maps straight onto the state-machine table in
-[architecture.md](architecture.md#2-the-state-machine), so it tells you exactly why the box did or did not
+[architecture.md](architecture.md#2-the-state-machine), so it tells you exactly why the instance did or did not
 act — which is usually the answer to "why is nothing happening".
 
 ## 12. Re-run a single job by hand
@@ -594,7 +594,7 @@ the same way — a manual run is not a dry run.
 
 ## 13. Force a re-implement from scratch
 
-Rule 5 only fires when **no PR with head `openbuilder/work/<slug>` exists**. So to make the box start the
+Rule 5 only fires when **no PR with head `openbuilder/work/<slug>` exists**. So to make the instance start the
 story over, remove the PR and the branch:
 
 ```sh
@@ -607,7 +607,7 @@ If the branch survives (or there was never a PR):
 git push origin --delete openbuilder/work/<slug>
 ```
 
-Then clear the box's local state for that slug so it starts from a clean worktree, and reset attempts:
+Then clear the instance's local state for that slug so it starts from a clean worktree, and reset attempts:
 
 ```sh
 openbuilder shell
@@ -637,7 +637,7 @@ git push origin --delete openbuilder/plan/<slug>
 
 ## 14. Roll back merged work
 
-Nothing the box does is irreversible, because it never merges. Once *you* have merged, revert like any
+Nothing the instance does is irreversible, because it never merges. Once *you* have merged, revert like any
 other change:
 
 ```sh
@@ -660,17 +660,17 @@ gh pr view <pr> --repo you/your-repo --json mergeCommit,mergedAt,title
 ```
 
 Prefer `git revert` over a force-push: the agent's guardrails hook blocks force-pushes, and history that
-the box may still have cloned in `src/` should not be rewritten under it. If you do rewrite anyway, reset
-the box's clone:
+the instance may still have cloned in `src/` should not be rewritten under it. If you do rewrite anyway, reset
+the instance's clone:
 
 ```sh
 openbuilder shell
 sudo -u openbuilder git -C /opt/openbuilder/src/you__your-repo fetch --all --prune
 ```
 
-## 15. Update the box
+## 15. Update the instance
 
-The box runs whatever is in `/opt/openbuilder/repo`, a checkout of this control repo. After you push a
+The instance runs whatever is in `/opt/openbuilder/repo`, a checkout of this control repo. After you push a
 change to `runner/`, `agent/remote/` or the prompts:
 
 ```sh
@@ -686,7 +686,7 @@ reinstalls the systemd units, and `daemon-reload`s. Verify:
 openbuilder doctor
 ```
 
-If the pull fails because the working tree diverged (you hand-edited a script on the box):
+If the pull fails because the working tree diverged (you hand-edited a script on the instance):
 
 ```sh
 openbuilder shell
@@ -695,11 +695,11 @@ sudo -u openbuilder git -C /opt/openbuilder/repo checkout -- .
 sudo -u openbuilder /opt/openbuilder/bin/ob-selfupdate
 ```
 
-`--ff-only` is deliberate: the box never merges, not even its own control repo.
+`--ff-only` is deliberate: the instance never merges, not even its own control repo.
 
 Changes to `/opt/openbuilder/etc/openbuilder.env` are **not** covered by `ob-selfupdate` — that file is
 rendered by cloud-init from Terraform variables. To change it properly, edit `infra/terraform.tfvars`,
-`make apply`, and recreate the instance (or hand-edit the file on the box for a temporary override and
+`make apply`, and recreate the instance (or hand-edit the file on the instance for a temporary override and
 accept that it is not durable).
 
 To pick up a new omp release, bump `omp_version` in `infra/terraform.tfvars` and `make apply`, or just
@@ -717,18 +717,18 @@ omp --version
 | Want | Command |
 |---|---|
 | See everything at a glance | `openbuilder status you/your-repo` |
-| Tail the box log | `openbuilder logs -f` |
+| Tail the instance log | `openbuilder logs -f` |
 | Full preflight | `openbuilder doctor` |
-| Shell on the box | `openbuilder shell` |
+| Shell on the instance | `openbuilder shell` |
 | Power | `openbuilder start` / `openbuilder stop` |
 | Spend so far | `openbuilder cost` |
 | What would the poller do? | `sudo -u openbuilder /opt/openbuilder/bin/ob-poll --dry-run` |
 | Run one implement now | `sudo -u openbuilder /opt/openbuilder/bin/ob-implement you/your-repo <slug>` |
 | Run one review round now | `sudo -u openbuilder /opt/openbuilder/bin/ob-respond you/your-repo <slug> <pr>` |
 | Fresh App token identity | `sudo -u openbuilder bash -lc 'GH_TOKEN=$(/opt/openbuilder/bin/ob-token) gh api user --jq .login'` |
-| Update the box | `sudo -u openbuilder /opt/openbuilder/bin/ob-selfupdate` |
-| Hand the PR back to the box | `openbuilder request-changes you/your-repo <pr>` |
-| Tell the box to stop touching a PR | `openbuilder approve you/your-repo <pr>` |
+| Update the instance | `sudo -u openbuilder /opt/openbuilder/bin/ob-selfupdate` |
+| Hand the PR back to the instance | `openbuilder request-changes you/your-repo <pr>` |
+| Tell the instance to stop touching a PR | `openbuilder approve you/your-repo <pr>` |
 | Reset attempts | `printf '0\n' \| sudo -u openbuilder tee /opt/openbuilder/state/<key>/attempts` then `rm -f .../blocked-reported` |
 | Read the newest round's report | `cat /opt/openbuilder/state/<key>/rounds/*/final.md \| tail -40` |
 | Why did the poller skip my slug? | `sudo journalctl -u openbuilder-poll.service --since today \| grep DECISION` |

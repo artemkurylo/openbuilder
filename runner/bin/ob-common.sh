@@ -249,11 +249,11 @@ ob_label() {
 ob_ensure_labels() {
   local repo="$1" spec short color desc
   for spec in \
-    'queued|fbca04|Plan branch pushed, waiting for the box to pick it up' \
+    'queued|fbca04|Plan branch pushed, waiting for the instance to pick it up' \
     'in-progress|1d76db|The remote agent is working on this right now' \
     'awaiting-review|0e8a16|PR is ready for the reviewer' \
     'changes-requested|d93f0b|The reviewer wants another implementation round' \
-    'approved|5319e7|Approved; a human may merge and the box stops touching it' \
+    'approved|5319e7|Approved; a human may merge and the instance stops touching it' \
     'blocked|b60205|The agent gave up; a human needs to look at this'; do
     IFS='|' read -r short color desc <<<"$spec"
     # `gh label create` errors when the label already exists; that is expected.
@@ -332,7 +332,7 @@ ob_report_blocked() {
     printf -- '- slug: `%s`\n' "$slug"
     printf -- '- attempts: %s / %s\n' \
       "$(ob_attempts_get "$repo" "$slug")" "${OPENBUILDER_MAX_ATTEMPTS}"
-    printf -- '- box time: %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf -- '- instance time: %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'Operational log tail (redacted):\n\n```\n'
     cat "$tail_file"
     printf '```\n'

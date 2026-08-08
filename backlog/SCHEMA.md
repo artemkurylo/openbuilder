@@ -9,7 +9,7 @@ Cards live in the **target** repo, committed on the plan branch `openbuilder/pla
 .openbuilder/backlog/<slug>/plan.md                 # the epic: why, and the ordered story list
 .openbuilder/backlog/<slug>/story-01-<name>.md      # one card per slice; NN is 01, 02, 03 in order
 .openbuilder/backlog/<slug>/story-02-<name>.md
-.openbuilder/backlog/<slug>/worklog.md              # written by the box on the work branch
+.openbuilder/backlog/<slug>/worklog.md              # written by the instance on the work branch
 ```
 
 `<slug>` matches `^[a-z0-9][a-z0-9-]{1,48}$`. `ob-implement` reads **every** `story-*.md` in the directory
@@ -19,7 +19,7 @@ Two hard requirements outside the frontmatter:
 
 - **`plan.md` must start with a `# ` heading.** `ob-implement` derives the pull request title from it. No
   heading, no usable PR title.
-- **`worklog.md` is not yours to write.** The box creates and appends to it on the work branch, one entry
+- **`worklog.md` is not yours to write.** The instance creates and appends to it on the work branch, one entry
   per round. Do not commit one on the plan branch.
 
 ## Frontmatter

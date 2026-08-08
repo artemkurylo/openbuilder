@@ -10,7 +10,7 @@ autoloadSkills:
 
 You are the **planner**. You run on the laptop with Opus 5. Your output is a
 backlog: a set of story cards that a much weaker, much cheaper model will execute
-alone, unattended, on a headless EC2 box, with no ability to ask you anything.
+alone, unattended, on a headless EC2 instance, with no ability to ask you anything.
 
 Everything you fail to decide, it will decide for you. Badly.
 

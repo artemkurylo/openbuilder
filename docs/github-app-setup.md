@@ -23,7 +23,7 @@ under an organisation.
    is required and cosmetic).
 5. **Webhook**: **uncheck "Active"**.
 
-   This system has no webhook endpoint by design. The box polls `api.github.com` every 60 seconds from
+   This system has no webhook endpoint by design. The instance polls `api.github.com` every 60 seconds from
    an instance with zero inbound network rules — no public listener, no TLS certificate, no webhook
    secret to rotate. Leaving the webhook active would just queue undeliverable events. See
    [architecture.md](architecture.md#poll-loop-instead-of-webhooks).
@@ -174,7 +174,7 @@ That query deliberately does not pass `--with-decryption`, so it prints names on
 
 ## 7. Verify with `ob-doctor`
 
-`ob-doctor` is the only real proof that the App works, because it mints a token on the box with the
+`ob-doctor` is the only real proof that the App works, because it mints a token on the instance with the
 instance role and the SSM values you just set:
 
 ```sh
@@ -187,7 +187,7 @@ or equivalently, from anywhere the CLI is on your `PATH`:
 openbuilder doctor
 ```
 
-or from a shell on the box itself:
+or from a shell on the instance itself:
 
 ```sh
 openbuilder shell
@@ -221,6 +221,6 @@ sudo -u openbuilder rm -f /opt/openbuilder/cache/gh-token.json
 | `ob-doctor` App token row FAILs with 401 `A JWT could not be decoded` | wrong App ID, or the PEM in SSM is mangled (newlines lost) | re-put the PEM with `--value "$(cat key.pem)"`, delete the token cache |
 | 404 from `/app/installations/<id>/access_tokens` | wrong installation ID — you used the App ID by mistake | re-read the number from the `settings/installations/<id>` URL |
 | Token mints, but a repo row FAILs "not writable" | the App is installed but that repo is not in the selected list | **Install App** → Configure → add the repo |
-| `git push` from the box fails 403 on a story that touches `.github/workflows/` | Workflows permission missing | add Workflows: Read and write, then accept the permission request under **Install App** → Configure |
+| `git push` from the instance fails 403 on a story that touches `.github/workflows/` | Workflows permission missing | add Workflows: Read and write, then accept the permission request under **Install App** → Configure |
 | Everything worked yesterday, 401 today | nothing expires that you own — the *cached* token expired and something is reusing it wrongly | delete `/opt/openbuilder/cache/gh-token.json`, re-run `ob-doctor` |
 | You changed permissions and nothing took effect | permission changes on an installed App require approval | go to **Install App** → Configure and accept the pending request |

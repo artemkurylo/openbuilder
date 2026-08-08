@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ob-doctor — preflight the box and print an aligned PASS/FAIL table.
+# ob-doctor — preflight the instance and print an aligned PASS/FAIL table.
 # Single responsibility: prove every dependency of a real job works BEFORE a job
 # needs it. Exits non-zero if any check fails.
 set -euo pipefail

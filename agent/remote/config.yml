@@ -1,7 +1,7 @@
-# openbuilder — omp global config for the EC2 implementer box
+# openbuilder — omp global config for the EC2 implementer instance
 #
 # Installed by runner/bootstrap.sh to:  /opt/openbuilder/.omp/agent/config.yml
-# (the box sets PI_CODING_AGENT_DIR=/opt/openbuilder/.omp, so this file IS the
+# (the instance sets PI_CODING_AGENT_DIR=/opt/openbuilder/.omp, so this file IS the
 # "global" omp config layer for the `openbuilder` system user.)
 #
 # Layer precedence, lowest to highest:
@@ -11,14 +11,14 @@
 # `cycleOrder`, `extensions`, ...) are REPLACED WHOLESALE by any higher-precedence
 # layer -- they are never merged or appended. A target repo that happens to ship its
 # own `.omp/config.yml` with a `disabledProviders` array therefore wipes the list
-# below for runs inside that repo. That is why the box additionally relies on
+# below for runs inside that repo. That is why the instance additionally relies on
 # NOT having credentials for any other provider: this file is defense-in-depth,
 # not the only line of defense.
 
 # ---------------------------------------------------------------------------
 # Model routing
 # ---------------------------------------------------------------------------
-# Every role points at the same OpenRouter DeepSeek selector. The box has exactly
+# Every role points at the same OpenRouter DeepSeek selector. The instance has exactly
 # one model credential (OPENROUTER_API_KEY, fetched from SSM at job start), so any
 # role that resolved to a different provider would fail the run instead of
 # degrading gracefully. Pinning all four makes that impossible.
@@ -31,7 +31,7 @@ modelRoles:
   # ($0.09/Mtok in, $0.18/Mtok out).
   smol: openrouter/deepseek/deepseek-v4-flash-0731
   # `slow` — the "think harder" escalation role. Same model; there is nothing
-  # stronger reachable from this box on purpose (cost ceiling + single credential).
+  # stronger reachable from this instance on purpose (cost ceiling + single credential).
   slow: openrouter/deepseek/deepseek-v4-flash-0731
   # `plan` — planning turns. Planning is supposed to happen on the LAPTOP with
   # Opus 5; if the remote agent plans anyway it must stay on the cheap model.
@@ -44,7 +44,7 @@ memory:
   # Long-term memory is OFF. Each poll pass runs a FRESH `--no-session` omp
   # process (see spec §2: "fresh omp session each round"); the durable state of a
   # job is the git worktree plus `.openbuilder/backlog/<slug>/worklog.md` on the
-  # work branch, which is reviewable in the PR. A hidden memory store on the box
+  # work branch, which is reviewable in the PR. A hidden memory store on the instance
   # would be unreviewable state that silently changes agent behaviour between
   # rounds, and would also mean an extra sqlite file to back up.
   #
@@ -58,7 +58,7 @@ memory:
 # ---------------------------------------------------------------------------
 # Disabling a provider gates model selection BEFORE any credential check, so an
 # accidentally-present env var (AWS instance-profile creds are always present on
-# this box!) can never route a token of openbuilder traffic somewhere unbudgeted.
+# this instance!) can never route a token of openbuilder traffic somewhere unbudgeted.
 # This list must stay COMPLETE -- see the array-replacement note at the top.
 disabledProviders:
   # The instance profile grants ssm/ec2/cloudwatch, but IMDS credentials would
@@ -74,7 +74,7 @@ disabledProviders:
   # Same reasoning for GEMINI_API_KEY / GOOGLE_API_KEY.
   - google
   # Local inference engines. A t4g.medium (2 vCPU / 4 GiB, no GPU) cannot host a
-  # coding model; if one of these were ever discovered it would peg the box and
+  # coding model; if one of these were ever discovered it would peg the instance and
   # starve the poll timer instead of erroring fast.
   - ollama
   - llama.cpp

@@ -3,9 +3,9 @@
 # -----------------------------------------------------------------------------
 # Why a public subnet instead of a private subnet:
 #
-#   All access to this box is via SSM Session Manager, and the SSM agent is
+#   All access to this instance is via SSM Session Manager, and the SSM agent is
 #   strictly OUTBOUND: it long-polls ssmmessages/ec2messages/ssm over TCP 443.
-#   Nothing ever connects in. That means the box needs egress to the internet
+#   Nothing ever connects in. That means the instance needs egress to the internet
 #   and nothing else.
 #
 #   The two ways to give a private subnet that egress both cost real money for
@@ -80,7 +80,7 @@ resource "aws_route_table_association" "public" {
 
 resource "aws_security_group" "instance" {
   name        = "${var.name_prefix}-instance"
-  description = "openbuilder box: egress only, no ingress. Access is via SSM Session Manager."
+  description = "openbuilder instance: egress only, no ingress. Access is via SSM Session Manager."
   vpc_id      = aws_vpc.main.id
 
   egress {

@@ -6,7 +6,7 @@
 # Deliberate logging rule: an uneventful pass writes NOTHING to
 # $OPENBUILDER_HOME/log/openbuilder.log — decisions go to stdout (the journal)
 # only. ob-idle-stop treats the log's mtime as "when work last happened", so a
-# chatty poll pass would keep the box awake forever.
+# chatty poll pass would keep the instance awake forever.
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -30,7 +30,7 @@ Runs one pass of the OpenBuilder state machine (spec §6).
 
   --dry-run   Print the decision for every slug and exit 0 without taking any
               action, creating any label, or writing any state. Used by
-              ob-idle-stop to decide whether the box may power itself off.
+              ob-idle-stop to decide whether the instance may power itself off.
 
 Output: one `DECISION ...` line per slug, then a final `ACTIONABLE=<n>` line.
 EOF
@@ -84,7 +84,7 @@ mark_blocked() {
   fi
   ob_log WARN "attempt budget exhausted for ${repo} ${slug} (${attempts}/${MAX_ATTEMPTS})"
   ob_report_blocked "$repo" "$slug" "$pr" \
-    "The attempt budget is exhausted (${attempts} of ${MAX_ATTEMPTS} rounds used). openbuilder will not touch this slug again. To hand it back to the agent, on the box run: \`printf '0\\n' > $(ob_state_dir "$repo" "$slug")/attempts\` and delete \`${marker}\`."
+    "The attempt budget is exhausted (${attempts} of ${MAX_ATTEMPTS} rounds used). openbuilder will not touch this slug again. To hand it back to the agent, on the instance run: \`printf '0\\n' > $(ob_state_dir "$repo" "$slug")/attempts\` and delete \`${marker}\`."
   printf '%s\n' "$attempts" >"$marker"
 }
 
@@ -194,7 +194,7 @@ main() {
 
   # A real pass takes the global lock so passes never overlap. A dry run takes
   # no lock: it changes nothing, and blocking on the live pass would make
-  # ob-idle-stop misread a busy box as an idle one.
+  # ob-idle-stop misread a busy instance as an idle one.
   if ((DRY_RUN == 0)); then
     if ! ob_lock poll; then
       decision "-" "-" "-" skip "poll-lock-held"

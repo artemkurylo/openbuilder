@@ -7,7 +7,7 @@ Unit=openbuilder-poll.service
 OnBootSec=60s
 OnUnitInactiveSec=60s
 AccuracySec=5s
-# A pass missed while the box was stopped is worthless: the laptop starts the
+# A pass missed while the instance was stopped is worthless: the laptop starts the
 # instance before creating work, so the next live pass picks everything up.
 Persistent=false
 

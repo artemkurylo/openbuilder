@@ -154,7 +154,7 @@ work is correct and in scope, approve it and say why briefly.
 The `review-openbuilder-pr` skill has the exact `gh` invocations for posting line
 comments, posting the summary review, and setting `openbuilder:approved` /
 `openbuilder:changes-requested`. Use those commands verbatim — the labels are the
-message bus the box polls, and a mistyped label means the loop stalls silently.
+message bus the instance polls, and a mistyped label means the loop stalls silently.
 
 Post the review, set exactly one of the two labels, then return the structured
 result matching this agent's output schema.

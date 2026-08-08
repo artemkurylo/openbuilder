@@ -67,7 +67,7 @@ prepare_repo() {
     ob_die "work branch ${WORK_BRANCH} does not exist on ${REPO}"
 
   # The worktree normally survives from the implement round; recreate it from the
-  # pushed branch when the box was rebuilt in between.
+  # pushed branch when the instance was rebuilt in between.
   if [[ ! -e "${WT_DIR}/.git" ]]; then
     ob_log WARN "worktree ${WT_DIR} is missing; recreating it from origin/${WORK_BRANCH}"
   fi

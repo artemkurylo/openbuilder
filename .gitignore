@@ -38,7 +38,7 @@ id_rsa
 id_ed25519
 
 # --- Agent run artifacts --------------------------------------------------
-# omp --mode json output, pulled off the box for debugging. Contains prompts,
+# omp --mode json output, pulled off the instance for debugging. Contains prompts,
 # diffs and token costs.
 *.ndjson
 

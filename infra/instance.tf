@@ -1,5 +1,5 @@
 # The omp release asset and the AMI must agree with the instance type's CPU
-# architecture, otherwise the box boots an image it cannot run (or runs an
+# architecture, otherwise the instance boots an image it cannot run (or runs an
 # unrunnable omp binary). instance_type is a variable, so derive the arch from
 # it instead of pinning arm64 and hoping nobody edits it. runner/bootstrap.sh
 # performs the mirror-image detection via `uname -m`.
@@ -18,7 +18,7 @@ data "aws_ssm_parameter" "ubuntu_2404" {
   name = "/aws/service/canonical/ubuntu/server/24.04/stable/current/${local.ami_architecture}/hvm/ebs-gp3/ami-id"
 }
 
-resource "aws_instance" "box" {
+resource "aws_instance" "openbuilder" {
   ami           = nonsensitive(data.aws_ssm_parameter.ubuntu_2404.value)
   instance_type = var.instance_type
 
@@ -26,11 +26,11 @@ resource "aws_instance" "box" {
   vpc_security_group_ids = [aws_security_group.instance.id]
   iam_instance_profile   = aws_iam_instance_profile.instance.name
 
-  # No key_name on purpose: there is no sshd path in or out of this box.
+  # No key_name on purpose: there is no sshd path in or out of this instance.
 
   # IMDSv2 only. hop limit 2 so the runner scripts, which call IMDS from inside
   # the instance (ob-idle-stop resolves its own instance id), still work while
-  # any container on the box cannot reach it.
+  # any container on the instance cannot reach it.
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
@@ -48,7 +48,7 @@ resource "aws_instance" "box" {
     })
   }
 
-  # `shutdown -h` from inside the box (and any accidental `poweroff`) must stop
+  # `shutdown -h` from inside the instance (and any accidental `poweroff`) must stop
   # the instance, never terminate it. Belt-and-braces alongside the IAM policy,
   # which grants StopInstances but not TerminateInstances.
   instance_initiated_shutdown_behavior = "stop"
@@ -69,14 +69,14 @@ resource "aws_instance" "box" {
     extra_apt_packages = join(" ", var.extra_apt_packages)
   })
 
-  # Editing user_data must not recycle a box that has live worktrees on it.
+  # Editing user_data must not recycle a instance that has live worktrees on it.
   # Config changes reach the running instance through `ob-selfupdate`.
   user_data_replace_on_change = false
 
   lifecycle {
     # A new Ubuntu point release changes the SSM-published AMI id. Without this
-    # the next apply would silently replace the box and destroy its state.
-    # Deliberate rebuilds: `terraform taint` / `-replace=aws_instance.box`.
+    # the next apply would silently replace the instance and destroy its state.
+    # Deliberate rebuilds: `terraform taint` / `-replace=aws_instance.openbuilder`.
     ignore_changes = [ami]
   }
 
@@ -93,6 +93,6 @@ resource "aws_instance" "box" {
   ]
 
   tags = merge(local.tags, {
-    Name = "${var.name_prefix}-box"
+    Name = var.name_prefix
   })
 }

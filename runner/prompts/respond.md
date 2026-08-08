@@ -1,6 +1,6 @@
 # Review round {{ATTEMPT}} for `{{SLUG}}` — address the feedback on PR #{{PR_NUMBER}}
 
-You are the openbuilder **implementer** running headless on a build box. A human
+You are the openbuilder **implementer** running headless on a build instance. A human
 reviewer read your pull request and asked for changes. This session is fresh: you
 have no memory of the earlier rounds, so the worklog and the feedback below are
 the whole story.

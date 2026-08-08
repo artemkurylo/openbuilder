@@ -45,7 +45,7 @@ apply: ## terraform apply, then drop the cached instance id
 	@rm -f "$(CACHE_DIR)/instance-id" "$(CACHE_DIR)/region"
 	@echo
 	@echo "next: make secrets   # then paste the put-parameter commands"
-	@echo "      make doctor    # verify the box end to end"
+	@echo "      make doctor    # verify the instance end to end"
 
 destroy: ## Destroy all AWS infrastructure (requires typed confirmation)
 	@printf 'This destroys the openbuilder VPC, instance, EBS volume and SSM parameters.\n'
@@ -62,13 +62,13 @@ secrets: ## Print the aws ssm put-parameter commands for the secrets
 	@terraform -chdir=$(TF_DIR) output -raw set_secrets_commands
 	@printf '\n'
 
-doctor: ## Run ob-doctor on the box and surface its verdict
+doctor: ## Run ob-doctor on the instance and surface its verdict
 	@$(CLI) doctor
 
-shell: ## Open an SSM Session Manager shell on the box
+shell: ## Open an SSM Session Manager shell on the instance
 	@$(CLI) shell
 
-logs: ## Tail the box log over SSM (make logs ARGS=-f)
+logs: ## Tail the instance log over SSM (make logs ARGS=-f)
 	@$(CLI) logs $(ARGS)
 
 status: ## Show slugs, branches, PRs and labels (make status REPO=owner/repo)
@@ -109,5 +109,5 @@ repo-create: ## Create the GitHub control repo and push (no-op if it exists)
 	fi; \
 	gh repo create '$(CONTROL_REPO)' --public --source=. --remote=origin --push
 	@echo
-	@echo "the box clones this repo unauthenticated at first boot, so it must stay public"
+	@echo "the instance clones this repo unauthenticated at first boot, so it must stay public"
 	@echo "(or ob-selfupdate has to mint an App token first) — see docs/architecture.md"

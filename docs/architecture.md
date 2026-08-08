@@ -6,7 +6,7 @@
 
 | Component | Path | What it is |
 |---|---|---|
-| `openbuilder` CLI | `local/bin/openbuilder` | Bash. The only thing you type. Reads `OPENBUILDER_INSTANCE_ID`, `OPENBUILDER_REGION`, `OPENBUILDER_AWS_PROFILE`, `OPENBUILDER_TARGET_REPO`, sourcing `.openbuilder.local` if present. Ignores ambient `AWS_REGION`/`AWS_PROFILE` for box calls so the local model provider's account cannot be targeted by mistake. Subcommands: `plan`, `dispatch`, `review`, `approve`, `request-changes`, `status`, `logs`, `shell`, `doctor`, `start`, `stop`, `cost`. |
+| `openbuilder` CLI | `local/bin/openbuilder` | Bash. The only thing you type. Reads `OPENBUILDER_INSTANCE_ID`, `OPENBUILDER_REGION`, `OPENBUILDER_AWS_PROFILE`, `OPENBUILDER_TARGET_REPO`, sourcing `.openbuilder.local` if present. Ignores ambient `AWS_REGION`/`AWS_PROFILE` for instance calls so the local model provider's account cannot be targeted by mistake. Subcommands: `plan`, `dispatch`, `review`, `approve`, `request-changes`, `status`, `logs`, `shell`, `doctor`, `start`, `stop`, `cost`. |
 | `Makefile` | `Makefile` | Wrappers for the one-time setup and the observation commands: `help` (default), `init`, `plan-tf`, `apply`, `destroy`, `secrets`, `doctor`, `shell`, `logs`, `status`, `fmt`, `lint`, `repo-create`. |
 | planner agent | `agent/local/agents/planner.md` | Opus 5. Emits story cards per `backlog/SCHEMA.md`. |
 | reviewer agent | `agent/local/agents/reviewer.md` | Opus 5. Emits `approve` or `changes-requested` plus line-anchored comments. Read-only tools plus `github` and `bash`. |
@@ -21,16 +21,16 @@ key pair in the design at all.
 | Artifact | Name | Written by |
 |---|---|---|
 | plan branch | `openbuilder/plan/<slug>` | laptop (`dispatch`) |
-| work branch | `openbuilder/work/<slug>` | box (`ob-implement`) |
+| work branch | `openbuilder/work/<slug>` | instance (`ob-implement`) |
 | story cards | `.openbuilder/backlog/<slug>/plan.md`, `story-<NN>-<name>.md` | laptop, committed on the plan branch |
-| worklog | `.openbuilder/backlog/<slug>/worklog.md` | box, committed on the work branch, appended once per round |
-| pull request | head `openbuilder/work/<slug>` | box |
+| worklog | `.openbuilder/backlog/<slug>/worklog.md` | instance, committed on the work branch, appended once per round |
+| pull request | head `openbuilder/work/<slug>` | instance |
 | labels | `openbuilder:queued`, `:in-progress`, `:awaiting-review`, `:changes-requested`, `:approved`, `:blocked` | both |
 
 `<slug>` matches `^[a-z0-9][a-z0-9-]{1,48}$`. There is no other channel. No webhook endpoint, no queue,
 no database — if it is not a branch, a commit, a comment or a label, it does not exist.
 
-### On the box
+### On the instance
 
 | Component | Path | What it is |
 |---|---|---|
@@ -46,7 +46,7 @@ no database — if it is not a branch, a commit, a comment or a label, it does n
 | omp | `/usr/local/bin/omp` | Self-contained bun binary, `omp-linux-arm64`, checksum-verified against `SHA256SUMS.txt`. |
 | implementer agent | `/opt/openbuilder/agent/agents/implementer.md` | Tools `read,grep,glob,write,edit,bash,lsp,todo,task,github,yield`. No `browser`, no `web_search`. |
 
-### Box filesystem
+### Instance filesystem
 
 ```
 /opt/openbuilder                                 OPENBUILDER_HOME, home of the openbuilder system user
@@ -111,10 +111,10 @@ wins, one action per poll pass**:
 | 7 | otherwise | skip (waiting on the human reviewer) |
 
 The ordering is the whole design. Rules 1–4 are refusals and they come first, so no amount of label
-weirdness or leftover state can make the box act on a slug a human has closed out. Rule 7 is the resting
+weirdness or leftover state can make the instance act on a slug a human has closed out. Rule 7 is the resting
 state: the common case for a live PR is "do nothing, the reviewer has it".
 
-### Label transitions performed by the box
+### Label transitions performed by the instance
 
 | Event | Add | Remove |
 |---|---|---|
@@ -160,7 +160,7 @@ sequenceDiagram
     participant L as Laptop omp / Opus 5
     participant A as AWS API
     participant G as GitHub
-    participant B as Box / ob-poll
+    participant B as Instance / ob-poll
     participant M as OpenRouter / DeepSeek V4 Flash
 
     U->>L: openbuilder plan you/repo healthz-endpoint
@@ -204,10 +204,10 @@ Each of these was a real fork in the road. The tradeoff is named, not hidden.
 
 `ob-poll` on a 60-second systemd timer, not a GitHub webhook.
 
-A webhook would need an inbound path to the box: a public listener, an ALB or API Gateway plus Lambda,
+A webhook would need an inbound path to the instance: a public listener, an ALB or API Gateway plus Lambda,
 a TLS certificate, a webhook secret to rotate, and a security group with an ingress rule. That is four
 more resources, one more secret and an internet-reachable endpoint — to save at most 60 seconds of
-latency on a job that takes minutes. Polling needs nothing inbound at all: the box makes outbound HTTPS
+latency on a job that takes minutes. Polling needs nothing inbound at all: the instance makes outbound HTTPS
 calls to `api.github.com` and that is the entire network surface.
 
 **Tradeoff:** up to 60 seconds of latency before a plan branch is noticed, and a steady trickle of `gh`
@@ -219,7 +219,7 @@ work pending.
 
 One public subnet, `map_public_ip_on_launch = true`, zero ingress rules.
 
-The box needs outbound 443 to `api.github.com`, `openrouter.ai`, the Ubuntu and NodeSource mirrors, and
+The instance needs outbound 443 to `api.github.com`, `openrouter.ai`, the Ubuntu and NodeSource mirrors, and
 the AWS SSM/EC2/KMS endpoints. The two "private" alternatives both cost real money: a NAT gateway is
 ~$32/month plus data processing, and the interface endpoints needed for Session Manager
 (`ssm`, `ssmmessages`, `ec2messages`) run ~$22/month combined. Together that is roughly $54/month of
@@ -229,16 +229,16 @@ accepts zero inbound connections.
 **Tradeoff:** the instance has a public IPv4 address. That is a real exposure increase on paper, which is
 why the security group has *no* ingress rules whatsoever (not "SSH from my IP" — none), there is no
 sshd-reachable port, and there is no key pair. An unsolicited packet has nothing to reach. The public IP
-also costs ~$3.65/month if the box runs continuously, now that AWS charges for in-use IPv4 addresses —
-still an order of magnitude cheaper than the alternative, and it stops when the box does.
+also costs ~$3.65/month if the instance runs continuously, now that AWS charges for in-use IPv4 addresses —
+still an order of magnitude cheaper than the alternative, and it stops when the instance does.
 
 ### GitHub App instead of a personal access token
 
 A GitHub App (`openbuilder-bot`) whose installation token `ob-token` mints on demand.
 
-A PAT is a long-lived bearer credential sitting on a box that runs a model with shell access. An App
+A PAT is a long-lived bearer credential sitting on a instance that runs a model with shell access. An App
 installation token expires in one hour, is scoped to the repositories you explicitly installed the App
-on, and cannot be broadened from the box. It also gives the bot its own identity: every commit, PR and
+on, and cannot be broadened from the instance. It also gives the bot its own identity: every commit, PR and
 comment is visibly `openbuilder-bot`, so `git log` and the PR timeline tell you exactly which changes
 were machine-authored, and you can revoke the whole thing by uninstalling one App.
 
@@ -268,9 +268,9 @@ makes worklog discipline a load-bearing instruction in the implementer prompt ra
 One long-lived instance that stops itself after `OPENBUILDER_IDLE_STOP_MINUTES` of nothing to do, rather
 than launching a fresh instance (or container) per job and terminating it.
 
-An ephemeral box starts from zero every time: full `apt-get`, a Node install, an omp download, a cold
+An ephemeral instance starts from zero every time: full `apt-get`, a Node install, an omp download, a cold
 `git clone` of the target repo, and a cold dependency install before the model writes a single line. On
-a `t4g.medium` that is minutes of paid setup per job, repeated. The persistent box keeps
+a `t4g.medium` that is minutes of paid setup per job, repeated. The persistent instance keeps
 `/opt/openbuilder/src/<owner>__<repo>/` as a warm clone that only needs a `git fetch`, keeps the package
 manager cache, and keeps `git worktree` directories around so a review round starts instantly.
 
@@ -301,10 +301,10 @@ vague PR, and this is the design's real dependency on human effort.
 
 - **No inbound network.** The security group has zero ingress rules. No SSH, no port 22, no key pair, no
   load balancer, no webhook listener. All access is `aws ssm start-session` / `aws ssm send-command`,
-  which is an outbound-initiated connection from the box to AWS.
+  which is an outbound-initiated connection from the instance to AWS.
 - **IMDSv2 required.** `metadata_options { http_tokens = "required" }`. The instance metadata service
   cannot be read without a `PUT`-obtained token, which closes the classic SSRF-to-credentials path — the
-  one thing that matters most on a box running a model with shell and network access. `ob-idle-stop`
+  one thing that matters most on a instance running a model with shell and network access. `ob-idle-stop`
   obtains its own instance id the IMDSv2 way.
 - **Secrets in SecureString, never on disk.** `openrouter_api_key` and `github_app_private_key` are SSM
   `SecureString` parameters. `/opt/openbuilder/etc/openbuilder.env` holds only non-secret configuration.
@@ -314,7 +314,7 @@ vague PR, and this is the design's real dependency on human effort.
 - **Least-privilege IAM.** The instance role can read exactly `<ssm_prefix>/*`, decrypt only via
   `ssm.<region>.amazonaws.com` (`kms:ViaService`), put metrics only into the `OpenBuilder` namespace, and
   stop instances **only where `ec2:ResourceTag/openbuilder:managed = "true"`**. The self-stop permission
-  is tag-scoped rather than ARN-scoped, so it survives instance replacement without ever letting the box
+  is tag-scoped rather than ARN-scoped, so it survives instance replacement without ever letting the instance
   stop something it does not own. It has no `ec2:TerminateInstances`, no `iam:*`, no `s3:*`.
 - **Short-lived, narrowly-scoped GitHub credentials.** Installation tokens expire in an hour and only
   cover the repositories the App is installed on. The token cache is mode 0600 and is never logged.
@@ -325,7 +325,7 @@ vague PR, and this is the design's real dependency on human effort.
   A blocked call returns `{ block: true, reason }` and the model sees the refusal.
 - **Provider lockout.** `agent/remote/config.yml` sets `disabledProviders` for `amazon-bedrock`,
   `anthropic`, `openai`, `google`, `ollama`, `llama.cpp` and `lm-studio`, so a stray config or an
-  environment variable cannot make the box talk to a model you did not intend to pay for. The
+  environment variable cannot make the instance talk to a model you did not intend to pay for. The
   implementer agent's tool list excludes `browser` and `web_search`.
 - **Fail loud.** Every failure path exits non-zero, adds `openbuilder:blocked`, and posts a PR comment
   with the log tail. Attempts are counted and capped at `OPENBUILDER_MAX_ATTEMPTS`.
@@ -341,8 +341,8 @@ thing that stops accidents, not the thing that stops attacks.
 
 Inside that qualification, the honest statement of exposure is:
 
-1. **The box holds a GitHub credential with write access to every allowlisted repo.** An installation
-   token is short-lived but continuously renewable from the PEM in SSM, which the box can read by design.
+1. **The instance holds a GitHub credential with write access to every allowlisted repo.** An installation
+   token is short-lived but continuously renewable from the PEM in SSM, which the instance can read by design.
    Anything that gets code execution as `openbuilder` on that instance can push branches, open PRs and
    comment on any repo in `OPENBUILDER_REPOS` for as long as it has that access. **Keep `repos` as small
    as the work requires.** This is the single most important knob in `terraform.tfvars`.

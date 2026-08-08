@@ -2,21 +2,21 @@
 # openbuilder — operator CLI for the openbuilder control plane.
 #
 # Runs on the laptop. Plans and reviews locally with Opus 5; drives the EC2
-# implementer box exclusively through AWS Systems Manager (send-command /
+# implementer instance exclusively through AWS Systems Manager (send-command /
 # start-session). There is no SSH, no key pair and no inbound rule anywhere in
 # this system — if you find yourself wanting `ssh`, you want `openbuilder shell`.
 #
 # Configuration (plain environment variables, no config file format):
-#   OPENBUILDER_INSTANCE_ID   EC2 instance id of the implementer box.
+#   OPENBUILDER_INSTANCE_ID   EC2 instance id of the implementer instance.
 #                             If unset, falls back to
 #                             `terraform -chdir=infra output -raw instance_id`
 #                             and caches the answer.
-#   OPENBUILDER_REGION        Region the box lives in. Falls back to the cached
+#   OPENBUILDER_REGION        Region the instance lives in. Falls back to the cached
 #                             value, then the `region` TF output, then
 #                             eu-central-1. Deliberately ignores AWS_REGION:
 #                             that variable belongs to your local model
 #                             provider and is usually a different region.
-#   OPENBUILDER_AWS_PROFILE   Profile used for EC2/SSM calls against the box.
+#   OPENBUILDER_AWS_PROFILE   Profile used for EC2/SSM calls against the instance.
 #                             Set this when your ambient AWS_PROFILE points at
 #                             a different account (e.g. one that only serves
 #                             the local planner/reviewer model). Unset means
@@ -57,11 +57,11 @@ OB_REMOTE_USER=openbuilder
 
 # name|color|description — the six labels from the naming contract.
 OB_LABELS=(
-    "openbuilder:queued|fbca04|Plan branch pushed; not yet picked up by the box"
+    "openbuilder:queued|fbca04|Plan branch pushed; not yet picked up by the instance"
     "openbuilder:in-progress|1d76db|Remote implementer agent is working on it"
     "openbuilder:awaiting-review|5319e7|Pull request is ready for the Opus 5 reviewer"
     "openbuilder:changes-requested|d93f0b|Reviewer wants another implementation round"
-    "openbuilder:approved|0e8a16|Human may merge; the box stops touching it"
+    "openbuilder:approved|0e8a16|Human may merge; the instance stops touching it"
     "openbuilder:blocked|b60205|Agent gave up; needs a human"
 )
 
@@ -140,7 +140,7 @@ ob_tf_output() {
     printf '%s\n' "$value"
 }
 
-# Where the BOX lives. Deliberately NOT derived from AWS_REGION or
+# Where the INSTANCE lives. Deliberately NOT derived from AWS_REGION or
 # AWS_DEFAULT_REGION: those describe the account and region serving the LOCAL
 # planner/reviewer model (a Bedrock account in another region, for instance), and
 # leaking them here would send every SSM/EC2 call hunting for the instance in the
@@ -183,10 +183,10 @@ ob_region() {
     printf '%s\n' "$candidate"
 }
 
-# Every AWS call for the box goes through here, explicitly scoped to the box's
+# Every AWS call for the instance goes through here, explicitly scoped to the instance's
 # account and region. The surrounding shell is often pinned to a different
 # profile/region for the local model provider, and that must not bleed into
-# instance management. Set OPENBUILDER_AWS_PROFILE when the box lives in an
+# instance management. Set OPENBUILDER_AWS_PROFILE when the instance lives in an
 # account other than your ambient AWS_PROFILE.
 ob_aws() {
     local region
@@ -264,7 +264,7 @@ ob_repo_key() { printf '%s\n' "${1/\//__}"; }
 
 # ob_ssm_exec <script>
 #
-# Runs <script> on the box with the AWS-RunShellScript SSM document, polls
+# Runs <script> on the instance with the AWS-RunShellScript SSM document, polls
 # `aws ssm list-command-invocations` until the invocation reaches a terminal
 # state, writes remote stdout to our stdout and remote stderr to our stderr,
 # and returns the remote script's real exit status.
@@ -381,7 +381,7 @@ ob_wait_ssm_online() {
     return 1
 }
 
-# Idempotent: no-op when the box is already running.
+# Idempotent: no-op when the instance is already running.
 ob_ensure_running() {
     local region instance state
     ob_need aws
@@ -533,17 +533,17 @@ ob_command_table() {
 usage: openbuilder <command> [args]
 
   plan <owner/repo> <slug>          scaffold a backlog and plan it with Opus 5
-  dispatch <owner/repo> <slug>      commit + push the plan branch, hand it to the box
+  dispatch <owner/repo> <slug>      commit + push the plan branch, hand it to the instance
   review <owner/repo> <pr>          review a pull request with Opus 5
   approve <owner/repo> <pr>         label a pull request approved
-  request-changes <owner/repo> <pr> ask the box for another round
+  request-changes <owner/repo> <pr> ask the instance for another round
   status [owner/repo]               slugs, branches, pull requests, labels
-  logs [-f] [-n lines]              tail the box's operational log over SSM
-  shell                             interactive SSM session on the box
-  doctor                            run ob-doctor on the box
+  logs [-f] [-n lines]              tail the instance's operational log over SSM
+  shell                             interactive SSM session on the instance
+  doctor                            run ob-doctor on the instance
   start                             start the implementer instance
   stop                              stop the implementer instance
-  cost                              per-slug model spend from the box's run.ndjson
+  cost                              per-slug model spend from the instance's run.ndjson
   help                              this table
 
 environment: OPENBUILDER_INSTANCE_ID, OPENBUILDER_REGION, OPENBUILDER_AWS_PROFILE,
@@ -671,7 +671,7 @@ cmd_dispatch() {
     ob_validate_slug "$slug"
     ob_need git gh aws jq
 
-    # Start the box first: the poll loop is the only trigger, so a stopped
+    # Start the instance first: the poll loop is the only trigger, so a stopped
     # instance would otherwise turn a dispatch into a silent no-op.
     ob_ensure_running
 
@@ -689,7 +689,7 @@ cmd_dispatch() {
 
     stories=$(find "$dir/$backlog" -maxdepth 1 -name 'story-*.md' | wc -l | tr -d '[:space:]')
     [[ $stories -gt 0 ]] ||
-        ob_die "$backlog contains no story-*.md cards — nothing for the box to implement"
+        ob_die "$backlog contains no story-*.md cards — nothing for the instance to implement"
 
     if [[ $(git -C "$dir" rev-parse --abbrev-ref HEAD) != "$branch" ]]; then
         ob_info "switching $dir to $branch"
@@ -715,10 +715,10 @@ cmd_dispatch() {
 
 Dispatched $repo :: $slug
   plan branch : $branch  ($stories story cards)
-  work branch : $(ob_work_branch "$slug")  (created by the box)
+  work branch : $(ob_work_branch "$slug")  (created by the instance)
 
 What happens next, without any further action from you:
-  1. Within 60s the box's openbuilder-poll timer sees $branch.
+  1. Within 60s the instance's openbuilder-poll timer sees $branch.
   2. It finds no pull request for $(ob_work_branch "$slug") and runs ob-implement.
   3. On success it pushes the work branch, opens a pull request and labels it
      'openbuilder:awaiting-review'. On failure it labels 'openbuilder:blocked'
@@ -742,7 +742,7 @@ cmd_review() {
     ob_validate_pr "$pr"
     ob_need git gh omp aws jq
 
-    # The box must be up: whatever verdict we post starts the next round.
+    # The instance must be up: whatever verdict we post starts the next round.
     ob_ensure_running
 
     local dir head
@@ -808,7 +808,7 @@ cmd_approve() {
     gh pr comment "$pr" --repo "$repo" --body \
         "**openbuilder: approved.** Reviewed with \`$OB_OPUS_MODEL\`. The remote agent will stop touching this branch. A human may merge." >/dev/null
 
-    ob_info "$repo#$pr labelled $OB_LABEL_PREFIX:approved — the box will ignore it from now on"
+    ob_info "$repo#$pr labelled $OB_LABEL_PREFIX:approved — the instance will ignore it from now on"
     printf 'merge it with: gh pr merge %s --repo %s --squash\n' "$pr" "$repo"
 }
 
@@ -827,9 +827,9 @@ cmd_request_changes() {
     gh pr comment "$pr" --repo "$repo" --body \
         "**openbuilder: changes requested.** See the review comments above. The remote agent will pick this up within 60s, start a fresh session against the existing worktree and push another round." >/dev/null
 
-    # The box only reacts while it is up.
+    # The instance only reacts while it is up.
     ob_ensure_running
-    ob_info "$repo#$pr labelled $OB_LABEL_PREFIX:changes-requested — the box responds within 60s"
+    ob_info "$repo#$pr labelled $OB_LABEL_PREFIX:changes-requested — the instance responds within 60s"
 }
 
 # ---------------------------------------------------------------------------
@@ -905,10 +905,10 @@ cmd_status() {
 # request/response: it runs a script to completion and hands back a bounded
 # output blob, so there is no stream to follow. `-f` is therefore a bounded
 # polling loop — each pass asks for the bytes appended since the previous pass,
-# using a byte offset the box reports back. For a real live terminal on the box
+# using a byte offset the instance reports back. For a real live terminal on the instance
 # (interactive `tail -f`, journalctl, a shell) use `openbuilder shell`.
 #
-# The offset is safe because the box treats this file as strictly append-only
+# The offset is safe because the instance treats this file as strictly append-only
 # (ob_log in ob-common.sh and log() in bootstrap.sh both use `>>`, and nothing
 # rotates it). A file that has shrunk is treated as replaced and re-read from 0.
 #
@@ -1086,14 +1086,14 @@ cmd_stop() {
         ;;
     esac
     printf 'state: %s\n' "$(ob_instance_state)"
-    printf 'note: the box also stops itself after OPENBUILDER_IDLE_STOP_MINUTES of idleness.\n'
+    printf 'note: the instance also stops itself after OPENBUILDER_IDLE_STOP_MINUTES of idleness.\n'
 }
 
 # ---------------------------------------------------------------------------
 # cost
 # ---------------------------------------------------------------------------
 
-# The box keeps one NDJSON per attempt at
+# The instance keeps one NDJSON per attempt at
 #   state/<owner>__<repo>__<slug>/rounds/<NNN>/run.ndjson
 # so walk with find and fold the rounds back onto their slug. The flat
 # state/<key>/run.ndjson layout is handled too, so this keeps working if a job
@@ -1121,7 +1121,7 @@ cmd_cost() {
     local out rc=0
     out=$(ob_ssm_exec "$(ob_cost_script)") || rc=$?
     if [[ $rc -ne 0 ]]; then
-        ob_die "could not read model spend from the box (exit $rc)"
+        ob_die "could not read model spend from the instance (exit $rc)"
     fi
     if [[ -z ${out//[[:space:]]/} ]]; then
         printf 'no run.ndjson files under %s/state yet — nothing has run.\n' "$OB_REMOTE_HOME"

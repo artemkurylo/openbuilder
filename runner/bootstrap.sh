@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# bootstrap.sh — provision (or re-provision) the openbuilder box. IDEMPOTENT:
-# re-running it on a healthy box changes nothing.
+# bootstrap.sh — provision (or re-provision) the openbuilder instance. IDEMPOTENT:
+# re-running it on a healthy instance changes nothing.
 # Single responsibility: everything that must be true on the instance before
 # ob-poll can do useful work — packages, gh, Node, omp, the /opt/openbuilder
 # tree, git identity and credentials, and the four systemd units.

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# ob-idle-stop — power the box off when it has nothing to do.
+# ob-idle-stop — power the instance off when it has nothing to do.
 # Single responsibility: evaluate the three idle conditions and, only if all
 # three hold, call ec2:StopInstances on this instance.
 #
 # Deliberate logging rule: a routine "not idle yet" decision goes to the journal
 # (stderr) ONLY. Condition 3 measures the mtime of $OPENBUILDER_HOME/log, so
-# writing that decision to the log file every five minutes would keep the box
+# writing that decision to the log file every five minutes would keep the instance
 # awake forever. Only an actual stop (and any error) is appended to the log.
 set -euo pipefail
 IFS=$'\n\t'

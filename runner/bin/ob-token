@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ob-token — mint a GitHub App installation access token and print ONLY that
-# token on stdout. Single responsibility: GitHub identity for the box.
+# token on stdout. Single responsibility: GitHub identity for the instance.
 #
 # Everything else (gh, git credential helper, omp's github tool) gets its
 # credential from here, so the JWT signing and the caching live in exactly one

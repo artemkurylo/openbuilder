@@ -38,7 +38,7 @@ All monthly figures use **730 hours** as one month.
 
 Two facts that dominate everything below:
 
-1. **EBS is billed 24/7 on the provisioned size, whether the instance runs or not.** Stopping the box
+1. **EBS is billed 24/7 on the provisioned size, whether the instance runs or not.** Stopping the instance
    removes the compute charge and the public IPv4 charge; the 40 GiB gp3 volume keeps costing
    ~$3.80/month regardless. Idle auto-stop does not reduce it by one cent. That is the floor.
 2. **The model is not the expensive part.** At $0.09/Mtok input, a month of real work costs less than a
@@ -180,7 +180,7 @@ compromise between paying for idle and thrashing.
 
 gp3 is billed **24/7 on the provisioned size**, not on usage and not on instance state. It is therefore
 the dominant *fixed* cost: 100% of the stopped-month bill ($3.80 of $3.80), and still ~25% of the
-240 h bill ($3.80 of $15.008). Every other AWS line item on this page goes to zero when the box stops;
+240 h bill ($3.80 of $15.008). Every other AWS line item on this page goes to zero when the instance stops;
 this one does not. Once you are auto-stopping aggressively, **shrinking the volume is the only lever left
 on the floor** — halving it halves the bill of a mostly-idle month:
 
@@ -206,7 +206,7 @@ list prices run above `us-east-1`:
 
 | Alternative | Added monthly cost (approx., unverified) |
 |---|---|
-| NAT gateway (so the box can sit in a private subnet) | ~$32.40 + data processing |
+| NAT gateway (so the instance can sit in a private subnet) | ~$32.40 + data processing |
 | Interface VPC endpoints for `ssm`, `ssmmessages`, `ec2messages` | ~$21.60 |
 | Both | **~$54/month** |
 
@@ -219,7 +219,7 @@ That is roughly three and a half times the entire running cost of the system wit
 ### Lever 1 — shrink the EBS volume (the only lever on the floor)
 
 At the assumed 8 h/day duty cycle the 40 GiB volume is **~25% of the bill** ($3.80 of $15.008), and it is
-the only line item you pay while the box is off — see [the floor](#the-floor-gp3-is-the-one-cost-auto-stop-cannot-touch)
+the only line item you pay while the instance is off — see [the floor](#the-floor-gp3-is-the-one-cost-auto-stop-cannot-touch)
 above for the `root_volume_gb = 20` change and the grow-only caveat. In absolute terms instance hours are
 now the bigger number; in *unavoidable* terms this is the whole floor.
 
@@ -259,7 +259,7 @@ cannot quietly spend a month's budget.
 
 ## 5. Watching actual spend
 
-Model spend, summed from `.message.usage.cost.total` across every round's `run.ndjson` on the box:
+Model spend, summed from `.message.usage.cost.total` across every round's `run.ndjson` on the instance:
 
 ```sh
 openbuilder cost
@@ -306,7 +306,7 @@ Where the thresholds actually sit, with a 40 GiB volume ($3.80 fixed) and $0.043
 ($20.00 − $3.80) ÷ $0.0434/h  =  ~373 awake h/month  (~12.4 h/day) →  budget exceeded above this
 ```
 
-So: $20 is the right budget for an auto-stopping box and the wrong budget for an always-on one. If you
+So: $20 is the right budget for an auto-stopping instance and the wrong budget for an always-on one. If you
 run always-on, raise `monthly_budget_usd` to at least 45 or the alert becomes noise you learn to ignore.
 
 Also set a hard spend limit on the OpenRouter key itself at <https://openrouter.ai/keys>. That is the

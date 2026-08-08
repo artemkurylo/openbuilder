@@ -2,7 +2,7 @@
  * openbuilder — pre-tool guardrails
  *
  * Installed as `.omp/hooks/pre/guardrails.ts` for both the laptop (planner /
- * reviewer) and the EC2 box (implementer). It is the last line of defense behind
+ * reviewer) and the EC2 instance (implementer). It is the last line of defense behind
  * the agent prompts: the prompts say "never merge, never force-push"; this hook
  * makes those sentences enforceable.
  *
@@ -213,7 +213,7 @@ const BASH_RULES: readonly BashRule[] = [
       "instance destroys the root volume — every worktree, every unpushed commit, " +
       "the state directory and the log. The instance profile intentionally grants " +
       "ec2:StopInstances and not ec2:TerminateInstances; `ob-idle-stop` stops the " +
-      "box, and Terraform is the only thing that may replace it.",
+      "instance, and Terraform is the only thing that may replace it.",
   },
   {
     id: "no-runner-config-redirect",

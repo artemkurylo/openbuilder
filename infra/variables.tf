@@ -73,13 +73,13 @@ variable "control_repo" {
 }
 
 variable "model" {
-  description = "omp model selector used for implementation and review-response runs on the box."
+  description = "omp model selector used for implementation and review-response runs on the instance."
   type        = string
   default     = "openrouter/deepseek/deepseek-v4-flash-0731"
 }
 
 variable "smol_model" {
-  description = "omp model selector for cheap auxiliary calls (summaries, title generation) on the box."
+  description = "omp model selector for cheap auxiliary calls (summaries, title generation) on the instance."
   type        = string
   default     = "openrouter/deepseek/deepseek-v4-flash-0731"
 }
@@ -96,13 +96,13 @@ variable "max_runtime" {
 }
 
 variable "max_attempts" {
-  description = "How many times the box may attempt one slug before it self-labels `openbuilder:blocked`."
+  description = "How many times the instance may attempt one slug before it self-labels `openbuilder:blocked`."
   type        = number
   default     = 6
 }
 
 variable "idle_stop_minutes" {
-  description = "Minutes of no work and no filesystem activity before the box stops itself."
+  description = "Minutes of no work and no filesystem activity before the instance stops itself."
   type        = number
   default     = 30
 }
@@ -162,7 +162,7 @@ variable "enable_budget" {
 # -----------------------------------------------------------------------------
 
 variable "omp_version" {
-  description = "omp release to install on the box. `latest` tracks the newest GitHub release; otherwise a tag like v17.2.11."
+  description = "omp release to install on the instance. `latest` tracks the newest GitHub release; otherwise a tag like v17.2.11."
   type        = string
   default     = "latest"
 }

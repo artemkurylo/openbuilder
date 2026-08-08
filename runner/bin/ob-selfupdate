@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ob-selfupdate — bring the box up to date with the control repo.
+# ob-selfupdate — bring the instance up to date with the control repo.
 # Single responsibility: fast-forward /opt/openbuilder/repo and re-run
 # bootstrap.sh, which is idempotent and reinstalls bin/, prompts/, agent/ and
 # the systemd units.

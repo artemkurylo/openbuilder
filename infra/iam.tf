@@ -21,7 +21,7 @@ data "aws_iam_policy_document" "assume_role" {
 
 resource "aws_iam_role" "instance" {
   name               = "${var.name_prefix}-instance"
-  description        = "Role for the openbuilder EC2 box: SSM access, its own parameters, and self-stop."
+  description        = "Role for the openbuilder EC2 instance: SSM access, its own parameters, and self-stop."
   assume_role_policy = data.aws_iam_policy_document.assume_role.json
 
   tags = merge(local.tags, {
@@ -75,7 +75,7 @@ data "aws_iam_policy_document" "instance" {
   }
 
   # 3. Idle self-stop (ob-idle-stop). Scoped by TAG rather than by instance ARN
-  #    on purpose: referencing aws_instance.box.arn here would make the role
+  #    on purpose: referencing aws_instance.openbuilder.arn here would make the role
   #    depend on the instance, which depends on the instance profile, which
   #    depends on the role — a dependency cycle. The tag condition is just as
   #    tight, and it can only ever stop, never terminate.

@@ -7,7 +7,7 @@ globs: .openbuilder/backlog/**/*.md
 # Writing an openbuilder backlog
 
 A backlog is a contract between a strong planner (Opus 5, on a laptop, with you in
-the loop) and a weak implementer (DeepSeek V4 Flash, on a headless box, alone, at
+the loop) and a weak implementer (DeepSeek V4 Flash, on a headless instance, alone, at
 3am, with no way to ask a question). The story card is the entire interface.
 
 The failure mode you are designing against is not "the implementer cannot code". It
@@ -152,7 +152,7 @@ Slug: `token-cache`. Two stories.
 # feat(runner): mint and cache GitHub App installation tokens
 
 ## Goal
-Every `gh` call from the box authenticates with a short-lived GitHub App
+Every `gh` call from the instance authenticates with a short-lived GitHub App
 installation token. Minting happens at most once per validity window instead of
 once per invocation, so a 60-second poll loop does not make 1440 token calls a day.
 
@@ -218,7 +218,7 @@ cloud-init, owned by the `openbuilder` user). `jq` is installed. `ob-common.sh`
 provides `ob_log` and `ob_die`.
 
 Trap: GitHub returns `expires_at` as an ISO-8601 UTC string like
-`2026-08-08T19:44:12Z`. GNU `date -d` parses it; BSD `date` does not. The box is
+`2026-08-08T19:44:12Z`. GNU `date -d` parses it; BSD `date` does not. The instance is
 Ubuntu 24.04, so GNU `date` is correct here — but do not reach for `date -j`.
 
 Trap: the token must never be logged. `ob_log` output goes to a file that a human

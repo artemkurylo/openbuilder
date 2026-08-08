@@ -242,7 +242,7 @@ pr_body() {
     printf -- '- work branch: `%s`\n' "$WORK_BRANCH"
     printf -- '- base branch: `%s`\n' "$DEFAULT_BRANCH"
     printf -- '- worklog: `%s`\n\n' ".openbuilder/backlog/${SLUG}/worklog.md"
-    printf 'Opened by the openbuilder box. The bot never merges, never '
+    printf 'Opened by the openbuilder instance. The bot never merges, never '
     printf 'force-pushes and never pushes to `%s`.\n' "$DEFAULT_BRANCH"
   } >"$body"
   printf '%s' "$body"
