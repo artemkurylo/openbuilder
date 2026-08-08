@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+# ob-implement — turn a plan branch into a pull request.
+# Single responsibility: one implementation round for one slug — prepare the
+# worktree, render the implement prompt from the story cards, run omp, prove it
+# produced commits, push, and open or reuse the PR.
+#
+# Usage: ob-implement <owner/repo> <slug>
+set -euo pipefail
+IFS=$'\n\t'
+
+# shellcheck disable=SC2034  # consumed by ob-common.sh's ob_log prefix after sourcing
+OB_PROG="ob-implement"
+OB_SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./ob-common.sh
+source "${OB_SELF_DIR}/ob-common.sh"
+
+REPO=""
+SLUG=""
+KEY=""
+STATE_DIR=""
+ROUND_DIR=""
+SRC_DIR=""
+WT_DIR=""
+PLAN_BRANCH=""
+WORK_BRANCH=""
+DEFAULT_BRANCH=""
+MERGE_BASE=""
+BASE_SHA=""
+ATTEMPT="0"
+NEW_COMMITS="0"
+PR_NUMBER=""
+PR_EXISTED=0
+COST="0"
+STORY_COUNT=0
+
+usage() {
+  cat <<'EOF'
+Usage: ob-implement <owner/repo> <slug>
+
+Runs one implementation round for openbuilder/plan/<slug> in <owner/repo>:
+clone or fetch the target, branch openbuilder/work/<slug> off the merge-base of
+the plan branch and the default branch, run omp against the story cards, then
+push and open (or reuse) the pull request.
+EOF
+}
+
+# Fail loud (hard rule 5). Guarded against firing inside a command-substitution
+# subshell, where bash also runs EXIT traps.
+on_exit() {
+  local rc=$?
+  if [[ "$BASHPID" != "$$" ]]; then
+    exit "$rc"
+  fi
+  trap - EXIT
+  if ((rc != 0)); then
+    ob_log ERROR "failed rc=${rc} repo=${REPO} slug=${SLUG} attempt=${ATTEMPT}"
+    ob_report_blocked "$REPO" "$SLUG" "$PR_NUMBER" \
+      "\`ob-implement\` failed with exit code ${rc} on attempt ${ATTEMPT}." || true
+  fi
+  exit "$rc"
+}
+
+prepare_repo() {
+  SRC_DIR="$(ob_sync_src "$REPO")"
+  DEFAULT_BRANCH="$(ob_default_branch "$REPO")" ||
+    ob_die "cannot determine the default branch of ${REPO}"
+  [[ "$WORK_BRANCH" != "$DEFAULT_BRANCH" ]] ||
+    ob_die "refusing to operate: work branch equals the default branch"
+
+  git -C "$SRC_DIR" rev-parse --verify --quiet "origin/${PLAN_BRANCH}" >/dev/null ||
+    ob_die "plan branch ${PLAN_BRANCH} does not exist on ${REPO}"
+  git -C "$SRC_DIR" rev-parse --verify --quiet "origin/${DEFAULT_BRANCH}" >/dev/null ||
+    ob_die "default branch ${DEFAULT_BRANCH} not fetched for ${REPO}"
+
+  MERGE_BASE="$(git -C "$SRC_DIR" merge-base \
+    "origin/${PLAN_BRANCH}" "origin/${DEFAULT_BRANCH}")"
+  ob_log INFO "default=${DEFAULT_BRANCH} merge-base=${MERGE_BASE}"
+
+  # Reuse the pushed work branch when there is one, so a second round continues
+  # the same history instead of starting over.
+  if ob_remote_branch_exists "$SRC_DIR" "$WORK_BRANCH"; then
+    ob_add_worktree "$SRC_DIR" "$WT_DIR" "$WORK_BRANCH" "origin/${WORK_BRANCH}"
+  else
+    ob_add_worktree "$SRC_DIR" "$WT_DIR" "$WORK_BRANCH" "$MERGE_BASE"
+  fi
+  BASE_SHA="$(git -C "$WT_DIR" rev-parse HEAD)"
+  ob_log INFO "worktree=${WT_DIR} branch=${WORK_BRANCH} base=${BASE_SHA}"
+}
+
+# card_title <ref:path> — the story card's frontmatter title, or its first
+# heading, or the file name.
+card_title() {
+  local ref_path="$1" fallback="$2" title
+  title="$(git -C "$SRC_DIR" show "$ref_path" 2>/dev/null | awk '
+    /^title:[[:space:]]*/ { sub(/^title:[[:space:]]*/, ""); gsub(/^["'"'"']|["'"'"']$/, ""); print; exit }
+    /^# / { sub(/^# +/, ""); print; exit }' || printf '')"
+  if [[ -z "$title" ]]; then
+    title="$fallback"
+  fi
+  printf '%s' "$title"
+}
+
+# read_backlog — pull plan.md and every story card off the PLAN branch (the work
+# branch is cut from the merge-base and does not contain them).
+read_backlog() {
+  local ref backlog_dir path base title
+  ref="origin/${PLAN_BRANCH}"
+  backlog_dir=".openbuilder/backlog/${SLUG}"
+
+  git -C "$SRC_DIR" show "${ref}:${backlog_dir}/plan.md" >"${ROUND_DIR}/plan.md" ||
+    ob_die "missing ${backlog_dir}/plan.md on ${PLAN_BRANCH}"
+
+  local -a paths=()
+  mapfile -t paths < <(git -C "$SRC_DIR" ls-tree -r --name-only "$ref" \
+    -- "${backlog_dir}/" | sort)
+
+  : >"${ROUND_DIR}/stories.md"
+  : >"${ROUND_DIR}/checklist.md"
+  for path in "${paths[@]+"${paths[@]}"}"; do
+    base="$(basename -- "$path")"
+    case "$base" in
+    story-*.md) ;;
+    *) continue ;;
+    esac
+    {
+      printf '\n---\n\n### Story card: `%s`\n\n' "$base"
+      git -C "$SRC_DIR" show "${ref}:${path}"
+      printf '\n'
+    } >>"${ROUND_DIR}/stories.md"
+    title="$(card_title "${ref}:${path}" "$base")"
+    printf -- '- [ ] `%s` — %s\n' "$base" "$title" >>"${ROUND_DIR}/checklist.md"
+    STORY_COUNT=$((STORY_COUNT + 1))
+  done
+
+  ((STORY_COUNT >= 1)) ||
+    ob_die "no story-*.md cards found under ${backlog_dir} on ${PLAN_BRANCH}"
+  ob_log INFO "loaded ${STORY_COUNT} story card(s) for ${SLUG}"
+}
+
+render() {
+  local scalars blocks worklog
+  scalars="${ROUND_DIR}/scalars.tsv"
+  blocks="${ROUND_DIR}/blocks.tsv"
+  worklog="${WT_DIR}/.openbuilder/backlog/${SLUG}/worklog.md"
+  if [[ ! -f "$worklog" ]]; then
+    worklog="${ROUND_DIR}/no-worklog.md"
+    : >"$worklog"
+  fi
+  {
+    printf 'REPO\t%s\n' "$REPO"
+    printf 'SLUG\t%s\n' "$SLUG"
+    printf 'PLAN_BRANCH\t%s\n' "$PLAN_BRANCH"
+    printf 'WORK_BRANCH\t%s\n' "$WORK_BRANCH"
+    printf 'BASE_BRANCH\t%s\n' "$DEFAULT_BRANCH"
+    printf 'WORKTREE\t%s\n' "$WT_DIR"
+    printf 'BACKLOG_DIR\t%s\n' ".openbuilder/backlog/${SLUG}"
+    printf 'ATTEMPT\t%s\n' "$ATTEMPT"
+    printf 'MAX_ATTEMPTS\t%s\n' "$OPENBUILDER_MAX_ATTEMPTS"
+    printf 'MAX_RUNTIME\t%s\n' "$OPENBUILDER_MAX_RUNTIME"
+    printf 'MODEL\t%s\n' "$OPENBUILDER_MODEL"
+    printf 'STORY_COUNT\t%s\n' "$STORY_COUNT"
+  } >"$scalars"
+  {
+    printf 'PLAN\t%s\n' "${ROUND_DIR}/plan.md"
+    printf 'STORIES\t%s\n' "${ROUND_DIR}/stories.md"
+    printf 'WORKLOG\t%s\n' "$worklog"
+  } >"$blocks"
+
+  ob_render_prompt "${OPENBUILDER_HOME}/prompts/implement.md" \
+    "${ROUND_DIR}/prompt.md" "$scalars" "$blocks"
+}
+
+run_agent() {
+  local rc=0
+  ob_run_omp "$WT_DIR" "${ROUND_DIR}/prompt.md" "${ROUND_DIR}/run.ndjson" || rc=$?
+  COST="$(ob_omp_cost "${ROUND_DIR}/run.ndjson")"
+  ob_omp_final_text "${ROUND_DIR}/run.ndjson" >"${ROUND_DIR}/final.md"
+  ob_log INFO "round ${ATTEMPT} cost=${COST} USD"
+  ((rc == 0)) || ob_die "omp exited ${rc} on attempt ${ATTEMPT}"
+}
+
+assert_progress() {
+  NEW_COMMITS="$(git -C "$WT_DIR" rev-list --count "${BASE_SHA}..HEAD")"
+  ob_log INFO "new commits this round: ${NEW_COMMITS}"
+  ((NEW_COMMITS >= 1)) ||
+    ob_die "the agent produced no commits on ${WORK_BRANCH} (attempt ${ATTEMPT})"
+  if [[ -n "$(git -C "$WT_DIR" status --porcelain)" ]]; then
+    ob_log WARN "worktree still has uncommitted changes; they were NOT pushed"
+  fi
+}
+
+record_worklog() {
+  local detail worklog heading
+  detail="${ROUND_DIR}/worklog-detail.md"
+  {
+    printf -- '- action: implement\n'
+    printf -- '- model: `%s`\n' "$OPENBUILDER_MODEL"
+    printf -- '- new commits: %s\n' "$NEW_COMMITS"
+    printf -- '- cost: %s USD\n' "$COST"
+    printf -- '- story cards: %s\n\n' "$STORY_COUNT"
+    printf '### Agent summary\n\n'
+    cat "${ROUND_DIR}/final.md"
+    printf '\n'
+  } >"$detail"
+  heading="Implementation round by \`ob-implement\` (attempt ${ATTEMPT} of ${OPENBUILDER_MAX_ATTEMPTS})."
+  worklog="$(ob_worklog_append "$WT_DIR" "$SLUG" "$ATTEMPT" "$heading" "$detail")"
+  git -C "$WT_DIR" add -- "$worklog"
+  git -C "$WT_DIR" commit --quiet \
+    -m "openbuilder(worklog): implementation round ${ATTEMPT} for ${SLUG}"
+}
+
+push_branch() {
+  [[ "$WORK_BRANCH" != "$DEFAULT_BRANCH" ]] ||
+    ob_die "refusing to push to the default branch"
+  git -C "$WT_DIR" push --set-upstream origin "$WORK_BRANCH"
+  ob_log INFO "pushed ${WORK_BRANCH} to ${REPO}"
+}
+
+pr_title() {
+  local title
+  title="$(awk '/^# /{sub(/^# +/, ""); print; exit}' "${ROUND_DIR}/plan.md")"
+  if [[ -z "$title" ]]; then
+    title="openbuilder: ${SLUG}"
+  fi
+  printf '%.200s' "$title"
+}
+
+pr_body() {
+  local body="${ROUND_DIR}/pr-body.md"
+  {
+    printf '## Plan\n\n'
+    awk 'NR == 1 && /^# / { next }
+         { kept++; if (kept <= 60) print; else { print "\n_(plan truncated — read the full plan on the plan branch)_"; exit } }' \
+      "${ROUND_DIR}/plan.md"
+    printf '\n## Stories\n\n'
+    cat "${ROUND_DIR}/checklist.md"
+    printf '\n## openbuilder\n\n'
+    printf -- '- attempt: %s of %s\n' "$ATTEMPT" "$OPENBUILDER_MAX_ATTEMPTS"
+    printf -- '- model: `%s`\n' "$OPENBUILDER_MODEL"
+    printf -- '- token cost this round: %s USD\n' "$COST"
+    printf -- '- plan branch: `%s`\n' "$PLAN_BRANCH"
+    printf -- '- work branch: `%s`\n' "$WORK_BRANCH"
+    printf -- '- base branch: `%s`\n' "$DEFAULT_BRANCH"
+    printf -- '- worklog: `%s`\n\n' ".openbuilder/backlog/${SLUG}/worklog.md"
+    printf 'Opened by the openbuilder box. The bot never merges, never '
+    printf 'force-pushes and never pushes to `%s`.\n' "$DEFAULT_BRANCH"
+  } >"$body"
+  printf '%s' "$body"
+}
+
+open_or_reuse_pr() {
+  local body title comment
+  body="$(pr_body)"
+  if [[ -z "$PR_NUMBER" ]]; then
+    title="$(pr_title)"
+    ob_gh pr create --repo "$REPO" --base "$DEFAULT_BRANCH" \
+      --head "$WORK_BRANCH" --title "$title" --body-file "$body" >/dev/null ||
+      ob_log WARN "gh pr create reported an error; re-checking for an existing PR"
+    PR_NUMBER="$(ob_pr_number "$REPO" "$WORK_BRANCH" all)"
+    [[ -n "$PR_NUMBER" ]] ||
+      ob_die "could not create or find a PR for ${WORK_BRANCH}"
+    ob_log INFO "opened ${REPO}#${PR_NUMBER}"
+  else
+    comment="${ROUND_DIR}/round-comment.md"
+    {
+      printf '### openbuilder: implementation round %s\n\n' "$ATTEMPT"
+      printf -- '- new commits: %s\n' "$NEW_COMMITS"
+      printf -- '- cost: %s USD\n\n' "$COST"
+      cat "${ROUND_DIR}/final.md"
+    } >"$comment"
+    ob_pr_comment "$REPO" "$PR_NUMBER" "$comment"
+    ob_log INFO "reused ${REPO}#${PR_NUMBER}"
+  fi
+}
+
+main() {
+  if (($# != 2)); then
+    usage >&2
+    exit 2
+  fi
+  REPO="$1"
+  SLUG="$2"
+
+  ob_load_env
+  ob_require_repo "$REPO"
+  ob_require_slug "$SLUG"
+
+  KEY="$(ob_slug_key "$REPO" "$SLUG")"
+  if ! ob_lock "$KEY"; then
+    ob_log INFO "lock ${KEY} is held by another job; skipping"
+    exit 0
+  fi
+  trap on_exit EXIT
+
+  PLAN_BRANCH="${OPENBUILDER_BRANCH_PREFIX}/plan/${SLUG}"
+  WORK_BRANCH="${OPENBUILDER_BRANCH_PREFIX}/work/${SLUG}"
+  STATE_DIR="$(ob_state_dir "$REPO" "$SLUG")"
+  WT_DIR="$(ob_worktree_dir "$REPO" "$SLUG")"
+  ATTEMPT="$(ob_attempts_incr "$REPO" "$SLUG")"
+  ROUND_DIR="${STATE_DIR}/rounds/$(printf '%03d' "$ATTEMPT")"
+  mkdir -p "$ROUND_DIR"
+  ob_log INFO "start repo=${REPO} slug=${SLUG} attempt=${ATTEMPT}/${OPENBUILDER_MAX_ATTEMPTS}"
+
+  ob_ensure_labels "$REPO"
+
+  # §6 start transition. Labels live on the PR, so on the very first round there
+  # is nothing to label yet — the awaiting-review flip below covers that case.
+  PR_NUMBER="$(ob_pr_number "$REPO" "$WORK_BRANCH" all)"
+  if [[ -n "$PR_NUMBER" ]]; then
+    PR_EXISTED=1
+    ob_label_add "$REPO" "$PR_NUMBER" in-progress
+    ob_label_remove "$REPO" "$PR_NUMBER" queued
+  fi
+
+  prepare_repo
+  read_backlog
+  render
+  run_agent
+  assert_progress
+  record_worklog
+  push_branch
+  open_or_reuse_pr
+
+  # §6 success transition.
+  ob_label_remove "$REPO" "$PR_NUMBER" in-progress
+  ob_label_remove "$REPO" "$PR_NUMBER" queued
+  ob_label_add "$REPO" "$PR_NUMBER" awaiting-review
+  ob_log INFO "done repo=${REPO} slug=${SLUG} pr=${PR_NUMBER} commits=${NEW_COMMITS} cost=${COST} reused_pr=${PR_EXISTED}"
+}
+
+main "$@"

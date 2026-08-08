@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# ob-doctor — preflight the box and print an aligned PASS/FAIL table.
+# Single responsibility: prove every dependency of a real job works BEFORE a job
+# needs it. Exits non-zero if any check fails.
+set -euo pipefail
+IFS=$'\n\t'
+
+# shellcheck disable=SC2034  # consumed by ob-common.sh's ob_log prefix after sourcing
+OB_PROG="ob-doctor"
+OB_SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./ob-common.sh
+source "${OB_SELF_DIR}/ob-common.sh"
+
+FAILURES=0
+WARNINGS=0
+
+# check <name> <PASS|FAIL|WARN> [detail]
+check() {
+  local name="$1" status="$2" detail="${3:-}"
+  printf '%-40s %-4s %s\n' "$name" "$status" "$detail"
+  case "$status" in
+  FAIL) FAILURES=$((FAILURES + 1)) ;;
+  WARN) WARNINGS=$((WARNINGS + 1)) ;;
+  *) ;;
+  esac
+}
+
+check_binaries() {
+  local bin version
+  for bin in omp gh jq git aws curl openssl flock awk sed find systemctl; do
+    if ! command -v "$bin" >/dev/null 2>&1; then
+      check "binary: ${bin}" FAIL "not on PATH"
+      continue
+    fi
+    version=""
+    case "$bin" in
+    omp) version="$(omp --version 2>/dev/null | awk 'NR == 1' || printf '')" ;;
+    gh) version="$(gh --version 2>/dev/null | awk 'NR == 1' || printf '')" ;;
+    jq) version="$(jq --version 2>/dev/null || printf '')" ;;
+    git) version="$(git --version 2>/dev/null || printf '')" ;;
+    aws) version="$(aws --version 2>&1 | awk 'NR == 1' || printf '')" ;;
+    esac
+    check "binary: ${bin}" PASS "$(command -v "$bin") ${version}"
+  done
+}
+
+check_env() {
+  local envfile="${OPENBUILDER_ENV_FILE:-/opt/openbuilder/etc/openbuilder.env}"
+  if [[ -r "$envfile" ]]; then
+    check "env file" PASS "$envfile"
+  else
+    check "env file" FAIL "${envfile} is not readable (using built-in defaults)"
+  fi
+  if [[ -n "${OPENBUILDER_REPOS}" ]]; then
+    check "env: OPENBUILDER_REPOS" PASS "$OPENBUILDER_REPOS"
+  else
+    check "env: OPENBUILDER_REPOS" FAIL "empty — the poll loop has nothing to do"
+  fi
+  check "env: OPENBUILDER_MODEL" PASS "$OPENBUILDER_MODEL"
+  check "env: PI_CODING_AGENT_DIR" PASS "$PI_CODING_AGENT_DIR"
+
+  local dir
+  for dir in log run state src work cache prompts bin; do
+    if [[ -d "${OPENBUILDER_HOME}/${dir}" && -w "${OPENBUILDER_HOME}/${dir}" ]]; then
+      check "tree: ${OPENBUILDER_HOME}/${dir}" PASS "writable"
+    else
+      check "tree: ${OPENBUILDER_HOME}/${dir}" FAIL "missing or not writable"
+    fi
+  done
+}
+
+check_ssm() {
+  local param
+  for param in openrouter_api_key github_app_id github_app_installation_id \
+    github_app_private_key; do
+    # Values are read to prove decryption works, and are never printed.
+    if ob_ssm "$param" >/dev/null 2>&1; then
+      check "ssm: ${OPENBUILDER_SSM_PREFIX%/}/${param}" PASS "readable and decrypted"
+    else
+      check "ssm: ${OPENBUILDER_SSM_PREFIX%/}/${param}" FAIL "unreadable, empty or REPLACE_ME"
+    fi
+  done
+}
+
+check_github() {
+  local token count
+  if ! token="$(ob_gh_token 2>/dev/null)" || [[ -z "$token" ]]; then
+    check "github: app token" FAIL "ob-token could not mint an installation token"
+    return 0
+  fi
+  check "github: app token" PASS "minted (${#token} chars, not shown)"
+  unset token
+
+  # NOTE: a GitHub App installation token cannot call /user (that endpoint needs
+  # a user-to-server token), so the equivalent liveness probe is the installation
+  # itself.
+  count="$(ob_gh api /installation/repositories --jq '.total_count // 0' 2>/dev/null || printf '')"
+  if [[ -n "$count" ]]; then
+    check "github: api reachable" PASS "installation covers ${count} repo(s)"
+  else
+    check "github: api reachable" FAIL "GET /installation/repositories failed"
+  fi
+}
+
+check_repos() {
+  local -a repos=()
+  local repo push branch
+  mapfile -t repos < <(ob_repos)
+  if ((${#repos[@]} == 0)); then
+    check "repos: configured" FAIL "OPENBUILDER_REPOS is empty"
+    return 0
+  fi
+  for repo in "${repos[@]}"; do
+    push="$(ob_gh api "repos/${repo}" --jq '.permissions.push // false' 2>/dev/null || printf '')"
+    if [[ "$push" == "true" ]]; then
+      branch="$(ob_default_branch "$repo" 2>/dev/null || printf '?')"
+      check "repo: ${repo}" PASS "writable, default branch ${branch}"
+    elif [[ "$push" == "false" ]]; then
+      check "repo: ${repo}" FAIL "reachable but the App has no push permission"
+    else
+      check "repo: ${repo}" FAIL "not reachable with the App installation token"
+    fi
+  done
+}
+
+check_model() {
+  local dir prompt text rc=0
+  dir="$(mktemp -d)"
+  prompt="${dir}/probe.md"
+  printf 'Reply with exactly one word and nothing else: ok\n' >"$prompt"
+  ob_run_omp "$dir" "$prompt" "${dir}/run.ndjson" "$OPENBUILDER_SMOL_MODEL" "2m" \
+    >/dev/null 2>&1 || rc=$?
+  if ((rc != 0)); then
+    check "model: ${OPENBUILDER_SMOL_MODEL}" FAIL "omp exited ${rc} (bad OPENROUTER_API_KEY, model id or egress)"
+    rm -rf "$dir"
+    return 0
+  fi
+  text="$(ob_omp_final_text "${dir}/run.ndjson" | tr -d '\n' | cut -c1-40)"
+  if [[ -n "$text" ]]; then
+    check "model: ${OPENBUILDER_SMOL_MODEL}" PASS "replied \"${text}\", cost $(ob_omp_cost "${dir}/run.ndjson") USD"
+  else
+    check "model: ${OPENBUILDER_SMOL_MODEL}" FAIL "omp exited 0 but produced no assistant text"
+  fi
+  rm -rf "$dir"
+}
+
+check_timers() {
+  local unit
+  for unit in openbuilder-poll.timer openbuilder-idle.timer; do
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+      check "timer: ${unit}" PASS "active"
+    else
+      check "timer: ${unit}" FAIL "not active (systemctl enable --now ${unit})"
+    fi
+  done
+}
+
+check_disk() {
+  local avail_kb use_pct avail_gb detail
+  avail_kb="$(df -P "$OPENBUILDER_HOME" | awk 'NR == 2 {print $4}')"
+  use_pct="$(df -P "$OPENBUILDER_HOME" | awk 'NR == 2 {gsub(/%/, "", $5); print $5}')"
+  avail_gb=$((avail_kb / 1024 / 1024))
+  detail="${avail_gb}GiB free (${use_pct}% used)"
+  # Absolute headroom is what matters: one target-repo clone plus its
+  # node_modules can want several GiB, while a high percentage on a big volume is
+  # harmless.
+  if ((avail_gb < 5)); then
+    check "disk: ${OPENBUILDER_HOME}" FAIL "$detail"
+  elif ((avail_gb < 15)); then
+    check "disk: ${OPENBUILDER_HOME}" WARN "$detail"
+  else
+    check "disk: ${OPENBUILDER_HOME}" PASS "$detail"
+  fi
+}
+
+main() {
+  ob_load_env
+  printf '%-40s %-4s %s\n' "CHECK" "----" "DETAIL"
+  printf '%-40s %-4s %s\n' "----------------------------------------" "----" \
+    "------------------------------"
+  check_binaries
+  check_env
+  check_ssm
+  check_github
+  check_repos
+  check_model
+  check_timers
+  check_disk
+  printf '\n'
+  if ((FAILURES > 0)); then
+    printf '%d check(s) FAILED, %d warning(s).\n' "$FAILURES" "$WARNINGS"
+    return 1
+  fi
+  printf 'All checks passed (%d warning(s)).\n' "$WARNINGS"
+}
+
+main "$@"

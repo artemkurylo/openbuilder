@@ -1,0 +1,53 @@
+# openbuilder — copy to terraform.tfvars and edit.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# Only `repos` is required; every other line below shows the default and can
+# stay commented out. No secrets belong in this file — the four SSM parameter
+# values are set out of band (see the `set_secrets_commands` output).
+
+# --- Required -----------------------------------------------------------------
+
+# Target repositories the remote agent may work on, as owner/repo.
+repos = [
+  "artemkurylo/my-app",
+  "artemkurylo/my-api",
+]
+
+# --- Placement ----------------------------------------------------------------
+
+# region      = "us-east-1"
+# name_prefix = "openbuilder"
+
+# --- Instance shape -----------------------------------------------------------
+
+# instance_type  = "t4g.medium"   # 2 vCPU / 4 GiB arm64, ~$24/mo always-on
+# root_volume_gb = 100            # gp3, encrypted; ~$8/mo
+
+# --- Runtime configuration ----------------------------------------------------
+
+# ssm_prefix        = "/openbuilder"
+# control_repo      = "artemkurylo/openbuilder"
+# model             = "openrouter/deepseek/deepseek-v4-flash-0731"
+# smol_model        = "openrouter/deepseek/deepseek-v4-flash-0731"
+# max_runtime       = "45m"       # ceiling for one omp run
+# max_attempts      = 6           # then the slug is labelled openbuilder:blocked
+# idle_stop_minutes = 30          # self-stop after this much quiet
+# git_user_name     = "openbuilder-bot"
+# git_user_email    = "openbuilder-bot@users.noreply.github.com"
+
+# --- Network ------------------------------------------------------------------
+
+# vpc_cidr    = "10.42.0.0/16"
+# subnet_cidr = "10.42.1.0/24"
+
+# --- Cost guardrails ----------------------------------------------------------
+
+# monthly_budget_usd = 100
+# budget_alert_email = "you@example.com"   # empty string disables the budget
+# enable_budget      = true
+
+# --- Bootstrap inputs ---------------------------------------------------------
+
+# omp_version        = "latest"   # or a tag like "v17.2.11"
+# extra_apt_packages = ["postgresql-client", "redis-tools"]

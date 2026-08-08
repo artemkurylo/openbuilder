@@ -1,0 +1,334 @@
+# openbuilder
+
+A control plane for autonomous coding that splits the job across two machines and uses GitHub as the
+message bus. Your laptop runs a strong, expensive model (Claude Opus 5 via `omp`) to do the two things
+humans are bad at delegating — deciding *what* to build and judging whether the result is acceptable.
+A small always-on arm64 EC2 box runs a cheap, fast model (DeepSeek V4 Flash via OpenRouter) to do the
+typing: it picks up plan branches, implements the stories, opens a pull request, and answers review
+rounds until the reviewer approves. There is no webhook, no queue, no inbound port and no SSH — the box
+polls GitHub every 60 seconds, and stops itself when there is nothing to do. Every artifact of every
+step is a branch, a commit, a PR comment or a label, so the whole system is auditable with `git log`
+and `gh`.
+
+## How it flows
+
+```mermaid
+flowchart TD
+    A["Laptop: openbuilder plan<br/>Opus 5 writes story cards"] --> B["Laptop: openbuilder dispatch<br/>starts box, pushes openbuilder/plan/slug"]
+    B --> C["GitHub: plan branch + label openbuilder:queued"]
+    C --> D["Box: ob-poll every 60s<br/>rule 5 matches"]
+    D --> E["Box: ob-implement<br/>DeepSeek V4 Flash writes code"]
+    E --> F["GitHub: PR from openbuilder/work/slug<br/>label openbuilder:awaiting-review"]
+    F --> G["Laptop: openbuilder review<br/>Opus 5 reads the diff"]
+    G -->|changes needed| H["Laptop: openbuilder request-changes<br/>label openbuilder:changes-requested"]
+    H --> I["Box: ob-poll rule 6<br/>ob-respond, fresh session + worklog"]
+    I --> F
+    G -->|looks good| J["Laptop: openbuilder approve<br/>label openbuilder:approved"]
+    J --> K["Human: gh pr merge --squash"]
+    F -.->|nothing to do for 30 min| L["Box: ob-idle-stop<br/>instance stops itself"]
+```
+
+Three roles, three different cost profiles:
+
+| Role | Where | Model | Job |
+|---|---|---|---|
+| planner | laptop | `amazon-bedrock/us.anthropic.claude-opus-5` | turn an idea into backlog story cards, push a plan branch |
+| implementer | EC2 `t4g.medium` | `openrouter/deepseek/deepseek-v4-flash-0731` | implement stories, open a PR, answer review rounds |
+| reviewer | laptop | `amazon-bedrock/us.anthropic.claude-opus-5` | review the PR, post comments, gate the merge |
+
+The box **auto-stops when idle** (no lock held, no actionable work, nothing touched for
+`OPENBUILDER_IDLE_STOP_MINUTES`, default 30). That is safe because the laptop CLI **starts the instance
+before it creates work** — `openbuilder dispatch` and `openbuilder review` both call
+`aws ec2 start-instances` and wait for the box to come up. A stopped box is never a missed trigger.
+
+## Quickstart: zero to first merged PR
+
+Everything below is copy-pasteable. Replace `you/your-repo` with the repo you want the agent to work in.
+
+### 0. Prerequisites
+
+| Tool | Minimum | Check |
+|---|---|---|
+| Terraform | `>= 1.9` | `terraform version` |
+| AWS CLI | v2 | `aws --version` |
+| GitHub CLI | any recent | `gh auth status` |
+| omp | `17.2.11` | `omp --version` |
+| An AWS account | — | `aws sts get-caller-identity` |
+| An OpenRouter API key | — | https://openrouter.ai/keys |
+
+Your laptop also needs Amazon Bedrock access to `us.anthropic.claude-opus-5` in the region you use for
+Bedrock, because the planner and reviewer run locally against that model.
+
+### 1. Get this repo onto GitHub
+
+Cloud-init clones the control repo onto the box over plain HTTPS, so the simplest setup is a public
+control repo.
+
+```sh
+git clone https://github.com/artemkurylo/openbuilder.git
+cd openbuilder
+```
+
+Building it from scratch instead? From the repo root:
+
+```sh
+make repo-create
+```
+
+> If you make the control repo private, add it to the GitHub App installation in step 2 as well —
+> the first cloud-init clone will fail (logged, not fatal) and `ob-selfupdate` will pick it up later
+> with an App token.
+
+### 2. Create the GitHub App
+
+Follow **[docs/github-app-setup.md](docs/github-app-setup.md)**. It walks the exact click-path and ends
+with three values you will need in step 5:
+
+- the numeric **App ID**
+- the numeric **installation ID**
+- the downloaded **private key PEM**
+
+Permissions are Contents RW, Pull requests RW, Issues RW, Metadata RO, Workflows RW. No webhook.
+
+### 3. Initialise Terraform
+
+```sh
+make init
+```
+
+This runs `terraform init` in `infra/` and creates `infra/terraform.tfvars` from
+`infra/terraform.tfvars.example` if it does not exist yet.
+
+### 4. Fill in `infra/terraform.tfvars`
+
+Open `infra/terraform.tfvars` and set at minimum:
+
+```hcl
+region             = "us-east-1"
+repos              = ["you/your-repo"]
+control_repo       = "artemkurylo/openbuilder"
+budget_alert_email = "you@example.com"
+```
+
+`repos` is the allowlist. The box will only ever look at plan branches in these repositories, and the
+App installation token is scoped to them. Everything else has a sane default (`t4g.medium`, 100 GB gp3,
+`/openbuilder` SSM prefix, 45m max runtime, 6 max attempts, 30 min idle stop).
+
+### 5. Create the infrastructure
+
+```sh
+make plan-tf     # read the plan; expect a VPC, one public subnet, an IGW, an SG with zero ingress,
+                 # an IAM role, four SSM parameters and one EC2 instance
+make apply
+```
+
+Terraform creates the four SSM parameters with the placeholder value `REPLACE_ME` and then
+**never touches their contents again** (`lifecycle { ignore_changes = [value] }`).
+
+### 6. Put the three secrets into SSM
+
+```sh
+make secrets
+```
+
+That prints the exact commands with placeholders. Run them with your real values:
+
+```sh
+aws ssm put-parameter --overwrite --name /openbuilder/openrouter_api_key \
+  --type SecureString --value 'sk-or-v1-REPLACE_ME' --region us-east-1
+
+aws ssm put-parameter --overwrite --name /openbuilder/github_app_id \
+  --type String --value 'REPLACE_ME' --region us-east-1
+
+aws ssm put-parameter --overwrite --name /openbuilder/github_app_installation_id \
+  --type String --value 'REPLACE_ME' --region us-east-1
+
+aws ssm put-parameter --overwrite --name /openbuilder/github_app_private_key \
+  --type SecureString --value "$(cat ~/Downloads/openbuilder-bot.private-key.pem)" --region us-east-1
+```
+
+Nothing secret is ever written to `/opt/openbuilder/etc/openbuilder.env`. The runner fetches these with
+`aws ssm get-parameter --with-decryption` at job start and exports them into the `omp` child process only.
+
+### 7. Point the laptop CLI at the box
+
+```sh
+cat > .openbuilder.local <<'EOF'
+OPENBUILDER_INSTANCE_ID=i-REPLACE_ME
+OPENBUILDER_REGION=us-east-1
+OPENBUILDER_TARGET_REPO=you/your-repo
+EOF
+```
+
+`terraform output instance_id` (or the tail of `make apply`) gives you the instance id. Then put the CLI
+on your `PATH`:
+
+```sh
+export PATH="$PWD/local/bin:$PATH"
+```
+
+### 8. Verify the box
+
+```sh
+make doctor
+```
+
+`ob-doctor` runs on the instance over SSM and prints a PASS/FAIL table: binaries and versions, env file
+parsed, every SSM parameter readable, App token mints and `gh api user` works, every repo in
+`OPENBUILDER_REPOS` reachable and writable, `OPENROUTER_API_KEY` valid via a one-token `omp` call, both
+systemd timers active, disk free. **Do not continue until every row is PASS.**
+
+### 9. Plan a change
+
+```sh
+openbuilder plan you/your-repo healthz-endpoint
+```
+
+Opus 5 runs locally with the planner agent and scaffolds
+`.openbuilder/backlog/healthz-endpoint/` — a `plan.md` plus one `story-NN-*.md` per slice. Read them.
+Edit them. This is the highest-leverage five minutes in the whole loop; the remote agent will do exactly
+what these cards say and nothing more. The contract is [backlog/SCHEMA.md](backlog/SCHEMA.md), and
+[backlog/example/plan.md](backlog/example/plan.md) plus its story card is a filled-in pair to compare
+against.
+
+### 10. Dispatch
+
+```sh
+openbuilder dispatch you/your-repo healthz-endpoint
+```
+
+This starts the instance and waits for it, commits the backlog directory, pushes
+`openbuilder/plan/healthz-endpoint`, and makes sure the six `openbuilder:*` labels exist in the repo.
+
+### 11. Wait for the PR
+
+```sh
+openbuilder status you/your-repo
+```
+
+Within ~60 seconds `ob-poll` matches rule 5 (no PR with head `openbuilder/work/healthz-endpoint`) and
+runs `ob-implement`. The label goes `openbuilder:queued` → `openbuilder:in-progress` →
+`openbuilder:awaiting-review`, and a PR appears whose title is the first `# ` heading of `plan.md`.
+Watch it happen with:
+
+```sh
+openbuilder logs -f
+```
+
+### 12. Review
+
+```sh
+openbuilder review you/your-repo 42
+```
+
+Opus 5 reads the diff, the plan, the worklog and the repo, then posts line-anchored comments and a
+verdict. Act on the verdict:
+
+```sh
+openbuilder request-changes you/your-repo 42   # -> box runs ob-respond on the next poll
+```
+
+Each `request-changes` costs one attempt. After `OPENBUILDER_MAX_ATTEMPTS` (6) the box labels the PR
+`openbuilder:blocked` and stops touching it.
+
+### 13. Approve and merge
+
+```sh
+openbuilder approve you/your-repo 42
+gh pr merge 42 --repo you/your-repo --squash --delete-branch
+```
+
+`openbuilder:approved` is the box's stop sign: rule 2 in the state machine skips that slug forever.
+**Only a human merges.** The remote agent is blocked from merging, force-pushing and pushing to a
+default branch by the guardrails hook, and never has a reason to try.
+
+Thirty minutes later `ob-idle-stop` powers the box down and your spend drops to the EBS volume.
+
+## The daily loop
+
+Once the setup above is done, a normal day is four commands:
+
+```sh
+openbuilder plan     you/your-repo add-rate-limit   # think, then edit the story cards
+openbuilder dispatch you/your-repo add-rate-limit   # starts the box, pushes the plan branch
+openbuilder review   you/your-repo 43               # Opus 5 reviews; you read its verdict
+openbuilder approve  you/your-repo 43               # then gh pr merge
+```
+
+Everything else is observation:
+
+| Command | What it does |
+|---|---|
+| `openbuilder status [owner/repo]` | table of slugs, branches, PRs, labels, last action |
+| `openbuilder logs [-f]` | tail `/opt/openbuilder/log/openbuilder.log` over SSM |
+| `openbuilder cost` | sum `.message.usage.cost.total` across the box's `run.ndjson` files |
+| `openbuilder doctor` | run `ob-doctor` on the box |
+| `openbuilder shell` | `aws ssm start-session` onto the box |
+| `openbuilder start` / `openbuilder stop` | instance power, by hand |
+
+You can queue several slugs at once. `ob-poll` takes **one action per slug per pass** and holds a
+per-slug lock, so parallel plan branches make progress round-robin instead of stampeding.
+
+## What it costs
+
+Approximate `us-east-1` on-demand pricing, 730 hours/month. AWS prices are approximate and
+region-dependent; see [docs/cost.md](docs/cost.md) for the full arithmetic.
+
+| Item | Assumption | Monthly (approx.) |
+|---|---|---|
+| EC2 `t4g.medium`, always on | 730 h @ ~$0.0336/h | ~$24.53 |
+| EC2 `t4g.medium`, idle auto-stop | 240 h @ ~$0.0336/h | ~$8.06 |
+| Public IPv4 address | ~$0.005/h while running, 240 h | ~$1.20 |
+| EBS 100 GB gp3 | ~$0.08/GB-month, billed while stopped | ~$8.00 |
+| DeepSeek V4 Flash tokens | 20 stories @ 350k in / 45k out | ~$0.79 |
+| SSM Session Manager, Parameter Store (standard), KMS, CloudWatch metrics | — | ~$0.00 |
+| **Total with idle auto-stop** (8 h/day awake) | | **~$18.05/mo** |
+| **Total always-on** (730 h) | | **~$36.97/mo** |
+
+The model is not the expensive part. The instance is — which is why idle auto-stop exists, and why
+there is no NAT gateway (~$32/mo) or interface endpoint pair (~$22/mo) in the design.
+
+## Repo layout
+
+```
+openbuilder/
+├── README.md                 this file: what it is, quickstart, daily loop
+├── Makefile                  targets: help init plan-tf apply destroy secrets doctor shell logs status fmt lint repo-create
+├── docs/                     architecture, day-2 runbook, GitHub App setup, cost math
+├── infra/                    Terraform: VPC, public subnet, IAM, SSM params, instance, budget
+├── infra/templates/          cloud-init template that renders openbuilder.env and calls bootstrap.sh
+├── runner/                   everything that runs ON the box
+├── runner/bin/               ob-common.sh, ob-token, ob-poll, ob-implement, ob-respond, ob-idle-stop, ob-doctor, ob-selfupdate
+├── runner/systemd/           the poll timer (60s) and the idle timer (5m) and their oneshot services
+├── runner/prompts/           implement.md / respond.md templates fed to omp with {{PLACEHOLDER}} markers
+├── agent/remote/             omp config + implementer agent installed to /opt/openbuilder/.omp
+├── agent/local/              omp planner + reviewer agents and their skills, for your laptop
+├── agent/hooks/              pre-tool-call guardrails hook: no merge, no force-push, no push to main
+├── backlog/                  SCHEMA.md — the story-card contract — plus a filled-in example
+└── local/bin/                the `openbuilder` laptop CLI
+```
+
+## Troubleshooting
+
+Full playbook in [docs/runbook.md](docs/runbook.md). The fast table:
+
+| Symptom | Likely cause | Command to run |
+|---|---|---|
+| `openbuilder dispatch` pushed but no PR after 5 min | box stopped, or poll timer not firing | `openbuilder status` then `openbuilder start`, then `openbuilder shell` and `systemctl list-timers 'openbuilder-*'` |
+| PR stuck on `openbuilder:in-progress` | job died mid-run, stale lock, or `OPENBUILDER_MAX_RUNTIME` hit | `openbuilder logs` then `openbuilder shell` and `ls -l /opt/openbuilder/run/` |
+| `openbuilder:blocked` appeared | max attempts reached, or a hard failure — reason is in the PR comment | `gh pr view <pr> --repo you/your-repo --comments` |
+| No commits, agent "explained" instead | story card was ambiguous; the agent is told to stop rather than guess | read `.openbuilder/backlog/<slug>/worklog.md` on the work branch, tighten the card, re-dispatch |
+| `gh` calls fail with 401 | App token expired or the App is not installed on that repo | `openbuilder shell` then `sudo -u openbuilder /opt/openbuilder/bin/ob-doctor` |
+| omp exits instantly, no tokens spent | bad or out-of-credit `OPENROUTER_API_KEY` (429 / 402) | `openbuilder doctor`, then re-put `/openbuilder/openrouter_api_key` |
+| Box never stops, bill keeps growing | idle timer not firing, or work is genuinely queued | `openbuilder shell` then `sudo -u openbuilder /opt/openbuilder/bin/ob-poll --dry-run` |
+| Disk full, git operations fail | accumulated worktrees, caches and `run.ndjson` files | `openbuilder shell` then `df -h /opt/openbuilder` |
+| Box running old scripts after a control-repo push | box has not self-updated | `openbuilder shell` then `sudo -u openbuilder /opt/openbuilder/bin/ob-selfupdate` |
+
+## Where to read next
+
+- [docs/architecture.md](docs/architecture.md) — components, the full state machine, the sequence
+  diagram, the design decisions and their tradeoffs, and the security model.
+- [docs/github-app-setup.md](docs/github-app-setup.md) — one-time identity setup.
+- [docs/runbook.md](docs/runbook.md) — symptom-driven day-2 operations.
+- [docs/cost.md](docs/cost.md) — the money, itemised.
+- [backlog/SCHEMA.md](backlog/SCHEMA.md) — how to write a story card the remote agent can actually execute.

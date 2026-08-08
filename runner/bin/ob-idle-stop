@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# ob-idle-stop — power the box off when it has nothing to do.
+# Single responsibility: evaluate the three idle conditions and, only if all
+# three hold, call ec2:StopInstances on this instance.
+#
+# Deliberate logging rule: a routine "not idle yet" decision goes to the journal
+# (stderr) ONLY. Condition 3 measures the mtime of $OPENBUILDER_HOME/log, so
+# writing that decision to the log file every five minutes would keep the box
+# awake forever. Only an actual stop (and any error) is appended to the log.
+set -euo pipefail
+IFS=$'\n\t'
+
+# shellcheck disable=SC2034  # consumed by ob-common.sh's ob_log prefix after sourcing
+OB_PROG="ob-idle-stop"
+OB_SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./ob-common.sh
+source "${OB_SELF_DIR}/ob-common.sh"
+
+# idle_note <msg...> — journal-only line, deliberately not the log file.
+idle_note() {
+  printf '%s %-5s %s: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" INFO "$OB_PROG" "$*" >&2
+}
+
+# condition_1_no_locks — nothing is running right now.
+# Prints the blocking lock names when it fails.
+condition_1_no_locks() {
+  local held
+  held="$(ob_locks_held | paste -sd, - || printf '')"
+  if [[ -n "$held" ]]; then
+    printf '%s' "$held"
+    return 1
+  fi
+  return 0
+}
+
+# condition_2_no_work — a dry poll pass finds nothing actionable.
+# Prints the reported ACTIONABLE count (or a diagnostic) when it fails.
+condition_2_no_work() {
+  local out actionable rc=0
+  out="$(mktemp)"
+  "${OB_SELF_DIR}/ob-poll" --dry-run >"$out" 2>&1 || rc=$?
+  if ((rc != 0)); then
+    printf 'ob-poll --dry-run exited %s' "$rc"
+    rm -f "$out"
+    return 1
+  fi
+  actionable="$(awk -F= '/^ACTIONABLE=/ {value = $2} END {print value + 0}' "$out")"
+  rm -f "$out"
+  if [[ "$actionable" != "0" ]]; then
+    printf 'ACTIONABLE=%s' "$actionable"
+    return 1
+  fi
+  return 0
+}
+
+# condition_3_quiet <minutes> — no state/ or log/ write in the last <minutes>.
+# Prints the offending path when it fails.
+condition_3_quiet() {
+  local minutes="$1" recent
+  recent="$(find "${OPENBUILDER_HOME}/state" "${OPENBUILDER_HOME}/log" \
+    -newermt "-${minutes} minutes" -print -quit 2>/dev/null || printf '')"
+  if [[ -n "$recent" ]]; then
+    printf '%s' "$recent"
+    return 1
+  fi
+  return 0
+}
+
+# self_instance_id — this instance's id via IMDSv2.
+self_instance_id() {
+  local token id
+  token="$(curl -sX PUT "http://169.254.169.254/latest/api/token" \
+    -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')" || return 1
+  [[ -n "$token" ]] || return 1
+  id="$(curl -s -H "X-aws-ec2-metadata-token: ${token}" \
+    "http://169.254.169.254/latest/meta-data/instance-id")" || return 1
+  [[ "$id" =~ ^i-[0-9a-f]+$ ]] || return 1
+  printf '%s' "$id"
+}
+
+main() {
+  ob_load_env
+  local minutes detail instance_id
+  minutes="${OPENBUILDER_IDLE_STOP_MINUTES//[^0-9]/}"
+  minutes="${minutes:-30}"
+
+  if ! detail="$(condition_1_no_locks)"; then
+    idle_note "staying up: condition 1 failed — locks held: ${detail}"
+    return 0
+  fi
+  if ! detail="$(condition_2_no_work)"; then
+    idle_note "staying up: condition 2 failed — ${detail}"
+    return 0
+  fi
+  if ! detail="$(condition_3_quiet "$minutes")"; then
+    idle_note "staying up: condition 3 failed — activity within ${minutes}m at ${detail}"
+    return 0
+  fi
+
+  if ! instance_id="$(self_instance_id)"; then
+    ob_log ERROR "all three idle conditions hold but IMDSv2 did not return an instance id; not stopping"
+    return 1
+  fi
+
+  ob_log INFO "idle for more than ${minutes}m with no locks and no actionable work; stopping ${instance_id}"
+  if ! aws ec2 stop-instances --instance-ids "$instance_id" \
+    --region "$AWS_REGION" >/dev/null; then
+    ob_log ERROR "ec2 stop-instances failed for ${instance_id}"
+    return 1
+  fi
+  ob_log INFO "stop requested for ${instance_id}"
+}
+
+main "$@"

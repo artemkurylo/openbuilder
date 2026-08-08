@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the OpenBuilder idle check every 5 minutes
+Documentation=https://github.com/artemkurylo/openbuilder
+
+[Timer]
+Unit=openbuilder-idle.service
+OnBootSec=10min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

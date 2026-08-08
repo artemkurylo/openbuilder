@@ -1,0 +1,102 @@
+#cloud-config
+# -----------------------------------------------------------------------------
+# openbuilder first boot — rendered by Terraform from
+# infra/templates/cloud-init.yaml.tftpl
+# -----------------------------------------------------------------------------
+# This template is deliberately dumb and does exactly four things:
+#   1. create the `openbuilder` user and its directory tree
+#   2. write /opt/openbuilder/etc/openbuilder.env
+#   3. clone the control repo to /opt/openbuilder/repo (failure tolerated)
+#   4. hand off to runner/bootstrap.sh
+# Package installs, omp/gh/node setup, systemd units and git config all live in
+# bootstrap.sh, which is idempotent and re-runnable via `ob-selfupdate`. Nothing
+# that needs to change after boot belongs here — user_data is only read once.
+# -----------------------------------------------------------------------------
+
+# Only what step 3 itself needs. bootstrap.sh owns the real package set.
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - git
+
+users:
+  - default
+  - name: openbuilder
+    gecos: openbuilder autonomous coding agent
+    system: false
+    shell: /bin/bash
+    homedir: /opt/openbuilder
+    lock_passwd: true
+
+write_files:
+  # `defer: true` moves this to the config stage, which runs AFTER
+  # users-groups; without it the openbuilder owner would not exist yet.
+  - path: /opt/openbuilder/etc/openbuilder.env
+    owner: openbuilder:openbuilder
+    permissions: '0640'
+    defer: true
+    content: |
+      # Non-secret runtime config for openbuilder. Sourced by every runner
+      # script and used as the systemd EnvironmentFile.
+      # Rendered once by cloud-init; change it by editing Terraform vars and
+      # re-provisioning. SECRETS ARE NEVER WRITTEN HERE — they are fetched at
+      # job start with `aws ssm get-parameter --with-decryption` and exported
+      # into the omp child process only.
+      OPENBUILDER_HOME=/opt/openbuilder
+      OPENBUILDER_SSM_PREFIX=${ssm_prefix}
+      OPENBUILDER_REPOS=${repos}
+      OPENBUILDER_CONTROL_REPO=${control_repo}
+      OPENBUILDER_GH_HOST=github.com
+      OPENBUILDER_MODEL=${model}
+      OPENBUILDER_SMOL_MODEL=${smol_model}
+      OPENBUILDER_MAX_RUNTIME=${max_runtime}
+      OPENBUILDER_MAX_ATTEMPTS=${max_attempts}
+      OPENBUILDER_IDLE_STOP_MINUTES=${idle_stop_minutes}
+      OPENBUILDER_BRANCH_PREFIX=openbuilder
+      OPENBUILDER_LABEL_PREFIX=openbuilder
+      OPENBUILDER_GIT_USER_NAME=${git_user_name}
+      OPENBUILDER_GIT_USER_EMAIL=${git_user_email}
+      AWS_REGION=${region}
+      PI_CODING_AGENT_DIR=/opt/openbuilder/.omp
+      # Inputs consumed by bootstrap.sh only.
+      OPENBUILDER_OMP_VERSION=${omp_version}
+      OPENBUILDER_EXTRA_APT_PACKAGES="${extra_apt_packages}"
+
+runcmd:
+  # 1. The directory tree from the filesystem contract, owned by openbuilder.
+  - install -d -o openbuilder -g openbuilder -m 0755
+    /opt/openbuilder
+    /opt/openbuilder/bin
+    /opt/openbuilder/prompts
+    /opt/openbuilder/agent
+    /opt/openbuilder/etc
+    /opt/openbuilder/repo
+    /opt/openbuilder/src
+    /opt/openbuilder/work
+    /opt/openbuilder/state
+    /opt/openbuilder/log
+    /opt/openbuilder/run
+    /opt/openbuilder/cache
+    /opt/openbuilder/.omp
+  - chown -R openbuilder:openbuilder /opt/openbuilder
+
+  # 2. Public clone of the control repo. Tolerated failure: a private repo or a
+  #    GitHub blip must not brick first boot — ob-selfupdate retries later with
+  #    a GitHub App installation token.
+  - |
+    set -a
+    . /opt/openbuilder/etc/openbuilder.env
+    set +a
+    if [ ! -d /opt/openbuilder/repo/.git ]; then
+      su -s /bin/bash openbuilder -c \
+        "git clone https://github.com/$${OPENBUILDER_CONTROL_REPO}.git /opt/openbuilder/repo" \
+        || echo "openbuilder: clone of $${OPENBUILDER_CONTROL_REPO} failed; ob-selfupdate will retry with an App token" >&2
+    fi
+
+  # 3. Hand off. Everything real happens in here.
+  - |
+    if [ -f /opt/openbuilder/repo/runner/bootstrap.sh ]; then
+      exec /bin/bash /opt/openbuilder/repo/runner/bootstrap.sh
+    fi
+    echo "openbuilder: /opt/openbuilder/repo/runner/bootstrap.sh not found; box is unconfigured" >&2

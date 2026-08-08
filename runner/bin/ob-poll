@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# ob-poll — one pass of the §6 state machine over every configured repo.
+# Single responsibility: decide, for each plan branch, which single action is due
+# and dispatch it. All the work itself lives in ob-implement / ob-respond.
+#
+# Deliberate logging rule: an uneventful pass writes NOTHING to
+# $OPENBUILDER_HOME/log/openbuilder.log — decisions go to stdout (the journal)
+# only. ob-idle-stop treats the log's mtime as "when work last happened", so a
+# chatty poll pass would keep the box awake forever.
+set -euo pipefail
+IFS=$'\n\t'
+
+# shellcheck disable=SC2034  # consumed by ob-common.sh's ob_log prefix after sourcing
+OB_PROG="ob-poll"
+OB_SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./ob-common.sh
+source "${OB_SELF_DIR}/ob-common.sh"
+
+DRY_RUN=0
+# Count of slugs that need real work this pass (rules 5 and 6). ob-idle-stop
+# parses the trailing ACTIONABLE= line.
+ACTIONABLE=0
+MAX_ATTEMPTS=6
+
+usage() {
+  cat <<'EOF'
+Usage: ob-poll [--dry-run]
+
+Runs one pass of the OpenBuilder state machine (spec §6).
+
+  --dry-run   Print the decision for every slug and exit 0 without taking any
+              action, creating any label, or writing any state. Used by
+              ob-idle-stop to decide whether the box may power itself off.
+
+Output: one `DECISION ...` line per slug, then a final `ACTIONABLE=<n>` line.
+EOF
+}
+
+# decision <repo> <slug> <rule> <action> <reason>
+decision() {
+  printf 'DECISION repo=%s slug=%s rule=%s action=%s reason=%s\n' \
+    "$1" "$2" "$3" "$4" "$5"
+}
+
+# list_plan_refs <owner/repo> — every refs/heads/<prefix>/plan/* ref.
+list_plan_refs() {
+  local repo="$1"
+  ob_gh api \
+    "repos/${repo}/git/matching-refs/heads/${OPENBUILDER_BRANCH_PREFIX}/plan/" \
+    --jq '.[].ref' 2>/dev/null || true
+}
+
+# run_action <script-name> <args...> — dispatch, unless this is a dry run.
+# A failing job must never abort the rest of the pass.
+run_action() {
+  local script="$1"
+  shift
+  if ((DRY_RUN)); then
+    return 0
+  fi
+  local rc=0
+  ob_log INFO "dispatch ${script} $*"
+  "${OB_SELF_DIR}/${script}" "$@" || rc=$?
+  if ((rc != 0)); then
+    ob_log ERROR "${script} $* exited ${rc}"
+  fi
+  return 0
+}
+
+# mark_blocked <repo> <slug> <pr-or-empty> <attempts> — rule 4's action, made
+# idempotent by remembering the attempt count we already reported.
+mark_blocked() {
+  local repo="$1" slug="$2" pr="$3" attempts="$4" marker reported
+  if ((DRY_RUN)); then
+    return 0
+  fi
+  marker="$(ob_state_dir "$repo" "$slug")/blocked-reported"
+  reported=""
+  if [[ -s "$marker" ]]; then
+    reported="$(tr -dc '0-9' <"$marker")"
+  fi
+  if [[ "$reported" == "$attempts" ]]; then
+    return 0
+  fi
+  ob_log WARN "attempt budget exhausted for ${repo} ${slug} (${attempts}/${MAX_ATTEMPTS})"
+  ob_report_blocked "$repo" "$slug" "$pr" \
+    "The attempt budget is exhausted (${attempts} of ${MAX_ATTEMPTS} rounds used). openbuilder will not touch this slug again. To hand it back to the agent, on the box run: \`printf '0\\n' > $(ob_state_dir "$repo" "$slug")/attempts\` and delete \`${marker}\`."
+  printf '%s\n' "$attempts" >"$marker"
+}
+
+# evaluate <owner/repo> <slug> — the §6 table, in order, first match wins,
+# at most one action per slug per pass.
+evaluate() {
+  local repo="$1" slug="$2"
+  local key work_branch pr labels attempts
+
+  key="$(ob_slug_key "$repo" "$slug")"
+  work_branch="${OPENBUILDER_BRANCH_PREFIX}/work/${slug}"
+
+  # --- Rule 1: a lock for this slug is held -> a job is already running.
+  if ob_lock_held "$key"; then
+    decision "$repo" "$slug" 1 skip "lock-held"
+    return 0
+  fi
+
+  pr="$(ob_pr_number "$repo" "$work_branch" all)"
+  labels=" "
+  if [[ -n "$pr" ]]; then
+    labels="$(ob_pr_labels "$repo" "$pr")"
+  fi
+
+  # --- Rule 2: PR exists and is approved -> skip forever.
+  if [[ -n "$pr" ]] && ob_has_label "$labels" approved; then
+    decision "$repo" "$slug" 2 skip "approved(pr=${pr})"
+    return 0
+  fi
+
+  # --- Rule 3: PR exists and is blocked -> skip forever.
+  if [[ -n "$pr" ]] && ob_has_label "$labels" blocked; then
+    decision "$repo" "$slug" 3 skip "blocked(pr=${pr})"
+    return 0
+  fi
+
+  # --- Rule 4: attempts counter >= OPENBUILDER_MAX_ATTEMPTS -> block, comment.
+  attempts="$(ob_attempts_get "$repo" "$slug")"
+  if ((attempts >= MAX_ATTEMPTS)); then
+    decision "$repo" "$slug" 4 block "attempts=${attempts}/${MAX_ATTEMPTS}"
+    mark_blocked "$repo" "$slug" "$pr" "$attempts"
+    return 0
+  fi
+
+  # --- Rule 5: no PR with head <prefix>/work/<slug> -> implement.
+  if [[ -z "$pr" ]]; then
+    decision "$repo" "$slug" 5 implement "no-pr attempts=${attempts}"
+    ACTIONABLE=$((ACTIONABLE + 1))
+    run_action ob-implement "$repo" "$slug"
+    return 0
+  fi
+
+  # --- Rule 6: PR exists and the reviewer requested changes -> respond.
+  if ob_has_label "$labels" changes-requested; then
+    decision "$repo" "$slug" 6 respond "pr=${pr} attempts=${attempts}"
+    ACTIONABLE=$((ACTIONABLE + 1))
+    run_action ob-respond "$repo" "$slug" "$pr"
+    return 0
+  fi
+
+  # --- Rule 7: otherwise -> waiting on the human reviewer.
+  decision "$repo" "$slug" 7 skip "awaiting-reviewer(pr=${pr})"
+}
+
+poll_repo() {
+  local repo="$1"
+  local -a refs=()
+  local ref slug prefix
+  prefix="refs/heads/${OPENBUILDER_BRANCH_PREFIX}/plan/"
+
+  mapfile -t refs < <(list_plan_refs "$repo")
+  if ((${#refs[@]} == 0)); then
+    decision "$repo" "-" "-" skip "no-plan-branches"
+    return 0
+  fi
+  for ref in "${refs[@]}"; do
+    slug="${ref#"$prefix"}"
+    if [[ ! "$slug" =~ ^[a-z0-9][a-z0-9-]{1,48}$ ]]; then
+      decision "$repo" "${slug:--}" "-" skip "invalid-slug"
+      continue
+    fi
+    evaluate "$repo" "$slug"
+  done
+}
+
+main() {
+  while (($# > 0)); do
+    case "$1" in
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h | --help)
+      usage
+      return 0
+      ;;
+    *)
+      usage >&2
+      ob_die "unknown argument: $1"
+      ;;
+    esac
+  done
+
+  ob_load_env
+  MAX_ATTEMPTS="${OPENBUILDER_MAX_ATTEMPTS//[^0-9]/}"
+  MAX_ATTEMPTS="${MAX_ATTEMPTS:-6}"
+
+  # A real pass takes the global lock so passes never overlap. A dry run takes
+  # no lock: it changes nothing, and blocking on the live pass would make
+  # ob-idle-stop misread a busy box as an idle one.
+  if ((DRY_RUN == 0)); then
+    if ! ob_lock poll; then
+      decision "-" "-" "-" skip "poll-lock-held"
+      printf 'ACTIONABLE=0\n'
+      return 0
+    fi
+  fi
+
+  local -a repos=()
+  mapfile -t repos < <(ob_repos)
+  if ((${#repos[@]} == 0)); then
+    decision "-" "-" "-" skip "no-repos-configured"
+    printf 'ACTIONABLE=0\n'
+    return 0
+  fi
+
+  local repo
+  for repo in "${repos[@]}"; do
+    if [[ ! "$repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+      decision "$repo" "-" "-" skip "invalid-repo"
+      continue
+    fi
+    if ((DRY_RUN == 0)); then
+      ob_ensure_labels "$repo"
+    fi
+    poll_repo "$repo"
+  done
+
+  printf 'ACTIONABLE=%d\n' "$ACTIONABLE"
+}
+
+main "$@"

@@ -1,0 +1,17 @@
+[Unit]
+Description=OpenBuilder idle check (stop this instance when there is nothing to do)
+Documentation=https://github.com/artemkurylo/openbuilder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=openbuilder
+Group=openbuilder
+EnvironmentFile=/opt/openbuilder/etc/openbuilder.env
+WorkingDirectory=/opt/openbuilder
+ExecStart=/opt/openbuilder/bin/ob-idle-stop
+StandardOutput=journal
+StandardError=journal
+# The idle check runs `ob-poll --dry-run`, which talks to the GitHub API.
+TimeoutStartSec=0

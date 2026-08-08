@@ -1,0 +1,36 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[{*.yaml,*.yml,*.tf,*.tftpl,*.json,*.ts,*.md}]
+indent_style = space
+indent_size = 2
+
+# Markdown uses two trailing spaces for hard line breaks.
+[*.md]
+trim_trailing_whitespace = false
+
+# Make requires real tabs in recipe lines.
+[{Makefile,Makefile.*,*.mk}]
+indent_style = tab
+indent_size = 4
+
+# Shell: 4 spaces. The extensionless scripts under bin/ are shell too.
+[*.sh]
+indent_style = space
+indent_size = 4
+
+[{local/bin/*,runner/bin/*}]
+indent_style = space
+indent_size = 4
+
+# systemd units are ini-ish and conventionally unindented.
+[*.{service,timer}]
+indent_style = space
+indent_size = 4

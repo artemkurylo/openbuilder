@@ -1,0 +1,81 @@
+# openbuilder — omp global config for the EC2 implementer box
+#
+# Installed by runner/bootstrap.sh to:  /opt/openbuilder/.omp/agent/config.yml
+# (the box sets PI_CODING_AGENT_DIR=/opt/openbuilder/.omp, so this file IS the
+# "global" omp config layer for the `openbuilder` system user.)
+#
+# Layer precedence, lowest to highest:
+#   built-in defaults < THIS FILE < <cwd>/.omp/config.yml < --config overlay < runtime flags
+#
+# !! ARRAY SEMANTICS !!  Array-typed settings (`disabledProviders`, `enabledModels`,
+# `cycleOrder`, `extensions`, ...) are REPLACED WHOLESALE by any higher-precedence
+# layer -- they are never merged or appended. A target repo that happens to ship its
+# own `.omp/config.yml` with a `disabledProviders` array therefore wipes the list
+# below for runs inside that repo. That is why the box additionally relies on
+# NOT having credentials for any other provider: this file is defense-in-depth,
+# not the only line of defense.
+
+# ---------------------------------------------------------------------------
+# Model routing
+# ---------------------------------------------------------------------------
+# Every role points at the same OpenRouter DeepSeek selector. The box has exactly
+# one model credential (OPENROUTER_API_KEY, fetched from SSM at job start), so any
+# role that resolved to a different provider would fail the run instead of
+# degrading gracefully. Pinning all four makes that impossible.
+modelRoles:
+  # `default` — the main implementation loop (ob-implement / ob-respond).
+  default: openrouter/deepseek/deepseek-v4-flash-0731
+  # `smol` — cheap background work: session titles, auto-thinking, summaries.
+  # Deliberately NOT a smaller model: a second model id means a second thing that
+  # can 404 unattended at 3am, and DeepSeek V4 Flash is already the cheap tier
+  # ($0.09/Mtok in, $0.18/Mtok out).
+  smol: openrouter/deepseek/deepseek-v4-flash-0731
+  # `slow` — the "think harder" escalation role. Same model; there is nothing
+  # stronger reachable from this box on purpose (cost ceiling + single credential).
+  slow: openrouter/deepseek/deepseek-v4-flash-0731
+  # `plan` — planning turns. Planning is supposed to happen on the LAPTOP with
+  # Opus 5; if the remote agent plans anyway it must stay on the cheap model.
+  plan: openrouter/deepseek/deepseek-v4-flash-0731
+
+# ---------------------------------------------------------------------------
+# Memory
+# ---------------------------------------------------------------------------
+memory:
+  # Long-term memory is OFF. Each poll pass runs a FRESH `--no-session` omp
+  # process (see spec §2: "fresh omp session each round"); the durable state of a
+  # job is the git worktree plus `.openbuilder/backlog/<slug>/worklog.md` on the
+  # work branch, which is reviewable in the PR. A hidden memory store on the box
+  # would be unreviewable state that silently changes agent behaviour between
+  # rounds, and would also mean an extra sqlite file to back up.
+  #
+  # Valid values for this enum are: off | local | hindsight | mnemopi
+  # ("none" is NOT a valid value.) Quoted because bare `off` is a boolean in
+  # YAML 1.1 parsers.
+  backend: "off"
+
+# ---------------------------------------------------------------------------
+# Provider lockdown
+# ---------------------------------------------------------------------------
+# Disabling a provider gates model selection BEFORE any credential check, so an
+# accidentally-present env var (AWS instance-profile creds are always present on
+# this box!) can never route a token of openbuilder traffic somewhere unbudgeted.
+# This list must stay COMPLETE -- see the array-replacement note at the top.
+disabledProviders:
+  # The instance profile grants ssm/ec2/cloudwatch, but IMDS credentials would
+  # still let the Bedrock SDK try to authenticate. Blocked: Bedrock is the
+  # laptop's planner/reviewer path, and its Opus 5 pricing must never be reachable
+  # from an unattended loop.
+  - amazon-bedrock
+  # No first-party Anthropic key is provisioned. Listed so a leaked/inherited
+  # ANTHROPIC_API_KEY in the environment cannot silently become the active model.
+  - anthropic
+  # Same reasoning for OPENAI_API_KEY.
+  - openai
+  # Same reasoning for GEMINI_API_KEY / GOOGLE_API_KEY.
+  - google
+  # Local inference engines. A t4g.medium (2 vCPU / 4 GiB, no GPU) cannot host a
+  # coding model; if one of these were ever discovered it would peg the box and
+  # starve the poll timer instead of erroring fast.
+  - ollama
+  - llama.cpp
+  - lm-studio

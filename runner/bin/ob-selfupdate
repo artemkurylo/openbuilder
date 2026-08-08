@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# ob-selfupdate — bring the box up to date with the control repo.
+# Single responsibility: fast-forward /opt/openbuilder/repo and re-run
+# bootstrap.sh, which is idempotent and reinstalls bin/, prompts/, agent/ and
+# the systemd units.
+set -euo pipefail
+IFS=$'\n\t'
+
+# shellcheck disable=SC2034  # consumed by ob-common.sh's ob_log prefix after sourcing
+OB_PROG="ob-selfupdate"
+OB_SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./ob-common.sh
+source "${OB_SELF_DIR}/ob-common.sh"
+
+main() {
+  ob_load_env
+
+  if ! ob_lock selfupdate; then
+    ob_log INFO "another self-update is already running; skipping"
+    return 0
+  fi
+
+  # Re-copying bin/ under a running job would swap scripts mid-flight.
+  local held
+  held="$(ob_locks_held | grep -v '^selfupdate$' | paste -sd, - || printf '')"
+  if [[ -n "$held" ]]; then
+    ob_log INFO "jobs are running (${held}); skipping self-update for now"
+    return 0
+  fi
+
+  local repo_dir bootstrap url before after
+  repo_dir="${OPENBUILDER_HOME}/repo"
+  url="$(ob_clone_url "$OPENBUILDER_CONTROL_REPO")"
+
+  if [[ -d "${repo_dir}/.git" ]]; then
+    before="$(git -C "$repo_dir" -c safe.directory='*' rev-parse HEAD)"
+    git -C "$repo_dir" -c safe.directory='*' remote set-url origin "$url"
+    git -C "$repo_dir" -c safe.directory='*' pull --ff-only ||
+      ob_die "git pull --ff-only failed in ${repo_dir}; resolve it by hand"
+    after="$(git -C "$repo_dir" -c safe.directory='*' rev-parse HEAD)"
+    ob_log INFO "control repo ${before:0:8} -> ${after:0:8}"
+  else
+    # The cloud-init clone is allowed to fail (public clone, no token yet); this
+    # is the retry path, and it goes through the git credential helper.
+    ob_log INFO "cloning the control repo into ${repo_dir}"
+    git clone --quiet "$url" "$repo_dir" ||
+      ob_die "cannot clone ${OPENBUILDER_CONTROL_REPO} into ${repo_dir}"
+  fi
+
+  bootstrap="${repo_dir}/runner/bootstrap.sh"
+  [[ -f "$bootstrap" ]] || ob_die "missing ${bootstrap}"
+
+  # bootstrap.sh installs packages and systemd units, so it needs root.
+  if [[ "$(id -u)" -eq 0 ]]; then
+    ob_log INFO "running ${bootstrap} as root"
+    bash "$bootstrap"
+  elif sudo -n true 2>/dev/null; then
+    ob_log INFO "running ${bootstrap} via sudo"
+    sudo -n bash "$bootstrap"
+  else
+    ob_die "bootstrap.sh needs root; re-run this as root (aws ssm start-session, then sudo)"
+  fi
+  ob_log INFO "self-update complete"
+}
+
+main "$@"

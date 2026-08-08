@@ -1,0 +1,1120 @@
+#!/usr/bin/env bash
+# openbuilder — operator CLI for the openbuilder control plane.
+#
+# Runs on the laptop. Plans and reviews locally with Opus 5; drives the EC2
+# implementer box exclusively through AWS Systems Manager (send-command /
+# start-session). There is no SSH, no key pair and no inbound rule anywhere in
+# this system — if you find yourself wanting `ssh`, you want `openbuilder shell`.
+#
+# Configuration (plain environment variables, no config file format):
+#   OPENBUILDER_INSTANCE_ID   EC2 instance id of the implementer box.
+#                             If unset, falls back to
+#                             `terraform -chdir=infra output -raw instance_id`
+#                             and caches the answer.
+#   OPENBUILDER_REGION        AWS region. Falls back to AWS_REGION,
+#                             AWS_DEFAULT_REGION, then the `region` TF output.
+#   OPENBUILDER_TARGET_REPO   Default <owner>/<repo> for `status`.
+#   OPENBUILDER_WORKSPACE     Where target repos are cloned.
+#                             Default: $HOME/.openbuilder/repos
+#
+# `./.openbuilder.local` (and `<repo-root>/.openbuilder.local`) is sourced when
+# present so you can keep those values next to the checkout. That file is
+# gitignored on purpose — it is machine-local operator config, never committed.
+# Real environment variables always win over the file.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+OB_PROG=${0##*/}
+
+# <root>/local/bin/openbuilder -> <root>
+OB_BIN_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+OB_ROOT=$(CDPATH='' cd -- "$OB_BIN_DIR/../.." && pwd -P)
+
+OB_CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/openbuilder
+
+# Planning and review happen on the laptop with the big model.
+OB_OPUS_MODEL=amazon-bedrock/us.anthropic.claude-opus-5
+
+OB_BRANCH_PREFIX=openbuilder
+OB_LABEL_PREFIX=openbuilder
+
+OB_REMOTE_HOME=/opt/openbuilder
+OB_REMOTE_LOG=$OB_REMOTE_HOME/log/openbuilder.log
+OB_REMOTE_USER=openbuilder
+
+# name|color|description — the six labels from the naming contract.
+OB_LABELS=(
+    "openbuilder:queued|fbca04|Plan branch pushed; not yet picked up by the box"
+    "openbuilder:in-progress|1d76db|Remote implementer agent is working on it"
+    "openbuilder:awaiting-review|5319e7|Pull request is ready for the Opus 5 reviewer"
+    "openbuilder:changes-requested|d93f0b|Reviewer wants another implementation round"
+    "openbuilder:approved|0e8a16|Human may merge; the box stops touching it"
+    "openbuilder:blocked|b60205|Agent gave up; needs a human"
+)
+
+# `logs -f` poll interval, and the byte ceiling we pull per poll. SSM caps the
+# inline invocation output, so we bound the chunk remotely and let the next poll
+# pick up the rest.
+OB_LOG_FOLLOW_INTERVAL=5
+OB_LOG_CHUNK_BYTES=16000
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+ob_info() { printf '%s\n' "==> $*" >&2; }
+ob_warn() { printf '%s\n' "warning: $*" >&2; }
+ob_die() {
+    printf '%s\n' "$OB_PROG: $*" >&2
+    exit 1
+}
+
+ob_need() {
+    local cmd
+    for cmd in "$@"; do
+        command -v "$cmd" >/dev/null 2>&1 ||
+            ob_die "required command not found on PATH: $cmd"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Configuration resolution
+# ---------------------------------------------------------------------------
+
+ob_load_local_config() {
+    local saved_instance=${OPENBUILDER_INSTANCE_ID:-}
+    local saved_region=${OPENBUILDER_REGION:-}
+    local saved_repo=${OPENBUILDER_TARGET_REPO:-}
+    local saved_workspace=${OPENBUILDER_WORKSPACE:-}
+    local candidate previous=''
+
+    for candidate in "$PWD/.openbuilder.local" "$OB_ROOT/.openbuilder.local"; do
+        [[ -f $candidate ]] || continue
+        # Do not source the same file twice when run from the repo root.
+        [[ $candidate == "$previous" ]] && continue
+        previous=$candidate
+        # shellcheck source=/dev/null
+        . "$candidate"
+    done
+
+    # Real environment variables outrank the file.
+    [[ -n $saved_instance ]] && OPENBUILDER_INSTANCE_ID=$saved_instance
+    [[ -n $saved_region ]] && OPENBUILDER_REGION=$saved_region
+    [[ -n $saved_repo ]] && OPENBUILDER_TARGET_REPO=$saved_repo
+    [[ -n $saved_workspace ]] && OPENBUILDER_WORKSPACE=$saved_workspace
+
+    OPENBUILDER_INSTANCE_ID=${OPENBUILDER_INSTANCE_ID:-}
+    OPENBUILDER_REGION=${OPENBUILDER_REGION:-}
+    OPENBUILDER_TARGET_REPO=${OPENBUILDER_TARGET_REPO:-}
+    OPENBUILDER_WORKSPACE=${OPENBUILDER_WORKSPACE:-$HOME/.openbuilder/repos}
+    return 0
+}
+
+ob_tf_output() {
+    local name=$1 value
+    command -v terraform >/dev/null 2>&1 || return 1
+    [[ -d $OB_ROOT/infra ]] || return 1
+    value=$(terraform -chdir="$OB_ROOT/infra" output -raw "$name" 2>/dev/null) || return 1
+    [[ -n $value ]] || return 1
+    printf '%s\n' "$value"
+}
+
+ob_region() {
+    if [[ -z $OPENBUILDER_REGION ]]; then
+        OPENBUILDER_REGION=${AWS_REGION:-${AWS_DEFAULT_REGION:-}}
+    fi
+    if [[ -z $OPENBUILDER_REGION && -f $OB_CACHE_DIR/region ]]; then
+        OPENBUILDER_REGION=$(<"$OB_CACHE_DIR/region")
+    fi
+    if [[ -z $OPENBUILDER_REGION ]]; then
+        OPENBUILDER_REGION=$(ob_tf_output region || true)
+        if [[ -n $OPENBUILDER_REGION ]]; then
+            mkdir -p "$OB_CACHE_DIR"
+            printf '%s\n' "$OPENBUILDER_REGION" >"$OB_CACHE_DIR/region"
+        fi
+    fi
+    [[ -n $OPENBUILDER_REGION ]] || OPENBUILDER_REGION=us-east-1
+    printf '%s\n' "$OPENBUILDER_REGION"
+}
+
+# Resolve the instance id: environment, then cache, then Terraform output.
+ob_instance_id() {
+    if [[ -n $OPENBUILDER_INSTANCE_ID ]]; then
+        printf '%s\n' "$OPENBUILDER_INSTANCE_ID"
+        return 0
+    fi
+    if [[ -f $OB_CACHE_DIR/instance-id ]]; then
+        OPENBUILDER_INSTANCE_ID=$(<"$OB_CACHE_DIR/instance-id")
+        if [[ -n $OPENBUILDER_INSTANCE_ID ]]; then
+            printf '%s\n' "$OPENBUILDER_INSTANCE_ID"
+            return 0
+        fi
+    fi
+    OPENBUILDER_INSTANCE_ID=$(ob_tf_output instance_id || true)
+    if [[ -n $OPENBUILDER_INSTANCE_ID ]]; then
+        mkdir -p "$OB_CACHE_DIR"
+        printf '%s\n' "$OPENBUILDER_INSTANCE_ID" >"$OB_CACHE_DIR/instance-id"
+        printf '%s\n' "$OPENBUILDER_INSTANCE_ID"
+        return 0
+    fi
+    ob_die "cannot resolve the implementer instance id.
+  Do one of:
+    * export OPENBUILDER_INSTANCE_ID=i-0123456789abcdef0
+    * put OPENBUILDER_INSTANCE_ID=... in ./.openbuilder.local
+    * run 'make apply' in $OB_ROOT so 'terraform -chdir=infra output -raw instance_id' resolves
+  (cached value, if any, lives at $OB_CACHE_DIR/instance-id)"
+}
+
+ob_repo_arg() {
+    local repo=${1:-}
+    [[ -n $repo ]] || repo=$OPENBUILDER_TARGET_REPO
+    [[ -n $repo ]] ||
+        ob_die "no repository given and OPENBUILDER_TARGET_REPO is unset"
+    ob_validate_repo "$repo"
+    printf '%s\n' "$repo"
+}
+
+ob_validate_repo() {
+    [[ $1 =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] ||
+        ob_die "not a valid <owner>/<repo>: $1"
+}
+
+ob_validate_slug() {
+    [[ $1 =~ ^[a-z0-9][a-z0-9-]{1,48}$ ]] ||
+        ob_die "invalid slug '$1' (must match ^[a-z0-9][a-z0-9-]{1,48}\$)"
+}
+
+ob_validate_pr() {
+    [[ $1 =~ ^[0-9]+$ ]] || ob_die "not a pull request number: $1"
+}
+
+# owner/repo -> owner__repo, the on-disk key used by both sides of the system.
+ob_repo_key() { printf '%s\n' "${1/\//__}"; }
+
+# ---------------------------------------------------------------------------
+# Remote execution — everything goes through SSM, never SSH
+# ---------------------------------------------------------------------------
+
+# ob_ssm_exec <script>
+#
+# Runs <script> on the box with the AWS-RunShellScript SSM document, polls
+# `aws ssm list-command-invocations` until the invocation reaches a terminal
+# state, writes remote stdout to our stdout and remote stderr to our stderr,
+# and returns the remote script's real exit status.
+#
+# AWS-RunShellScript is the AWS-managed document that runs a list of shell
+# commands as root via the SSM agent. The command payload is handed over as
+# --cli-input-json built by jq, so no operator input is ever concatenated into
+# a shell string or passed through eval.
+ob_ssm_exec() {
+    local script=$1
+    local timeout=${2:-600}
+    local region instance payload command_id json status rc out err
+
+    ob_need aws jq
+    region=$(ob_region)
+    instance=$(ob_instance_id)
+
+    payload=$(jq -n \
+        --arg instance "$instance" \
+        --arg script "$script" \
+        --argjson timeout "$timeout" \
+        '{
+            InstanceIds: [$instance],
+            DocumentName: "AWS-RunShellScript",
+            Comment: "openbuilder cli",
+            TimeoutSeconds: $timeout,
+            Parameters: { commands: [$script] }
+        }')
+
+    command_id=$(aws ssm send-command \
+        --region "$region" \
+        --cli-input-json "$payload" \
+        --query 'Command.CommandId' \
+        --output text) ||
+        ob_die "aws ssm send-command failed (is the instance running and SSM-managed? try '$OB_PROG start')"
+
+    while :; do
+        json=$(aws ssm list-command-invocations \
+            --region "$region" \
+            --command-id "$command_id" \
+            --instance-id "$instance" \
+            --details \
+            --output json) || ob_die "aws ssm list-command-invocations failed"
+        status=$(jq -r '.CommandInvocations[0].Status // "Pending"' <<<"$json")
+        case $status in
+        Success | Failed | Cancelled | TimedOut | Undeliverable | Terminated | DeliveryTimedOut | ExecutionTimedOut)
+            break
+            ;;
+        esac
+        sleep 2
+    done
+
+    # `Output` is stdout+stderr merged for display; when the plugin reports the
+    # streams separately, prefer real stdout so parsed output stays clean.
+    out=$(jq -r '.CommandInvocations[0].CommandPlugins[0].StandardOutputContent // ""' <<<"$json")
+    if [[ -z $out ]]; then
+        out=$(jq -r '.CommandInvocations[0].CommandPlugins[0].Output // ""' <<<"$json")
+    fi
+    err=$(jq -r '.CommandInvocations[0].CommandPlugins[0].StandardErrorContent // ""' <<<"$json")
+    rc=$(jq -r '.CommandInvocations[0].CommandPlugins[0].ResponseCode // -1' <<<"$json")
+
+    [[ -n $out ]] && printf '%s' "$out"
+    [[ -n $err ]] && printf '%s' "$err" >&2
+
+    if [[ $status != Success && $rc == "-1" ]]; then
+        ob_warn "SSM invocation ended with status $status"
+        return 1
+    fi
+    [[ $rc == "-1" ]] && rc=0
+    return "$rc"
+}
+
+# Run something as the openbuilder service user with its environment file.
+ob_remote_as_user() {
+    printf 'set -o allexport; . %s/etc/openbuilder.env; set +o allexport; exec sudo -u %s -E %s\n' \
+        "$OB_REMOTE_HOME" "$OB_REMOTE_USER" "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Instance power
+# ---------------------------------------------------------------------------
+
+ob_instance_state() {
+    local region instance
+    region=$(ob_region)
+    instance=$(ob_instance_id)
+    aws ec2 describe-instances \
+        --region "$region" \
+        --instance-ids "$instance" \
+        --query 'Reservations[0].Instances[0].State.Name' \
+        --output text
+}
+
+ob_ssm_online() {
+    local region instance count
+    region=$(ob_region)
+    instance=$(ob_instance_id)
+    count=$(aws ssm describe-instance-information \
+        --region "$region" \
+        --filters "Key=InstanceIds,Values=$instance" \
+        --query 'length(InstanceInformationList[?PingStatus==`Online`])' \
+        --output text 2>/dev/null || printf '0')
+    [[ $count == "1" ]]
+}
+
+ob_wait_ssm_online() {
+    local tries=${1:-60} i
+    for ((i = 0; i < tries; i++)); do
+        if ob_ssm_online; then
+            return 0
+        fi
+        sleep 5
+    done
+    return 1
+}
+
+# Idempotent: no-op when the box is already running.
+ob_ensure_running() {
+    local region instance state
+    ob_need aws
+    region=$(ob_region)
+    instance=$(ob_instance_id)
+    state=$(ob_instance_state)
+
+    case $state in
+    running)
+        ob_info "instance $instance already running"
+        ;;
+    pending)
+        ob_info "instance $instance is starting; waiting"
+        aws ec2 wait instance-running --region "$region" --instance-ids "$instance"
+        ;;
+    stopped | stopping)
+        if [[ $state == stopping ]]; then
+            ob_info "instance $instance is stopping; waiting for it to settle"
+            aws ec2 wait instance-stopped --region "$region" --instance-ids "$instance"
+        fi
+        ob_info "starting instance $instance"
+        aws ec2 start-instances --region "$region" --instance-ids "$instance" >/dev/null
+        aws ec2 wait instance-running --region "$region" --instance-ids "$instance"
+        ;;
+    *)
+        ob_die "instance $instance is in state '$state'; cannot use it"
+        ;;
+    esac
+
+    if ! ob_wait_ssm_online 60; then
+        ob_warn "instance is running but the SSM agent has not reported Online yet; remote commands may fail for another minute"
+        return 0
+    fi
+    ob_info "instance $instance is running and SSM-managed"
+}
+
+# ---------------------------------------------------------------------------
+# GitHub helpers
+# ---------------------------------------------------------------------------
+
+ob_ensure_labels() {
+    local repo=$1 spec name color desc
+    ob_need gh
+    for spec in "${OB_LABELS[@]}"; do
+        IFS='|' read -r name color desc <<<"$spec"
+        if gh label create "$name" \
+            --repo "$repo" --color "$color" --description "$desc" >/dev/null 2>&1; then
+            ob_info "created label $name"
+        else
+            # Already there (or a color drift) — converge, never fail.
+            gh label edit "$name" \
+                --repo "$repo" --color "$color" --description "$desc" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+ob_pr_labels() {
+    gh pr view "$2" --repo "$1" --json labels --jq '.labels[].name' 2>/dev/null || true
+}
+
+# ob_pr_relabel <repo> <pr> <add> <remove-csv>
+#
+# Only labels actually present are passed to --remove-label, so a second
+# invocation is a clean no-op instead of a gh error.
+ob_pr_relabel() {
+    local repo=$1 pr=$2 add=$3 remove_csv=$4
+    local -a args=() to_remove=()
+    local label present
+
+    present=$(ob_pr_labels "$repo" "$pr")
+
+    IFS=',' read -r -a to_remove <<<"$remove_csv"
+    for label in "${to_remove[@]}"; do
+        [[ -n $label ]] || continue
+        if printf '%s\n' "$present" | grep -qxF -- "$label"; then
+            args+=(--remove-label "$label")
+        fi
+    done
+    [[ -n $add ]] && args+=(--add-label "$add")
+
+    if [[ ${#args[@]} -eq 0 ]]; then
+        return 0
+    fi
+    gh pr edit "$pr" --repo "$repo" "${args[@]}" >/dev/null
+}
+
+ob_default_branch() {
+    gh repo view "$1" --json defaultBranchRef --jq '.defaultBranchRef.name'
+}
+
+# ---------------------------------------------------------------------------
+# Local clone / omp asset helpers
+# ---------------------------------------------------------------------------
+
+ob_clone_dir() {
+    printf '%s/%s\n' "$OPENBUILDER_WORKSPACE" "$(ob_repo_key "$1")"
+}
+
+ob_ensure_clone() {
+    local repo=$1 dir
+    dir=$(ob_clone_dir "$repo")
+    ob_need git gh
+    if [[ -d $dir/.git ]]; then
+        ob_info "fetching $repo into $dir"
+        git -C "$dir" fetch --prune --quiet origin
+    else
+        mkdir -p "$(dirname "$dir")"
+        ob_info "cloning $repo into $dir"
+        gh repo clone "$repo" "$dir" -- --quiet
+    fi
+    printf '%s\n' "$dir"
+}
+
+# Make the local planner/reviewer agents, their skills and the guardrail hook
+# visible to omp inside the target checkout. omp discovers project agents at
+# <cwd>/.omp/agents and pre-hooks at <cwd>/.omp/hooks/pre, so we mirror this
+# repo's agent/ tree there and add it to the clone's local git excludes — it is
+# tooling, it must never end up in a commit on the target repo.
+ob_install_local_assets() {
+    local dir=$1
+    local exclude="$dir/.git/info/exclude"
+
+    mkdir -p "$dir/.omp/agents" "$dir/.omp/hooks/pre"
+    if [[ -d $OB_ROOT/agent/local/agents ]]; then
+        cp -R "$OB_ROOT/agent/local/agents/." "$dir/.omp/agents/"
+    else
+        ob_warn "missing $OB_ROOT/agent/local/agents — planner/reviewer agents will not be available"
+    fi
+    if [[ -f $OB_ROOT/agent/hooks/pre/guardrails.ts ]]; then
+        cp "$OB_ROOT/agent/hooks/pre/guardrails.ts" "$dir/.omp/hooks/pre/guardrails.ts"
+    fi
+
+    mkdir -p "$(dirname "$exclude")"
+    touch "$exclude"
+    if ! grep -qxF '/.omp/' "$exclude" 2>/dev/null; then
+        printf '/.omp/\n' >>"$exclude"
+    fi
+}
+
+ob_plan_branch() { printf '%s/plan/%s\n' "$OB_BRANCH_PREFIX" "$1"; }
+ob_work_branch() { printf '%s/work/%s\n' "$OB_BRANCH_PREFIX" "$1"; }
+
+# ---------------------------------------------------------------------------
+# help
+# ---------------------------------------------------------------------------
+
+ob_command_table() {
+    cat <<'EOF'
+usage: openbuilder <command> [args]
+
+  plan <owner/repo> <slug>          scaffold a backlog and plan it with Opus 5
+  dispatch <owner/repo> <slug>      commit + push the plan branch, hand it to the box
+  review <owner/repo> <pr>          review a pull request with Opus 5
+  approve <owner/repo> <pr>         label a pull request approved
+  request-changes <owner/repo> <pr> ask the box for another round
+  status [owner/repo]               slugs, branches, pull requests, labels
+  logs [-f] [-n lines]              tail the box's operational log over SSM
+  shell                             interactive SSM session on the box
+  doctor                            run ob-doctor on the box
+  start                             start the implementer instance
+  stop                              stop the implementer instance
+  cost                              per-slug model spend from the box's run.ndjson
+  help                              this table
+
+environment: OPENBUILDER_INSTANCE_ID, OPENBUILDER_REGION,
+             OPENBUILDER_TARGET_REPO, OPENBUILDER_WORKSPACE
+             (./.openbuilder.local is sourced when present; it is gitignored)
+EOF
+}
+
+cmd_help() {
+    ob_command_table
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# plan
+# ---------------------------------------------------------------------------
+
+cmd_plan() {
+    local usage="usage: $OB_PROG plan <owner/repo> <slug>"
+    [[ $# -eq 2 ]] || ob_die "$usage"
+    local repo=$1 slug=$2
+    ob_validate_repo "$repo"
+    ob_validate_slug "$slug"
+    ob_need git gh omp
+
+    local dir branch base backlog
+    dir=$(ob_ensure_clone "$repo")
+    branch=$(ob_plan_branch "$slug")
+    base=$(ob_default_branch "$repo")
+
+    if git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+        ob_info "checking out existing plan branch $branch"
+        git -C "$dir" checkout -B "$branch" --track "origin/$branch" --quiet
+    else
+        ob_info "creating plan branch $branch from origin/$base"
+        git -C "$dir" checkout -B "$branch" "origin/$base" --quiet
+    fi
+
+    backlog=$dir/.openbuilder/backlog/$slug
+    mkdir -p "$backlog"
+    if [[ ! -f $backlog/plan.md ]]; then
+        ob_write_plan_scaffold "$backlog/plan.md" "$repo" "$slug" "$base"
+        ob_info "scaffolded .openbuilder/backlog/$slug/plan.md"
+    else
+        ob_info "reusing existing .openbuilder/backlog/$slug/plan.md"
+    fi
+
+    ob_install_local_assets "$dir"
+
+    local seed
+    seed=$(
+        cat <<EOF
+You are running as the openbuilder planner for $repo, slug \`$slug\`.
+
+Delegate the planning work to the \`planner\` agent (task tool, agent: "planner")
+and use the \`write-backlog\` skill for the story-card format.
+
+Deliverables, all inside \`.openbuilder/backlog/$slug/\` in this checkout
+(current branch: \`$branch\`, base branch: \`$base\`):
+
+1. \`plan.md\` — replace the scaffold. The first \`# \` heading becomes the pull
+   request title, so make it a real, specific title.
+2. \`story-<NN>-<name>.md\` — one card per story, numbered 01, 02, ... in
+   dependency order, matching the contract in the openbuilder repo's
+   \`backlog/SCHEMA.md\` (frontmatter: id, title, size, depends_on, files,
+   acceptance; body sections: ## Context, ## Change, ## Acceptance,
+   ## Out of scope).
+
+Read the actual code in this repository before writing any card. Cards are
+consumed by a smaller model with no access to this conversation, so every card
+must be self-contained: exact file paths, exact identifier names, explicit
+acceptance criteria, explicit non-goals.
+
+Do not commit, do not push, do not create branches. \`openbuilder dispatch\`
+does that. Stop and ask when a requirement is genuinely missing.
+EOF
+    )
+
+    ob_info "launching omp planner ($OB_OPUS_MODEL) in $dir"
+    GH_REPO="$repo" exec omp \
+        --cwd "$dir" \
+        --model "$OB_OPUS_MODEL" \
+        --append-system-prompt "openbuilder planner session for $repo slug $slug. Produce backlog story cards under .openbuilder/backlog/$slug/. Never commit, push, or merge." \
+        "$seed"
+}
+
+ob_write_plan_scaffold() {
+    local path=$1 repo=$2 slug=$3 base=$4
+    cat >"$path" <<EOF
+# $slug
+
+- repo: \`$repo\`
+- slug: \`$slug\`
+- base branch: \`$base\`
+- plan branch: \`$(ob_plan_branch "$slug")\`
+- work branch: \`$(ob_work_branch "$slug")\`
+
+## Goal
+
+_Replace this section with the outcome you want, in one paragraph._
+
+## Context
+
+_What exists today, and which parts of the repository are involved._
+
+## Stories
+
+_One line per story card in this directory, in dependency order._
+
+## Out of scope
+
+_What the implementer must not touch._
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+
+cmd_dispatch() {
+    local usage="usage: $OB_PROG dispatch <owner/repo> <slug>"
+    [[ $# -eq 2 ]] || ob_die "$usage"
+    local repo=$1 slug=$2
+    ob_validate_repo "$repo"
+    ob_validate_slug "$slug"
+    ob_need git gh aws jq
+
+    # Start the box first: the poll loop is the only trigger, so a stopped
+    # instance would otherwise turn a dispatch into a silent no-op.
+    ob_ensure_running
+
+    local dir branch backlog stories
+    dir=$(ob_clone_dir "$repo")
+    [[ -d $dir/.git ]] ||
+        ob_die "no local clone at $dir — run '$OB_PROG plan $repo $slug' first"
+    branch=$(ob_plan_branch "$slug")
+    backlog=.openbuilder/backlog/$slug
+
+    [[ -d $dir/$backlog ]] ||
+        ob_die "$backlog does not exist in $dir — run '$OB_PROG plan $repo $slug' first"
+    [[ -f $dir/$backlog/plan.md ]] ||
+        ob_die "$backlog/plan.md is missing — the planner did not finish"
+
+    stories=$(find "$dir/$backlog" -maxdepth 1 -name 'story-*.md' | wc -l | tr -d '[:space:]')
+    [[ $stories -gt 0 ]] ||
+        ob_die "$backlog contains no story-*.md cards — nothing for the box to implement"
+
+    if [[ $(git -C "$dir" rev-parse --abbrev-ref HEAD) != "$branch" ]]; then
+        ob_info "switching $dir to $branch"
+        git -C "$dir" checkout "$branch" --quiet
+    fi
+
+    git -C "$dir" add -- "$backlog"
+    if git -C "$dir" diff --cached --quiet -- "$backlog"; then
+        ob_info "backlog already committed; nothing new to stage"
+    else
+        # Authored with the operator's own git identity on purpose: the plan is
+        # the human's contribution, only the work branch belongs to the bot.
+        git -C "$dir" commit --quiet -m "openbuilder: backlog for $slug" -- "$backlog"
+        ob_info "committed $backlog ($stories story cards)"
+    fi
+
+    ob_info "pushing $branch to origin"
+    git -C "$dir" push --quiet --set-upstream origin "$branch"
+
+    ob_ensure_labels "$repo"
+
+    cat <<EOF
+
+Dispatched $repo :: $slug
+  plan branch : $branch  ($stories story cards)
+  work branch : $(ob_work_branch "$slug")  (created by the box)
+
+What happens next, without any further action from you:
+  1. Within 60s the box's openbuilder-poll timer sees $branch.
+  2. It finds no pull request for $(ob_work_branch "$slug") and runs ob-implement.
+  3. On success it pushes the work branch, opens a pull request and labels it
+     'openbuilder:awaiting-review'. On failure it labels 'openbuilder:blocked'
+     and comments the log tail.
+
+Watch it:  $OB_PROG status $repo
+           $OB_PROG logs -f
+Then:      $OB_PROG review $repo <pr>
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# review / approve / request-changes
+# ---------------------------------------------------------------------------
+
+cmd_review() {
+    local usage="usage: $OB_PROG review <owner/repo> <pr>"
+    [[ $# -eq 2 ]] || ob_die "$usage"
+    local repo=$1 pr=$2
+    ob_validate_repo "$repo"
+    ob_validate_pr "$pr"
+    ob_need git gh omp aws jq
+
+    # The box must be up: whatever verdict we post starts the next round.
+    ob_ensure_running
+
+    local dir head
+    dir=$(ob_ensure_clone "$repo")
+    head=$(gh pr view "$pr" --repo "$repo" --json headRefName --jq '.headRefName') ||
+        ob_die "cannot read pull request #$pr in $repo"
+
+    if git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$head"; then
+        ob_info "checking out $head for local inspection"
+        git -C "$dir" checkout -B "$head" --track "origin/$head" --quiet
+        git -C "$dir" reset --hard --quiet "origin/$head"
+    else
+        ob_warn "origin/$head not found locally; reviewing from the GitHub API only"
+    fi
+
+    ob_install_local_assets "$dir"
+
+    local seed
+    seed=$(
+        cat <<EOF
+You are running as the openbuilder reviewer for $repo pull request #$pr
+(head branch \`$head\`).
+
+Start by reading \`pr://$pr\` — that gives you the description, the diff and
+every existing comment. Then delegate to the \`reviewer\` agent (task tool,
+agent: "reviewer") and follow the \`review-openbuilder-pr\` skill.
+
+The pull request was produced by a small model from the story cards in
+\`.openbuilder/backlog/\` on the plan branch, and its own notes are in
+\`.openbuilder/backlog/<slug>/worklog.md\` on \`$head\`. Check the diff against
+the acceptance criteria of every card, not against your own taste.
+
+Finish with exactly one verdict:
+  * approve            -> tell me to run: $OB_PROG approve $repo $pr
+  * changes-requested  -> post line-anchored review comments that a small model
+                          can act on without guessing, then tell me to run:
+                          $OB_PROG request-changes $repo $pr
+
+Never merge, never push to $head, never push to a default branch.
+EOF
+    )
+
+    ob_info "launching omp reviewer ($OB_OPUS_MODEL) in $dir"
+    GH_REPO="$repo" exec omp \
+        --cwd "$dir" \
+        --model "$OB_OPUS_MODEL" \
+        --append-system-prompt "openbuilder reviewer session for $repo pull request #$pr. Read-only on the branch: comment and label, never merge, never push." \
+        "$seed"
+}
+
+cmd_approve() {
+    local usage="usage: $OB_PROG approve <owner/repo> <pr>"
+    [[ $# -eq 2 ]] || ob_die "$usage"
+    local repo=$1 pr=$2
+    ob_validate_repo "$repo"
+    ob_validate_pr "$pr"
+    ob_need gh
+
+    ob_ensure_labels "$repo"
+    ob_pr_relabel "$repo" "$pr" "$OB_LABEL_PREFIX:approved" \
+        "$OB_LABEL_PREFIX:awaiting-review,$OB_LABEL_PREFIX:changes-requested,$OB_LABEL_PREFIX:queued,$OB_LABEL_PREFIX:in-progress,$OB_LABEL_PREFIX:blocked"
+
+    gh pr comment "$pr" --repo "$repo" --body \
+        "**openbuilder: approved.** Reviewed with \`$OB_OPUS_MODEL\`. The remote agent will stop touching this branch. A human may merge." >/dev/null
+
+    ob_info "$repo#$pr labelled $OB_LABEL_PREFIX:approved — the box will ignore it from now on"
+    printf 'merge it with: gh pr merge %s --repo %s --squash\n' "$pr" "$repo"
+}
+
+cmd_request_changes() {
+    local usage="usage: $OB_PROG request-changes <owner/repo> <pr>"
+    [[ $# -eq 2 ]] || ob_die "$usage"
+    local repo=$1 pr=$2
+    ob_validate_repo "$repo"
+    ob_validate_pr "$pr"
+    ob_need gh aws jq
+
+    ob_ensure_labels "$repo"
+    ob_pr_relabel "$repo" "$pr" "$OB_LABEL_PREFIX:changes-requested" \
+        "$OB_LABEL_PREFIX:awaiting-review,$OB_LABEL_PREFIX:approved,$OB_LABEL_PREFIX:queued"
+
+    gh pr comment "$pr" --repo "$repo" --body \
+        "**openbuilder: changes requested.** See the review comments above. The remote agent will pick this up within 60s, start a fresh session against the existing worktree and push another round." >/dev/null
+
+    # The box only reacts while it is up.
+    ob_ensure_running
+    ob_info "$repo#$pr labelled $OB_LABEL_PREFIX:changes-requested — the box responds within 60s"
+}
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+
+cmd_status() {
+    local usage="usage: $OB_PROG status [owner/repo]"
+    [[ $# -le 1 ]] || ob_die "$usage"
+    local repo
+    repo=$(ob_repo_arg "${1:-}")
+    ob_need gh jq
+
+    local plan_refs work_refs prs rows
+    plan_refs=$(gh api "repos/$repo/git/matching-refs/heads/$OB_BRANCH_PREFIX/plan/" --paginate 2>/dev/null || printf '[]')
+    work_refs=$(gh api "repos/$repo/git/matching-refs/heads/$OB_BRANCH_PREFIX/work/" --paginate 2>/dev/null || printf '[]')
+    prs=$(gh pr list --repo "$repo" --state all --limit 200 \
+        --json number,headRefName,labels,updatedAt,state 2>/dev/null || printf '[]')
+
+    rows=$(jq -rn \
+        --argjson plan "$plan_refs" \
+        --argjson work "$work_refs" \
+        --argjson prs "$prs" \
+        --arg prefix "$OB_BRANCH_PREFIX" \
+        '
+        def slug_of($p): sub("^refs/heads/" + $prefix + "/" + $p + "/"; "");
+        ($work | map(.ref | slug_of("work"))) as $workslugs
+        | ($prs | map({ key: .headRefName, value: . }) | from_entries) as $byhead
+        | $plan
+        | map(.ref | slug_of("plan"))
+        | sort
+        | map(
+            . as $s
+            | ($byhead[$prefix + "/work/" + $s]) as $pr
+            | [ $s,
+                "yes",
+                (if ($workslugs | index($s)) then "yes" else "-" end),
+                (if $pr then ("#" + ($pr.number | tostring)) else "-" end),
+                (if $pr then (($pr.labels | map(.name) | map(sub("^" + $prefix + ":"; "")) | join(","))
+                             | if . == "" then "-" else . end) else "-" end),
+                (if $pr then ($pr.updatedAt // "-") else "-" end)
+              ]
+            | @tsv
+          )
+        | .[]
+        ')
+
+    if [[ -z $rows ]]; then
+        printf 'no %s/plan/* branches in %s\n' "$OB_BRANCH_PREFIX" "$repo"
+        return 0
+    fi
+
+    printf '%s\n' "$repo"
+    printf '%-26s %-5s %-5s %-6s %-40s %-22s\n' \
+        SLUG PLAN WORK PR LABELS 'LAST ACTIVITY'
+    printf '%-26s %-5s %-5s %-6s %-40s %-22s\n' \
+        '--------------------------' '-----' '-----' '------' \
+        '----------------------------------------' '----------------------'
+
+    local slug plan work pr labels updated
+    while IFS=$'\t' read -r slug plan work pr labels updated; do
+        [[ -n $slug ]] || continue
+        printf '%-26s %-5s %-5s %-6s %-40s %-22s\n' \
+            "$slug" "$plan" "$work" "$pr" "$labels" "$updated"
+    done <<<"$rows"
+}
+
+# ---------------------------------------------------------------------------
+# logs
+# ---------------------------------------------------------------------------
+
+# A true `tail -f` needs a long-lived stream. SSM send-command is
+# request/response: it runs a script to completion and hands back a bounded
+# output blob, so there is no stream to follow. `-f` is therefore a bounded
+# polling loop — each pass asks for the bytes appended since the previous pass,
+# using a byte offset the box reports back. For a real live terminal on the box
+# (interactive `tail -f`, journalctl, a shell) use `openbuilder shell`.
+#
+# The offset is safe because the box treats this file as strictly append-only
+# (ob_log in ob-common.sh and log() in bootstrap.sh both use `>>`, and nothing
+# rotates it). A file that has shrunk is treated as replaced and re-read from 0.
+#
+# Long silences are expected: uneventful poll passes deliberately write nothing,
+# because the idle-stop check measures this file's mtime and a chatty logger
+# would keep the instance awake forever. Only real work appears here.
+ob_logs_chunk_script() {
+    local offset=$1
+    cat <<EOF
+f=$OB_REMOTE_LOG
+off=$offset
+if [ ! -f "\$f" ]; then
+  printf '__OB_OFFSET__:%s\n' "\$off"
+  echo "no log file yet at \$f" >&2
+  exit 0
+fi
+size=\$(wc -c <"\$f" | tr -d '[:space:]')
+if [ "\$off" -gt "\$size" ]; then off=0; fi
+tmp=\$(mktemp)
+tail -c "+\$((off + 1))" "\$f" 2>/dev/null | head -c $OB_LOG_CHUNK_BYTES >"\$tmp" || true
+got=\$(wc -c <"\$tmp" | tr -d '[:space:]')
+printf '__OB_OFFSET__:%s\n' "\$((off + got))"
+cat "\$tmp"
+rm -f "\$tmp"
+EOF
+}
+
+ob_logs_tail_script() {
+    local lines=$1
+    cat <<EOF
+f=$OB_REMOTE_LOG
+if [ ! -f "\$f" ]; then
+  echo "no log file yet at \$f" >&2
+  exit 1
+fi
+size=\$(wc -c <"\$f" | tr -d '[:space:]')
+printf '__OB_OFFSET__:%s\n' "\$size"
+tail -n $lines "\$f"
+EOF
+}
+
+cmd_logs() {
+    local usage="usage: $OB_PROG logs [-f] [-n <lines>]"
+    local follow=0 lines=200
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+        -f | --follow)
+            follow=1
+            shift
+            ;;
+        -n | --lines)
+            [[ $# -ge 2 ]] || ob_die "$usage"
+            [[ $2 =~ ^[0-9]+$ ]] || ob_die "$usage"
+            lines=$2
+            shift 2
+            ;;
+        -h | --help)
+            printf '%s\n' "$usage"
+            return 0
+            ;;
+        *)
+            ob_die "$usage"
+            ;;
+        esac
+    done
+    ob_need aws jq
+
+    local out rc=0 offset=0
+    out=$(ob_ssm_exec "$(ob_logs_tail_script "$lines")") || rc=$?
+    offset=$(ob_logs_split_offset "$out")
+    ob_logs_print_body "$out"
+    if [[ $follow -eq 0 ]]; then
+        return "$rc"
+    fi
+
+    ob_info "following $OB_REMOTE_LOG over SSM every ${OB_LOG_FOLLOW_INTERVAL}s (Ctrl-C to stop)"
+    ob_info "silence is normal — idle poll passes log nothing; for every poll decision run '$OB_PROG shell' then 'journalctl -fu openbuilder-poll.service'"
+    while :; do
+        sleep "$OB_LOG_FOLLOW_INTERVAL"
+        rc=0
+        out=$(ob_ssm_exec "$(ob_logs_chunk_script "$offset")") || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            ob_warn "log poll failed (exit $rc); retrying"
+            continue
+        fi
+        offset=$(ob_logs_split_offset "$out")
+        ob_logs_print_body "$out"
+    done
+}
+
+ob_logs_split_offset() {
+    local first
+    first=$(printf '%s\n' "$1" | sed -n '1s/^__OB_OFFSET__://p' | tr -d '[:space:]')
+    [[ $first =~ ^[0-9]+$ ]] || first=0
+    printf '%s\n' "$first"
+}
+
+ob_logs_print_body() {
+    printf '%s' "$1" | awk 'NR == 1 && /^__OB_OFFSET__:/ { next } { print }'
+}
+
+# ---------------------------------------------------------------------------
+# shell / doctor
+# ---------------------------------------------------------------------------
+
+cmd_shell() {
+    local usage="usage: $OB_PROG shell"
+    [[ $# -eq 0 ]] || ob_die "$usage"
+    ob_need aws session-manager-plugin
+    ob_ensure_running
+    local region instance
+    region=$(ob_region)
+    instance=$(ob_instance_id)
+    ob_info "opening an SSM session on $instance ($region)"
+    printf 'tip: sudo -iu %s, then tail -f %s\n' "$OB_REMOTE_USER" "$OB_REMOTE_LOG" >&2
+    exec aws ssm start-session --region "$region" --target "$instance"
+}
+
+cmd_doctor() {
+    local usage="usage: $OB_PROG doctor"
+    [[ $# -eq 0 ]] || ob_die "$usage"
+    ob_need aws jq
+    ob_ensure_running
+
+    local out rc=0
+    out=$(ob_ssm_exec "$(ob_remote_as_user "$OB_REMOTE_HOME/bin/ob-doctor")" 900) || rc=$?
+    [[ -n $out ]] && printf '%s' "$out"
+    if [[ $rc -eq 0 ]]; then
+        ob_info "ob-doctor passed"
+    else
+        ob_warn "ob-doctor failed with exit code $rc"
+    fi
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# start / stop
+# ---------------------------------------------------------------------------
+
+cmd_start() {
+    local usage="usage: $OB_PROG start"
+    [[ $# -eq 0 ]] || ob_die "$usage"
+    ob_need aws
+    ob_ensure_running
+    printf 'state: %s\n' "$(ob_instance_state)"
+}
+
+cmd_stop() {
+    local usage="usage: $OB_PROG stop"
+    [[ $# -eq 0 ]] || ob_die "$usage"
+    ob_need aws
+    local region instance state
+    region=$(ob_region)
+    instance=$(ob_instance_id)
+    state=$(ob_instance_state)
+    case $state in
+    stopped)
+        ob_info "instance $instance already stopped"
+        ;;
+    stopping)
+        ob_info "instance $instance already stopping; waiting"
+        aws ec2 wait instance-stopped --region "$region" --instance-ids "$instance"
+        ;;
+    *)
+        ob_info "stopping instance $instance"
+        aws ec2 stop-instances --region "$region" --instance-ids "$instance" >/dev/null
+        aws ec2 wait instance-stopped --region "$region" --instance-ids "$instance"
+        ;;
+    esac
+    printf 'state: %s\n' "$(ob_instance_state)"
+    printf 'note: the box also stops itself after OPENBUILDER_IDLE_STOP_MINUTES of idleness.\n'
+}
+
+# ---------------------------------------------------------------------------
+# cost
+# ---------------------------------------------------------------------------
+
+# The box keeps one NDJSON per attempt at
+#   state/<owner>__<repo>__<slug>/rounds/<NNN>/run.ndjson
+# so walk with find and fold the rounds back onto their slug. The flat
+# state/<key>/run.ndjson layout is handled too, so this keeps working if a job
+# writes its transcript one level up.
+ob_cost_script() {
+    cat <<EOF
+find $OB_REMOTE_HOME/state -type f -name run.ndjson 2>/dev/null | sort | while read -r f; do
+  d=\$(dirname "\$f")
+  case "\$d" in
+    */rounds/*) key=\$(basename "\$(dirname "\$(dirname "\$d")")") ;;
+    *) key=\$(basename "\$d") ;;
+  esac
+  c=\$(jq -s 'map(select(.type=="message_end")|.message.usage.cost.total//0)|add//0' "\$f" 2>/dev/null || echo 0)
+  printf '%s\t%s\n' "\$key" "\$c"
+done
+EOF
+}
+
+cmd_cost() {
+    local usage="usage: $OB_PROG cost"
+    [[ $# -eq 0 ]] || ob_die "$usage"
+    ob_need aws jq awk
+    ob_ensure_running
+
+    local out rc=0
+    out=$(ob_ssm_exec "$(ob_cost_script)") || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        ob_die "could not read model spend from the box (exit $rc)"
+    fi
+    if [[ -z ${out//[[:space:]]/} ]]; then
+        printf 'no run.ndjson files under %s/state yet — nothing has run.\n' "$OB_REMOTE_HOME"
+        return 0
+    fi
+
+    printf 'model spend on %s (from %s/state/**/run.ndjson)\n\n' \
+        "$(ob_instance_id)" "$OB_REMOTE_HOME"
+    printf '%-48s %7s %12s\n' 'JOB (owner__repo__slug)' 'ROUNDS' 'USD'
+    printf '%-48s %7s %12s\n' \
+        '------------------------------------------------' '-------' '------------'
+    # One input line per round; fold them onto the slug, first-seen order.
+    printf '%s' "$out" | awk -F'\t' '
+        NF < 2 { next }
+        {
+            if (!($1 in seen)) { seen[$1] = 1; order[++n] = $1 }
+            sum[$1] += $2 + 0
+            rounds[$1] += 1
+            total += $2 + 0
+            files += 1
+        }
+        END {
+            for (i = 1; i <= n; i++) {
+                k = order[i]
+                printf "%-48s %7d %12.4f\n", k, rounds[k], sum[k]
+            }
+            printf "%-48s %7s %12s\n", "------------------------------------------------", "-------", "------------"
+            printf "%-48s %7d %12.4f\n", "TOTAL", files + 0, total + 0
+        }'
+    printf '\nEC2/EBS cost is not included here — see docs/cost.md and the AWS budget alarm.\n'
+}
+
+# ---------------------------------------------------------------------------
+# dispatch table
+# ---------------------------------------------------------------------------
+
+main() {
+    ob_load_local_config
+
+    local sub=${1:-help}
+    [[ $# -gt 0 ]] && shift
+
+    case $sub in
+    plan) cmd_plan "$@" ;;
+    dispatch) cmd_dispatch "$@" ;;
+    review) cmd_review "$@" ;;
+    approve) cmd_approve "$@" ;;
+    request-changes) cmd_request_changes "$@" ;;
+    status) cmd_status "$@" ;;
+    logs) cmd_logs "$@" ;;
+    shell) cmd_shell "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    start) cmd_start "$@" ;;
+    stop) cmd_stop "$@" ;;
+    cost) cmd_cost "$@" ;;
+    help | -h | --help) cmd_help ;;
+    *)
+        printf '%s: unknown command: %s\n\n' "$OB_PROG" "$sub" >&2
+        ob_command_table >&2
+        exit 2
+        ;;
+    esac
+}
+
+main "$@"

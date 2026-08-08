@@ -1,0 +1,17 @@
+[Unit]
+Description=OpenBuilder poll pass (one run of the spec §6 state machine)
+Documentation=https://github.com/artemkurylo/openbuilder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=openbuilder
+Group=openbuilder
+EnvironmentFile=/opt/openbuilder/etc/openbuilder.env
+WorkingDirectory=/opt/openbuilder
+ExecStart=/opt/openbuilder/bin/ob-poll
+StandardOutput=journal
+StandardError=journal
+# A single pass may dispatch a 45-minute implementation job. Never time it out.
+TimeoutStartSec=0

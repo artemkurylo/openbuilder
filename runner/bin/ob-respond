@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# ob-respond — answer a review round on an existing openbuilder pull request.
+# Single responsibility: collect every piece of actionable reviewer feedback,
+# run a FRESH omp session in the existing worktree, prove it produced commits,
+# push, and report back on the PR.
+#
+# Usage: ob-respond <owner/repo> <slug> <pr>
+set -euo pipefail
+IFS=$'\n\t'
+
+# shellcheck disable=SC2034  # consumed by ob-common.sh's ob_log prefix after sourcing
+OB_PROG="ob-respond"
+OB_SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./ob-common.sh
+source "${OB_SELF_DIR}/ob-common.sh"
+
+REPO=""
+SLUG=""
+PR=""
+KEY=""
+STATE_DIR=""
+ROUND_DIR=""
+SRC_DIR=""
+WT_DIR=""
+PLAN_BRANCH=""
+WORK_BRANCH=""
+DEFAULT_BRANCH=""
+BASE_SHA=""
+ATTEMPT="0"
+NEW_COMMITS="0"
+COST="0"
+# 1 when GitHub told us which review threads are still unresolved, so inline
+# comments can be filtered down to those. 0 means "include every inline comment".
+FILTER_OK=0
+
+usage() {
+  cat <<'EOF'
+Usage: ob-respond <owner/repo> <slug> <pr>
+
+Runs one review-response round: gathers the PR body, reviews, issue comments and
+unresolved review threads, runs a fresh omp session in the existing worktree for
+openbuilder/work/<slug>, then pushes and comments a summary.
+EOF
+}
+
+on_exit() {
+  local rc=$?
+  if [[ "$BASHPID" != "$$" ]]; then
+    exit "$rc"
+  fi
+  trap - EXIT
+  if ((rc != 0)); then
+    ob_log ERROR "failed rc=${rc} repo=${REPO} slug=${SLUG} pr=${PR} attempt=${ATTEMPT}"
+    ob_report_blocked "$REPO" "$SLUG" "$PR" \
+      "\`ob-respond\` failed with exit code ${rc} on attempt ${ATTEMPT}." || true
+  fi
+  exit "$rc"
+}
+
+prepare_repo() {
+  SRC_DIR="$(ob_sync_src "$REPO")"
+  DEFAULT_BRANCH="$(ob_default_branch "$REPO")" ||
+    ob_die "cannot determine the default branch of ${REPO}"
+  [[ "$WORK_BRANCH" != "$DEFAULT_BRANCH" ]] ||
+    ob_die "refusing to operate: work branch equals the default branch"
+  ob_remote_branch_exists "$SRC_DIR" "$WORK_BRANCH" ||
+    ob_die "work branch ${WORK_BRANCH} does not exist on ${REPO}"
+
+  # The worktree normally survives from the implement round; recreate it from the
+  # pushed branch when the box was rebuilt in between.
+  if [[ ! -e "${WT_DIR}/.git" ]]; then
+    ob_log WARN "worktree ${WT_DIR} is missing; recreating it from origin/${WORK_BRANCH}"
+  fi
+  ob_add_worktree "$SRC_DIR" "$WT_DIR" "$WORK_BRANCH" "origin/${WORK_BRANCH}"
+  git -C "$WT_DIR" pull --ff-only --quiet origin "$WORK_BRANCH"
+  BASE_SHA="$(git -C "$WT_DIR" rev-parse HEAD)"
+  ob_log INFO "worktree=${WT_DIR} branch=${WORK_BRANCH} base=${BASE_SHA}"
+}
+
+# unresolved_ids — databaseIds of comments in review threads that are still
+# unresolved. Only GraphQL exposes resolution state; REST does not.
+unresolved_ids() {
+  local query
+  query='query($owner:String!,$name:String!,$pr:Int!,$endCursor:String){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$pr){
+      reviewThreads(first:50,after:$endCursor){
+        pageInfo{hasNextPage endCursor}
+        nodes{isResolved comments(first:100){nodes{databaseId}}}}}}}'
+  ob_gh api graphql --paginate \
+    -F owner="${REPO%%/*}" -F name="${REPO##*/}" -F pr="$PR" \
+    -f query="$query" \
+    --jq '.data.repository.pullRequest.reviewThreads.nodes[]
+          | select(.isResolved == false) | .comments.nodes[].databaseId'
+}
+
+gather_feedback() {
+  local feedback ids_file ids_json
+  feedback="${ROUND_DIR}/feedback.md"
+  ids_file="${ROUND_DIR}/unresolved-ids.txt"
+
+  ob_gh api "repos/${REPO}/pulls/${PR}" --jq '.body // ""' \
+    >"${ROUND_DIR}/pr-body.md" || : >"${ROUND_DIR}/pr-body.md"
+
+  if unresolved_ids >"$ids_file" 2>/dev/null; then
+    FILTER_OK=1
+  else
+    FILTER_OK=0
+    : >"$ids_file"
+    ob_log WARN "could not read review-thread resolution state; using every inline comment"
+  fi
+  ids_json="$(jq -Rn '[inputs | select(length > 0) | tonumber]' <"$ids_file")"
+
+  ob_gh api --paginate "repos/${REPO}/pulls/${PR}/comments" --jq '.[]' \
+    >"${ROUND_DIR}/inline.ndjson" || : >"${ROUND_DIR}/inline.ndjson"
+
+  {
+    printf '### Unresolved inline review comments\n\n'
+    jq -r --argjson ids "$ids_json" --argjson useids "$FILTER_OK" '
+      select($useids == 0 or ((.id) as $i | $ids | index($i) != null))
+      | "- `\(.path)`"
+        + (if .line then ":\(.line)" else (if .original_line then ":~\(.original_line)" else "" end) end)
+        + " — **@\(.user.login)**\n\n"
+        + ((.diff_hunk // "") | if . == "" then "" else "  ```diff\n" + . + "\n  ```\n\n" end)
+        + "  \((.body // "") | gsub("\n"; "\n  "))\n"
+    ' "${ROUND_DIR}/inline.ndjson" 2>/dev/null || true
+
+    printf '\n### Review summaries\n\n'
+    ob_gh api --paginate "repos/${REPO}/pulls/${PR}/reviews" --jq '
+      .[] | select((.body // "") != "") | select(.state != "APPROVED")
+      | "- **@\(.user.login)** [\(.state)]\n\n  \((.body) | gsub("\n"; "\n  "))\n"
+    ' 2>/dev/null || true
+
+    printf '\n### Conversation comments\n\n'
+    ob_gh api --paginate "repos/${REPO}/issues/${PR}/comments" --jq '
+      .[] | select((.body // "") != "")
+      | select((.user.login | test("^openbuilder"; "i")) | not)
+      | "- **@\(.user.login)** (\(.created_at))\n\n  \((.body) | gsub("\n"; "\n  "))\n"
+    ' 2>/dev/null || true
+  } >"$feedback"
+
+  # A round with nothing to act on is a human problem, not an agent problem.
+  if ! grep -q '^- ' "$feedback"; then
+    ob_die "no actionable reviewer feedback found on ${REPO}#${PR}; the changes-requested label needs at least one comment or review body"
+  fi
+  ob_log INFO "collected feedback ($(wc -l <"$feedback" | tr -d ' ') lines, unresolved-filter=${FILTER_OK})"
+}
+
+# read_backlog — the acceptance criteria the reviewer is holding the PR against.
+# Best effort: reviewer feedback is the primary input for this round.
+read_backlog() {
+  local ref backlog_dir path base
+  ref="origin/${PLAN_BRANCH}"
+  backlog_dir=".openbuilder/backlog/${SLUG}"
+  : >"${ROUND_DIR}/plan.md"
+  : >"${ROUND_DIR}/stories.md"
+
+  if ! git -C "$SRC_DIR" rev-parse --verify --quiet "$ref" >/dev/null; then
+    ob_log WARN "plan branch ${PLAN_BRANCH} is gone; continuing with PR feedback only"
+    return 0
+  fi
+  git -C "$SRC_DIR" show "${ref}:${backlog_dir}/plan.md" >"${ROUND_DIR}/plan.md" ||
+    ob_log WARN "no plan.md on ${PLAN_BRANCH}"
+
+  local -a paths=()
+  mapfile -t paths < <(git -C "$SRC_DIR" ls-tree -r --name-only "$ref" \
+    -- "${backlog_dir}/" | sort)
+  for path in "${paths[@]+"${paths[@]}"}"; do
+    base="$(basename -- "$path")"
+    case "$base" in
+    story-*.md) ;;
+    *) continue ;;
+    esac
+    {
+      printf '\n---\n\n### Story card: `%s`\n\n' "$base"
+      git -C "$SRC_DIR" show "${ref}:${path}"
+      printf '\n'
+    } >>"${ROUND_DIR}/stories.md"
+  done
+}
+
+render() {
+  local scalars blocks worklog
+  scalars="${ROUND_DIR}/scalars.tsv"
+  blocks="${ROUND_DIR}/blocks.tsv"
+  worklog="${WT_DIR}/.openbuilder/backlog/${SLUG}/worklog.md"
+  if [[ ! -f "$worklog" ]]; then
+    worklog="${ROUND_DIR}/no-worklog.md"
+    : >"$worklog"
+  fi
+  {
+    printf 'REPO\t%s\n' "$REPO"
+    printf 'SLUG\t%s\n' "$SLUG"
+    printf 'PR_NUMBER\t%s\n' "$PR"
+    printf 'PLAN_BRANCH\t%s\n' "$PLAN_BRANCH"
+    printf 'WORK_BRANCH\t%s\n' "$WORK_BRANCH"
+    printf 'BASE_BRANCH\t%s\n' "$DEFAULT_BRANCH"
+    printf 'WORKTREE\t%s\n' "$WT_DIR"
+    printf 'BACKLOG_DIR\t%s\n' ".openbuilder/backlog/${SLUG}"
+    printf 'ATTEMPT\t%s\n' "$ATTEMPT"
+    printf 'MAX_ATTEMPTS\t%s\n' "$OPENBUILDER_MAX_ATTEMPTS"
+    printf 'MAX_RUNTIME\t%s\n' "$OPENBUILDER_MAX_RUNTIME"
+    printf 'MODEL\t%s\n' "$OPENBUILDER_MODEL"
+  } >"$scalars"
+  {
+    printf 'PLAN\t%s\n' "${ROUND_DIR}/plan.md"
+    printf 'STORIES\t%s\n' "${ROUND_DIR}/stories.md"
+    printf 'PR_BODY\t%s\n' "${ROUND_DIR}/pr-body.md"
+    printf 'FEEDBACK\t%s\n' "${ROUND_DIR}/feedback.md"
+    printf 'WORKLOG\t%s\n' "$worklog"
+  } >"$blocks"
+
+  ob_render_prompt "${OPENBUILDER_HOME}/prompts/respond.md" \
+    "${ROUND_DIR}/prompt.md" "$scalars" "$blocks"
+}
+
+run_agent() {
+  local rc=0
+  # A fresh omp session every round (--no-session): the worklog on the branch is
+  # the only memory that carries across rounds.
+  ob_run_omp "$WT_DIR" "${ROUND_DIR}/prompt.md" "${ROUND_DIR}/run.ndjson" || rc=$?
+  COST="$(ob_omp_cost "${ROUND_DIR}/run.ndjson")"
+  ob_omp_final_text "${ROUND_DIR}/run.ndjson" >"${ROUND_DIR}/final.md"
+  ob_log INFO "round ${ATTEMPT} cost=${COST} USD"
+  ((rc == 0)) || ob_die "omp exited ${rc} on attempt ${ATTEMPT}"
+}
+
+assert_progress() {
+  NEW_COMMITS="$(git -C "$WT_DIR" rev-list --count "${BASE_SHA}..HEAD")"
+  ob_log INFO "new commits this round: ${NEW_COMMITS}"
+  ((NEW_COMMITS >= 1)) ||
+    ob_die "the agent produced no commits while answering review on ${REPO}#${PR}"
+  if [[ -n "$(git -C "$WT_DIR" status --porcelain)" ]]; then
+    ob_log WARN "worktree still has uncommitted changes; they were NOT pushed"
+  fi
+}
+
+record_worklog() {
+  local detail worklog heading
+  detail="${ROUND_DIR}/worklog-detail.md"
+  {
+    printf -- '- action: respond to review\n'
+    printf -- '- pull request: #%s\n' "$PR"
+    printf -- '- model: `%s`\n' "$OPENBUILDER_MODEL"
+    printf -- '- new commits: %s\n' "$NEW_COMMITS"
+    printf -- '- cost: %s USD\n\n' "$COST"
+    printf '### Agent summary\n\n'
+    cat "${ROUND_DIR}/final.md"
+    printf '\n'
+  } >"$detail"
+  heading="Review-response round by \`ob-respond\` (attempt ${ATTEMPT} of ${OPENBUILDER_MAX_ATTEMPTS})."
+  worklog="$(ob_worklog_append "$WT_DIR" "$SLUG" "$ATTEMPT" "$heading" "$detail")"
+  git -C "$WT_DIR" add -- "$worklog"
+  git -C "$WT_DIR" commit --quiet \
+    -m "openbuilder(worklog): review round ${ATTEMPT} for ${SLUG}"
+}
+
+push_branch() {
+  [[ "$WORK_BRANCH" != "$DEFAULT_BRANCH" ]] ||
+    ob_die "refusing to push to the default branch"
+  git -C "$WT_DIR" push --set-upstream origin "$WORK_BRANCH"
+  ob_log INFO "pushed ${WORK_BRANCH} to ${REPO}"
+}
+
+comment_summary() {
+  local comment="${ROUND_DIR}/round-comment.md"
+  {
+    printf '### openbuilder: review round %s\n\n' "$ATTEMPT"
+    printf -- '- new commits: %s\n' "$NEW_COMMITS"
+    printf -- '- cost this round: %s USD\n' "$COST"
+    printf -- '- attempt: %s of %s\n\n' "$ATTEMPT" "$OPENBUILDER_MAX_ATTEMPTS"
+    cat "${ROUND_DIR}/final.md"
+    printf '\n\nPushed to `%s`. Re-review when ready; the bot never merges.\n' \
+      "$WORK_BRANCH"
+  } >"$comment"
+  ob_pr_comment "$REPO" "$PR" "$comment"
+}
+
+main() {
+  if (($# != 3)); then
+    usage >&2
+    exit 2
+  fi
+  REPO="$1"
+  SLUG="$2"
+  PR="$3"
+
+  ob_load_env
+  ob_require_repo "$REPO"
+  ob_require_slug "$SLUG"
+  [[ "$PR" =~ ^[0-9]+$ ]] || ob_die "invalid PR number: ${PR}"
+
+  KEY="$(ob_slug_key "$REPO" "$SLUG")"
+  if ! ob_lock "$KEY"; then
+    ob_log INFO "lock ${KEY} is held by another job; skipping"
+    exit 0
+  fi
+  trap on_exit EXIT
+
+  PLAN_BRANCH="${OPENBUILDER_BRANCH_PREFIX}/plan/${SLUG}"
+  WORK_BRANCH="${OPENBUILDER_BRANCH_PREFIX}/work/${SLUG}"
+  STATE_DIR="$(ob_state_dir "$REPO" "$SLUG")"
+  WT_DIR="$(ob_worktree_dir "$REPO" "$SLUG")"
+  ATTEMPT="$(ob_attempts_incr "$REPO" "$SLUG")"
+  ROUND_DIR="${STATE_DIR}/rounds/$(printf '%03d' "$ATTEMPT")"
+  mkdir -p "$ROUND_DIR"
+  ob_log INFO "start repo=${REPO} slug=${SLUG} pr=${PR} attempt=${ATTEMPT}/${OPENBUILDER_MAX_ATTEMPTS}"
+
+  ob_ensure_labels "$REPO"
+  # §6 start transition.
+  ob_label_add "$REPO" "$PR" in-progress
+  ob_label_remove "$REPO" "$PR" changes-requested
+
+  prepare_repo
+  gather_feedback
+  read_backlog
+  render
+  run_agent
+  assert_progress
+  record_worklog
+  push_branch
+  comment_summary
+
+  # §6 success transition.
+  ob_label_remove "$REPO" "$PR" in-progress
+  ob_label_add "$REPO" "$PR" awaiting-review
+  ob_log INFO "done repo=${REPO} slug=${SLUG} pr=${PR} commits=${NEW_COMMITS} cost=${COST}"
+}
+
+main "$@"

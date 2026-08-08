@@ -1,0 +1,648 @@
+# Runbook
+
+Day-2 operations, organised by symptom. Every entry gives the exact command.
+
+Two conventions throughout:
+
+- `you/your-repo` is the target repo, `<slug>` the story-set slug, `<pr>` the PR number.
+- `<key>` is the state key `ob_slug_key` derives: `<owner>__<repo>__<slug>`, e.g.
+  `you__your-repo__healthz-endpoint`.
+
+## 0. The first three commands, always
+
+```sh
+openbuilder status you/your-repo     # slugs, branches, PRs, labels, last action
+openbuilder logs                     # tail /opt/openbuilder/log/openbuilder.log over SSM
+openbuilder doctor                   # ob-doctor PASS/FAIL table on the box
+```
+
+If `status` shows nothing and `logs` returns nothing, the box is probably stopped — jump to
+[§5](#5-box-is-stopped-and-not-picking-up-work).
+
+To get a shell for anything below:
+
+```sh
+openbuilder shell                    # aws ssm start-session onto the box
+```
+
+Everything on the box runs as the `openbuilder` user. Always prefix with `sudo -u openbuilder`, or you
+will create root-owned files in `/opt/openbuilder` and break the next poll pass.
+
+## 1. Agent produced nothing / no commits
+
+`ob-implement` and `ob-respond` both **require at least one new commit**. If the model finished without
+committing, the job fails loudly: `openbuilder:blocked` goes on, a comment with the log tail goes on the
+PR, and the attempts counter has already been incremented.
+
+Diagnose in this order.
+
+**a. Read what the agent said.** The final assistant text is the agent explaining itself. Extract it from
+the run's NDJSON:
+
+```sh
+openbuilder shell
+sudo -u openbuilder jq -rs 'map(select(.type=="agent_end"))|last|.messages|map(select(.role=="assistant"))|last
+        |.content|map(select(.type=="text"))|map(.text)|join("\n")' \
+  /opt/openbuilder/state/<key>/run.ndjson
+```
+
+**b. Read the worklog** on the work branch — this is where the agent records dead ends across rounds:
+
+```sh
+gh api repos/you/your-repo/contents/.openbuilder/backlog/<slug>/worklog.md \
+  --ref openbuilder/work/<slug> --jq .content | base64 -d
+```
+
+**c. Interpret.** The implementer prompt tells it to **stop and explain instead of guessing at missing
+requirements**, so "no commits plus a paragraph of questions" is the system working as designed, not a
+crash. The fix is upstream: the story card was ambiguous. Tighten it and re-dispatch:
+
+```sh
+# edit .openbuilder/backlog/<slug>/story-NN-*.md in your local clone, then
+openbuilder dispatch you/your-repo <slug>
+```
+
+Then force a clean re-implement per [§13](#13-force-a-re-implement-from-scratch).
+
+**d. If instead it ran out of time** — the log line will say the omp run hit `OPENBUILDER_MAX_RUNTIME` —
+either split the story (the correct answer; see `backlog/SCHEMA.md` on sizing) or raise the ceiling:
+
+```sh
+openbuilder shell
+sudo sed -i 's/^OPENBUILDER_MAX_RUNTIME=.*/OPENBUILDER_MAX_RUNTIME=90m/' /opt/openbuilder/etc/openbuilder.env
+```
+
+That edit is local to the box and will be reverted the next time cloud-init renders the file. For a
+durable change, set `max_runtime` in `infra/terraform.tfvars` and `make apply`.
+
+## 2. PR stuck in `openbuilder:in-progress`
+
+`openbuilder:in-progress` is only ever set at job start and removed at job end, success or failure. If it
+persists for longer than `OPENBUILDER_MAX_RUNTIME`, the process died without running its cleanup — OOM,
+an instance stop mid-run, or a `SIGKILL`.
+
+Check whether anything is actually running:
+
+```sh
+openbuilder shell
+ls -l /opt/openbuilder/run/                                   # lockfiles
+pgrep -a -u openbuilder omp                                   # is an omp child alive?
+systemctl status openbuilder-poll.service --no-pager
+sudo journalctl -u openbuilder-poll.service -n 200 --no-pager
+```
+
+`ob_lock` uses `flock`, so a stale lockfile is not itself a problem — the lock dies with the process that
+held it, and rule 1 stops matching. If `pgrep` is empty and the lockfile is old, the lock is not held.
+
+Clear the state by hand and let the next poll pass re-decide:
+
+```sh
+gh pr edit <pr> --repo you/your-repo --remove-label openbuilder:in-progress \
+                                     --add-label openbuilder:changes-requested
+```
+
+Adding `changes-requested` makes rule 6 fire, so the box runs `ob-respond` and continues the round it
+lost. If it lost the *initial* implement and never pushed a work branch, there is no PR — see
+[§13](#13-force-a-re-implement-from-scratch).
+
+If it was killed by memory pressure:
+
+```sh
+openbuilder shell
+sudo dmesg -T | grep -i -E 'oom|killed process'
+free -m
+```
+
+A `t4g.medium` is 4 GB. A big `npm install` plus a test run plus omp can exhaust it. Raise
+`instance_type` in `infra/terraform.tfvars` (`t4g.large`) and `make apply`.
+
+## 3. `openbuilder:blocked` appeared
+
+`blocked` is terminal from the box's point of view: rule 3 skips the slug **forever**. It is always
+accompanied by a PR comment explaining why.
+
+```sh
+gh pr view <pr> --repo you/your-repo --comments
+openbuilder logs
+```
+
+Two distinct causes, distinguishable from the comment text:
+
+- **Rule 4** — the attempts counter reached `OPENBUILDER_MAX_ATTEMPTS`; see
+  [§4](#4-attempts-hit-openbuilder_max_attempts).
+- **Any failure path** — a push rejected, `gh` 401, omp non-zero exit, no new commit. Fix the underlying
+  cause, then resume.
+
+To resume after fixing the cause, remove the label and give the box something to match:
+
+```sh
+gh pr edit <pr> --repo you/your-repo --remove-label openbuilder:blocked \
+                                     --add-label openbuilder:changes-requested
+```
+
+Rule 3 stops matching, rule 6 matches, `ob-respond` runs on the next pass. **Reset the attempts counter
+too**, or rule 4 will immediately re-block it:
+
+```sh
+openbuilder shell
+sudo -u openbuilder rm -f /opt/openbuilder/state/<key>/attempts
+```
+
+(`ob_attempts_reset` writes the same file; deleting it is equivalent and is what you can do by hand.)
+
+## 4. Attempts hit `OPENBUILDER_MAX_ATTEMPTS`
+
+Rule 4: `attempts >= OPENBUILDER_MAX_ATTEMPTS` (default 6) → label `openbuilder:blocked`, comment, skip.
+Every `ob-implement` and every `ob-respond` costs one attempt, so six is roughly "one implement plus five
+review rounds".
+
+Read the counter:
+
+```sh
+openbuilder shell
+cat /opt/openbuilder/state/<key>/attempts
+```
+
+**Think before you reset.** Six failed rounds on one story almost always means the story card is wrong,
+not that the model needs a seventh try — the weak model is not going to find the answer on attempt seven
+if it has not by attempt six. The right move is usually to close the PR, split the story, and re-plan.
+
+If you do want more rounds:
+
+```sh
+openbuilder shell
+sudo -u openbuilder rm -f /opt/openbuilder/state/<key>/attempts
+gh pr edit <pr> --repo you/your-repo --remove-label openbuilder:blocked \
+                                     --add-label openbuilder:changes-requested
+```
+
+To raise the ceiling durably, set `max_attempts` in `infra/terraform.tfvars` and `make apply`.
+
+## 5. Box is stopped and not picking up work
+
+Expected: `ob-idle-stop` stops the instance after `OPENBUILDER_IDLE_STOP_MINUTES` (default 30) of no lock
+held, no actionable work from `ob-poll --dry-run`, and no mtime change under `state/` or the log.
+
+The laptop CLI starts it for you — `openbuilder dispatch` and `openbuilder review` both call
+`aws ec2 start-instances` and wait. So a stopped box is only a problem if you pushed a plan branch by
+hand.
+
+```sh
+openbuilder start                    # ec2 start-instances + wait
+openbuilder status you/your-repo
+```
+
+If `start` returns but the box never picks up work, the timers did not come back — see
+[§9](#9-poll-timer-not-firing).
+
+If the instance will not start at all, look at the API's reason:
+
+```sh
+aws ec2 describe-instances --instance-ids "$OPENBUILDER_INSTANCE_ID" \
+  --region "$OPENBUILDER_REGION" \
+  --query 'Reservations[].Instances[].{State:State.Name,Reason:StateTransitionReason}'
+```
+
+`InsufficientInstanceCapacity` for `t4g.medium` in your AZ is transient — retry, or change
+`subnet_cidr`/AZ in Terraform.
+
+To stop it deliberately:
+
+```sh
+openbuilder stop
+```
+
+## 6. App token expired or 401
+
+The installation token lives one hour. `ob-token` caches it at `/opt/openbuilder/cache/gh-token.json` and
+mints a fresh one when it is within five minutes of `expires_at`, so an expiry should be invisible. A
+persistent 401 means the *credential inputs* are wrong, not that the token aged out.
+
+```sh
+openbuilder doctor
+```
+
+Then, on the box:
+
+```sh
+openbuilder shell
+sudo -u openbuilder rm -f /opt/openbuilder/cache/gh-token.json      # force a fresh mint
+sudo -u openbuilder bash -lc 'GH_TOKEN=$(/opt/openbuilder/bin/ob-token) gh api user --jq .login'
+# expect: openbuilder-bot[bot]
+```
+
+If that fails, the cause is one of:
+
+| Error | Cause | Fix |
+|---|---|---|
+| `A JWT could not be decoded` | PEM in SSM is mangled or the App ID is wrong | re-put both, see [github-app-setup.md](github-app-setup.md#6-put-the-values-into-ssm) |
+| 404 on `/app/installations/<id>/access_tokens` | installation ID is wrong | re-read it from the `settings/installations/<id>` URL |
+| Token mints, `gh` 403 on push | repo not in the App installation, or Workflows permission missing | **Install App** → Configure |
+| `ParameterNotFound` in the log | wrong `OPENBUILDER_SSM_PREFIX`, or `make secrets` was never run | `aws ssm get-parameters-by-path --path /openbuilder --recursive --query 'Parameters[].Name' --output table` |
+
+Check the clock too — JWT signing uses `iat = now-60`, `exp = now+540`, and a badly skewed clock produces
+exactly the "could not be decoded" error:
+
+```sh
+openbuilder shell
+timedatectl status
+```
+
+## 7. OpenRouter 429 or insufficient credit
+
+Symptom: omp exits fast, `run.ndjson` is tiny, cost is zero, and the log shows an HTTP error from the
+provider.
+
+```sh
+openbuilder shell
+sudo -u openbuilder tail -c 4000 /opt/openbuilder/state/<key>/run.ndjson
+sudo -u openbuilder grep -c . /opt/openbuilder/state/<key>/run.ndjson    # a handful of lines = failed early
+```
+
+Check the key end-to-end without printing it:
+
+```sh
+openbuilder shell
+sudo -u openbuilder bash -lc '
+  OPENROUTER_API_KEY=$(aws ssm get-parameter --with-decryption \
+    --name /openbuilder/openrouter_api_key --query Parameter.Value --output text)
+  export OPENROUTER_API_KEY
+  curl -s -o /dev/null -w "%{http_code}\n" https://openrouter.ai/api/v1/credits \
+    -H "Authorization: Bearer $OPENROUTER_API_KEY"'
+```
+
+- `200` — the key is valid; a `429` during a run was rate limiting. The next poll pass retries in 60
+  seconds; that is the whole remediation. Repeated 429s mean too many slugs in flight — queue fewer.
+- `401` — bad key. Re-put it and delete nothing else:
+
+  ```sh
+  aws ssm put-parameter --overwrite --name /openbuilder/openrouter_api_key \
+    --type SecureString --value 'sk-or-v1-REPLACE_ME' --region us-east-1
+  ```
+
+- `402` / a zero balance — top up at <https://openrouter.ai/credits>.
+
+`ob-doctor` covers this with a one-token omp call, which is the cheapest possible end-to-end check:
+
+```sh
+openbuilder doctor
+```
+
+## 8. Model produced a broken build
+
+The agent is instructed to run the repo's own test and lint commands, but a weak model can convince
+itself a failure is unrelated. That is what the review gate is for.
+
+```sh
+gh pr checks <pr> --repo you/your-repo
+gh pr diff <pr> --repo you/your-repo
+openbuilder review you/your-repo <pr>
+```
+
+Then hand it back with the failure quoted in a comment, which is what `ob-respond` will read:
+
+~~~sh
+gh pr comment <pr> --repo you/your-repo --body-file - <<'EOF'
+CI is failing. `npm test` output:
+
+```
+FAIL test/health.test.js
+  expected 200, got 404
+```
+
+Fix the route registration, then re-run the tests locally before pushing.
+EOF
+openbuilder request-changes you/your-repo <pr>
+~~~
+
+`ob-respond` pulls the PR body, **all** review comments and **all** review threads with
+`gh api --paginate`, so a specific, quoted failure is the highest-signal thing you can give it. Vague
+comments produce vague rounds.
+
+If it is unsalvageable, stop spending attempts on it. Do **not** reach for `openbuilder approve` — that
+label means "a human may merge this", and using it as a mute button leaves a lie in the PR timeline.
+
+Close it outright instead, then re-plan with better story cards:
+
+```sh
+gh pr close <pr> --repo you/your-repo
+gh pr edit <pr> --repo you/your-repo --add-label openbuilder:blocked
+```
+
+`blocked` is the honest label: rule 3 makes the box skip the slug forever without pretending the work was
+accepted.
+
+## 9. Poll timer not firing
+
+```sh
+openbuilder shell
+systemctl list-timers 'openbuilder-*' --all --no-pager
+systemctl status openbuilder-poll.timer  --no-pager
+systemctl status openbuilder-poll.service --no-pager
+sudo journalctl -u openbuilder-poll.service -n 200 --no-pager
+sudo journalctl -u openbuilder-idle.service -n 100 --no-pager
+```
+
+Expected: `openbuilder-poll.timer` with `OnBootSec=60s`, `OnUnitInactiveSec=60s`, `AccuracySec=5s`,
+`Persistent=false`; `openbuilder-idle.timer` with `OnBootSec=10min`, `OnUnitInactiveSec=5min`. Both
+`active (waiting)`.
+
+Restart them:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now openbuilder-poll.timer openbuilder-idle.timer
+```
+
+If the units are missing entirely, cloud-init or `bootstrap.sh` did not finish. Check, then re-run
+bootstrap — it is idempotent:
+
+```sh
+sudo cloud-init status --long
+sudo tail -100 /var/log/cloud-init-output.log
+sudo /opt/openbuilder/repo/runner/bootstrap.sh
+```
+
+If the service fails immediately with a status about the environment file, the env file is missing or
+malformed (`EnvironmentFile=/opt/openbuilder/etc/openbuilder.env`):
+
+```sh
+sudo cat /opt/openbuilder/etc/openbuilder.env
+```
+
+Every line must be `KEY=value`, no `export`, no stray quotes. If it is wrong, fix
+`infra/terraform.tfvars` and `make apply` — the file is rendered by cloud-init from Terraform vars.
+
+Run one pass in the foreground to see what it decides:
+
+```sh
+sudo -u openbuilder /opt/openbuilder/bin/ob-poll --dry-run
+```
+
+## 10. Disk full
+
+Symptom: git operations fail, `run.ndjson` truncates, everything blocks.
+
+```sh
+openbuilder shell
+df -h /opt/openbuilder
+sudo du -sh /opt/openbuilder/* | sort -h
+sudo du -sh /opt/openbuilder/state/* | sort -h
+```
+
+The usual suspects, in order: `work/` worktrees, `src/` clones with big histories and `node_modules`,
+`state/<key>/run.ndjson` files, and the apt/npm caches.
+
+Reclaim, safest first:
+
+```sh
+# 1. old NDJSON transcripts for slugs that are done (approved/merged)
+sudo -u openbuilder find /opt/openbuilder/state -name 'run.ndjson' -mtime +14 -delete
+
+# 2. worktrees for finished slugs — remove through git so the clone's metadata stays consistent
+sudo -u openbuilder git -C /opt/openbuilder/src/you__your-repo \
+  worktree remove --force /opt/openbuilder/work/you__your-repo__<slug>
+sudo -u openbuilder git -C /opt/openbuilder/src/you__your-repo worktree prune
+
+# 3. git object churn
+sudo -u openbuilder git -C /opt/openbuilder/src/you__your-repo gc --prune=now
+
+# 4. package manager caches
+sudo apt-get clean
+sudo -u openbuilder npm cache clean --force
+
+# 5. journal
+sudo journalctl --vacuum-time=7d
+```
+
+Never `rm -rf` a `work/` directory without `git worktree remove`/`prune` — the clone in `src/` keeps
+metadata pointing at it and the next `ob-implement` for that slug will fail confusingly.
+
+For headroom, raise `root_volume_gb` in `infra/terraform.tfvars`, `make apply`, then grow the filesystem:
+
+```sh
+openbuilder shell
+lsblk
+sudo growpart /dev/nvme0n1 1
+sudo resize2fs /dev/nvme0n1p1
+```
+
+## 11. Reading the logs
+
+**Operational log** — one append-only file, ISO-8601 UTC timestamps, secrets redacted
+(`sk-or-`, `ghs_`, `github_pat_`, PEM bodies):
+
+```sh
+openbuilder logs                 # tail it over SSM
+openbuilder logs -f              # follow
+```
+
+On the box directly:
+
+```sh
+openbuilder shell
+tail -n 200 /opt/openbuilder/log/openbuilder.log
+tail -f    /opt/openbuilder/log/openbuilder.log
+grep -F '<slug>' /opt/openbuilder/log/openbuilder.log
+grep -E 'ERROR|WARN'  /opt/openbuilder/log/openbuilder.log | tail -50
+```
+
+**Per-job omp transcript** — `state/<key>/run.ndjson`, one JSON object per line, `.type` in
+`session|agent_start|turn_start|message_start|message_update|message_end|turn_end|agent_end`:
+
+```sh
+openbuilder shell
+cd /opt/openbuilder/state/<key>
+
+# what the agent finally said
+jq -rs 'map(select(.type=="agent_end"))|last|.messages|map(select(.role=="assistant"))|last
+        |.content|map(select(.type=="text"))|map(.text)|join("\n")' run.ndjson
+
+# what this run cost, in USD
+jq -s 'map(select(.type=="message_end")|.message.usage.cost.total//0)|add//0' run.ndjson
+
+# the shape of the run: how many of each event
+jq -r .type run.ndjson | sort | uniq -c
+
+# every tool call it made, in order
+jq -rc 'select(.type=="message_end")|.message.content[]?|select(.type=="tool_use")|[.name,(.input|tostring)[0:160]]|@tsv' run.ndjson
+```
+
+Cost across every job on the box:
+
+```sh
+openbuilder cost
+```
+
+**systemd journal** — for the wrapper, not the agent:
+
+```sh
+sudo journalctl -u openbuilder-poll.service  --since '2 hours ago' --no-pager
+sudo journalctl -u openbuilder-idle.service  --since '1 day ago'   --no-pager
+```
+
+## 12. Re-run a single job by hand
+
+Useful when you want to watch a run live instead of waiting 60 seconds and reading a transcript. Take the
+slug lock the same way the poller does by simply not running two at once — stop the timer first.
+
+```sh
+openbuilder shell
+sudo systemctl stop openbuilder-poll.timer          # don't race the poller
+
+# a full implement pass
+sudo -u openbuilder /opt/openbuilder/bin/ob-implement you/your-repo <slug>
+
+# or one review round against an existing PR
+sudo -u openbuilder /opt/openbuilder/bin/ob-respond you/your-repo <slug> <pr>
+
+# what the poller *would* do, no side effects
+sudo -u openbuilder /opt/openbuilder/bin/ob-poll --dry-run
+
+# a real single pass
+sudo -u openbuilder /opt/openbuilder/bin/ob-poll
+
+sudo systemctl start openbuilder-poll.timer         # ALWAYS put it back
+```
+
+These are the same entry points the timer uses and they update labels, attempts and the worklog exactly
+the same way — a manual run is not a dry run.
+
+## 13. Force a re-implement from scratch
+
+Rule 5 only fires when **no PR with head `openbuilder/work/<slug>` exists**. So to make the box start the
+story over, remove the PR and the branch:
+
+```sh
+gh pr close <pr> --repo you/your-repo --delete-branch
+```
+
+If the branch survives (or there was never a PR):
+
+```sh
+git push origin --delete openbuilder/work/<slug>
+```
+
+Then clear the box's local state for that slug so it starts from a clean worktree, and reset attempts:
+
+```sh
+openbuilder shell
+sudo -u openbuilder git -C /opt/openbuilder/src/you__your-repo \
+  worktree remove --force /opt/openbuilder/work/you__your-repo__<slug> || true
+sudo -u openbuilder git -C /opt/openbuilder/src/you__your-repo worktree prune
+sudo -u openbuilder git -C /opt/openbuilder/src/you__your-repo branch -D openbuilder/work/<slug> || true
+sudo -u openbuilder rm -rf /opt/openbuilder/state/you__your-repo__<slug>
+```
+
+Push updated story cards if you changed them, and make sure the plan branch carries `openbuilder:queued`
+again:
+
+```sh
+openbuilder dispatch you/your-repo <slug>
+```
+
+The next poll pass matches rule 5 and runs `ob-implement` fresh. Note that the worklog is gone with the
+branch — that is the point of a clean restart.
+
+To retire a slug permanently instead, delete the plan branch; `ob-poll` iterates over
+`openbuilder/plan/*`, so no branch means no work:
+
+```sh
+git push origin --delete openbuilder/plan/<slug>
+```
+
+## 14. Roll back merged work
+
+Nothing the box does is irreversible, because it never merges. Once *you* have merged, revert like any
+other change:
+
+```sh
+git fetch origin
+git checkout main && git pull --ff-only
+
+# a squash-merged PR is one commit
+git revert --no-edit <merge-or-squash-sha>
+
+# a true merge commit
+git revert --no-edit -m 1 <merge-sha>
+
+git push origin main
+```
+
+Find the SHA:
+
+```sh
+gh pr view <pr> --repo you/your-repo --json mergeCommit,mergedAt,title
+```
+
+Prefer `git revert` over a force-push: the agent's guardrails hook blocks force-pushes, and history that
+the box may still have cloned in `src/` should not be rewritten under it. If you do rewrite anyway, reset
+the box's clone:
+
+```sh
+openbuilder shell
+sudo -u openbuilder git -C /opt/openbuilder/src/you__your-repo fetch --all --prune
+```
+
+## 15. Update the box
+
+The box runs whatever is in `/opt/openbuilder/repo`, a checkout of this control repo. After you push a
+change to `runner/`, `agent/remote/` or the prompts:
+
+```sh
+openbuilder shell
+sudo -u openbuilder /opt/openbuilder/bin/ob-selfupdate
+```
+
+That does `git -C /opt/openbuilder/repo pull --ff-only` and then re-runs `bootstrap.sh`, which is
+idempotent: it re-copies `runner/bin`, `runner/prompts` and `agent/remote` into `/opt/openbuilder/`,
+reinstalls the systemd units, and `daemon-reload`s. Verify:
+
+```sh
+openbuilder doctor
+```
+
+If the pull fails because the working tree diverged (you hand-edited a script on the box):
+
+```sh
+openbuilder shell
+sudo -u openbuilder git -C /opt/openbuilder/repo status --short
+sudo -u openbuilder git -C /opt/openbuilder/repo checkout -- .
+sudo -u openbuilder /opt/openbuilder/bin/ob-selfupdate
+```
+
+`--ff-only` is deliberate: the box never merges, not even its own control repo.
+
+Changes to `/opt/openbuilder/etc/openbuilder.env` are **not** covered by `ob-selfupdate` — that file is
+rendered by cloud-init from Terraform variables. To change it properly, edit `infra/terraform.tfvars`,
+`make apply`, and recreate the instance (or hand-edit the file on the box for a temporary override and
+accept that it is not durable).
+
+To pick up a new omp release, bump `omp_version` in `infra/terraform.tfvars` and `make apply`, or just
+re-run bootstrap — it downloads `omp-linux-arm64` plus `SHA256SUMS.txt`, verifies the checksum, and skips
+the install if the version already matches:
+
+```sh
+openbuilder shell
+sudo /opt/openbuilder/repo/runner/bootstrap.sh
+omp --version
+```
+
+## 16. Quick reference
+
+| Want | Command |
+|---|---|
+| See everything at a glance | `openbuilder status you/your-repo` |
+| Tail the box log | `openbuilder logs -f` |
+| Full preflight | `openbuilder doctor` |
+| Shell on the box | `openbuilder shell` |
+| Power | `openbuilder start` / `openbuilder stop` |
+| Spend so far | `openbuilder cost` |
+| What would the poller do? | `sudo -u openbuilder /opt/openbuilder/bin/ob-poll --dry-run` |
+| Run one implement now | `sudo -u openbuilder /opt/openbuilder/bin/ob-implement you/your-repo <slug>` |
+| Run one review round now | `sudo -u openbuilder /opt/openbuilder/bin/ob-respond you/your-repo <slug> <pr>` |
+| Fresh App token identity | `sudo -u openbuilder bash -lc 'GH_TOKEN=$(/opt/openbuilder/bin/ob-token) gh api user --jq .login'` |
+| Update the box | `sudo -u openbuilder /opt/openbuilder/bin/ob-selfupdate` |
+| Hand the PR back to the box | `openbuilder request-changes you/your-repo <pr>` |
+| Tell the box to stop touching a PR | `openbuilder approve you/your-repo <pr>` |
+| Reset attempts | `sudo -u openbuilder rm -f /opt/openbuilder/state/<key>/attempts` |
