@@ -19,6 +19,13 @@ repos = [
 # region      = "eu-central-1"
 # name_prefix = "openbuilder"
 
+# Which account to deploy into. Leave commented to use the ambient credential
+# chain. SET IT if your shell's AWS_PROFILE points at some other account (a
+# model-API-only account, a work SSO profile) — otherwise Terraform will happily
+# try to build this there. Must be the same account as OPENBUILDER_AWS_PROFILE
+# in .openbuilder.local. Verify after apply with: terraform output account_id
+# aws_profile = "my-personal-profile"
+
 # --- Instance shape -----------------------------------------------------------
 
 # instance_type  = "t4g.medium"   # 2 vCPU / 4 GiB arm64, ~$28/mo always-on

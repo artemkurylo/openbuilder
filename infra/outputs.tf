@@ -8,6 +8,11 @@ output "region" {
   value       = var.region
 }
 
+output "account_id" {
+  description = "Account this module actually deployed into. Check it after the first apply — the fastest way to catch a wrong ambient AWS_PROFILE."
+  value       = data.aws_caller_identity.current.account_id
+}
+
 output "ssm_session_command" {
   description = "Interactive shell on the instance. No SSH, no key pair, no inbound rule involved."
   value       = "aws ssm start-session --target ${aws_instance.openbuilder.id} --region ${var.region}"

@@ -8,6 +8,17 @@ variable "region" {
   default     = "eu-central-1"
 }
 
+variable "aws_profile" {
+  # Terraform obeys the ambient AWS_PROFILE, which is often pinned to a totally
+  # different account — e.g. one that only serves a model API. Applying this
+  # module there fails on ec2:* at best, and builds the instance in the wrong
+  # account at worst. Pin the intended account here and the mistake is
+  # impossible. Empty means "use the normal AWS credential chain".
+  description = "AWS profile to deploy with. Empty uses the default credential chain (AWS_PROFILE, env keys, SSO, instance role)."
+  type        = string
+  default     = ""
+}
+
 variable "name_prefix" {
   description = "Prefix for every resource name and for the `Name` tag (`<name_prefix>-<resource>`)."
   type        = string

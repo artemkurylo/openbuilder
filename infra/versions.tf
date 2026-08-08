@@ -47,6 +47,11 @@ terraform {
 provider "aws" {
   region = var.region
 
+  # null (not "") means "fall back to the normal credential chain". Setting this
+  # pins the deploy to one account so an unrelated ambient AWS_PROFILE cannot
+  # silently send the instance somewhere else.
+  profile = var.aws_profile != "" ? var.aws_profile : null
+
   # The common pair from the naming contract goes on every resource this
   # provider creates. The per-resource `Name` tag is set on each resource.
   default_tags {
