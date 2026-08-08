@@ -32,18 +32,29 @@ main() {
   repo_dir="${OPENBUILDER_HOME}/repo"
   url="$(ob_clone_url "$OPENBUILDER_CONTROL_REPO")"
 
+  # Git runs as the owning user, never as root. bootstrap.sh below genuinely
+  # needs root, but a root `git fetch` here leaves root-owned .git/FETCH_HEAD,
+  # index.lock and objects behind, after which every later openbuilder-user
+  # operation dies with "Permission denied". Observed on the first real boot.
+  local as_owner=()
+  if [[ "$(id -u)" -eq 0 ]]; then
+    as_owner=(runuser -u "${OB_USER:-openbuilder}" -- env "HOME=${OPENBUILDER_HOME}")
+  fi
+
   if [[ -d "${repo_dir}/.git" ]]; then
-    before="$(git -C "$repo_dir" -c safe.directory='*' rev-parse HEAD)"
-    git -C "$repo_dir" -c safe.directory='*' remote set-url origin "$url"
-    git -C "$repo_dir" -c safe.directory='*' pull --ff-only ||
-      ob_die "git pull --ff-only failed in ${repo_dir}; resolve it by hand"
-    after="$(git -C "$repo_dir" -c safe.directory='*' rev-parse HEAD)"
+    before="$("${as_owner[@]}" git -C "$repo_dir" -c safe.directory='*' rev-parse HEAD)"
+    "${as_owner[@]}" git -C "$repo_dir" -c safe.directory='*' remote set-url origin "$url"
+    "${as_owner[@]}" git -C "$repo_dir" -c safe.directory='*' fetch --prune --quiet origin ||
+      ob_die "git fetch failed in ${repo_dir}"
+    "${as_owner[@]}" git -C "$repo_dir" -c safe.directory='*' merge --ff-only FETCH_HEAD ||
+      ob_die "fast-forward failed in ${repo_dir}; history diverged, resolve it by hand"
+    after="$("${as_owner[@]}" git -C "$repo_dir" -c safe.directory='*' rev-parse HEAD)"
     ob_log INFO "control repo ${before:0:8} -> ${after:0:8}"
   else
     # The cloud-init clone is allowed to fail (public clone, no token yet); this
     # is the retry path, and it goes through the git credential helper.
     ob_log INFO "cloning the control repo into ${repo_dir}"
-    git clone --quiet "$url" "$repo_dir" ||
+    "${as_owner[@]}" git clone --quiet "$url" "$repo_dir" ||
       ob_die "cannot clone ${OPENBUILDER_CONTROL_REPO} into ${repo_dir}"
   fi
 

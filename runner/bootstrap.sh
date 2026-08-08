@@ -214,6 +214,34 @@ install_omp() {
   log "installed omp: $(/usr/local/bin/omp --version 2>/dev/null | awk 'NR == 1')"
 }
 
+# Canonical's Ubuntu images do NOT ship the AWS CLI (Amazon Linux does). Without
+# it every `aws ssm get-parameter` fails, so the runner cannot read a single
+# secret and ob-idle-stop cannot stop the instance — the whole system is inert.
+# Installed from the official bundle because Ubuntu's `awscli` package lags and
+# has historically shipped v1.
+install_awscli() {
+  local arch url tmp
+  if command -v aws >/dev/null 2>&1; then
+    log "aws already installed: $(aws --version 2>&1 | head -1)"
+    return 0
+  fi
+  case "$(uname -m)" in
+    aarch64 | arm64) arch="aarch64" ;;
+    x86_64 | amd64) arch="x86_64" ;;
+    *) die "unsupported architecture for the AWS CLI: $(uname -m)" ;;
+  esac
+  url="https://awscli.amazonaws.com/awscli-exe-linux-${arch}.zip"
+  tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064  # expand tmp now, not at trap time
+  trap "rm -rf '${tmp}'" RETURN
+  log "downloading ${url}"
+  curl -fsSL "$url" -o "${tmp}/awscliv2.zip" || die "cannot download the AWS CLI"
+  unzip -q "${tmp}/awscliv2.zip" -d "$tmp" || die "cannot unpack the AWS CLI"
+  "${tmp}/aws/install" --update >/dev/null || die "aws/install failed"
+  command -v aws >/dev/null 2>&1 || die "aws still not on PATH after install"
+  log "installed aws: $(aws --version 2>&1 | head -1)"
+}
+
 install_runner() {
   install -o "$OB_USER" -g "$OB_USER" -m 0755 \
     "${REPO_ROOT}/runner/bin/"* "${OB_HOME}/bin/"
@@ -297,6 +325,7 @@ main() {
   install_gh
   install_node
   install_omp
+  install_awscli
   install_runner
   configure_git
   install_units
