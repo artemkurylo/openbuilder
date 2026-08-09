@@ -130,11 +130,25 @@ read_state() {
 }
 
 write_state() {
-  local epic="$1" dir
+  local epic="$1" dir target tmp
   dir="$(dirname "$(state_path "$epic")")"
-  TMP_STATE="$(mktemp "${dir}/.ob-gate.tmp.XXXXXX")"
+  target="$(state_path "$epic")"
+  tmp="$(mktemp "${dir}/.ob-gate.tmp.XXXXXX")"
+  TMP_STATE="$tmp"
   cat >"$TMP_STATE"
-  mv "$TMP_STATE" "$(state_path "$epic")"
+  # This function is the last element of a pipefail pipeline; when a middle
+  # stage (jq) fails, stdin is empty or truncated and the failure is only
+  # reported after we have run. Do not mv garbage over the one record this
+  # script exists to protect: refuse, and remove the temp file here — in a
+  # subshell, TMP_STATE never reaches the parent's EXIT trap.
+  if [[ ! -s "$TMP_STATE" ]] ||
+     ! jq -e 'type == "object" and has("epic") and has("stage") and has("approvals")' \
+       "$TMP_STATE" >/dev/null 2>&1; then
+    rm -f "$TMP_STATE"
+    TMP_STATE=""
+    die "refusing to overwrite state.json: staged document at ${tmp} is empty or not a valid state object (removed); state.json was left untouched" 1
+  fi
+  mv "$TMP_STATE" "$target"
   TMP_STATE=""
 }
 
