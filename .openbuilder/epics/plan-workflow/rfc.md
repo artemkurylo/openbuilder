@@ -217,10 +217,24 @@ optimisation but a requirement: `ob-respond` drops conversation comments authore
 `openbuilder*`, so a review posted with the App token is invisible to the worker (learning 12).
 
 The head sha of the last reviewed round is remembered in
-`$OPENBUILDER_WORKSPACE/state/<repo>__<pr>/reviewed-head`, which is what makes "no round is
-reviewed twice" mechanical rather than hopeful. Round count is capped at
-`OPENBUILDER_MAX_ATTEMPTS` (6, `ob-poll:23`) so laptop and instance exhaust together instead of one
-outliving the other.
+`$OB_CACHE_DIR/review/<owner>__<repo>__<pr>`, one line, where `OB_CACHE_DIR` is
+`${XDG_CACHE_HOME:-$HOME/.cache}/openbuilder` (`local/bin/openbuilder:46`). That is what makes "no
+round is reviewed twice" mechanical rather than hopeful.
+
+Not `OPENBUILDER_WORKSPACE`: that variable names where **target repositories are cloned**
+(`openbuilder:25,480`), and a per-pull-request review marker is neither a clone nor anything a
+human should find inside one. `OB_CACHE_DIR` already holds exactly this kind of laptop-side scrap —
+the cached region and instance id, each a one-line file written after `mkdir -p "$OB_CACHE_DIR"`
+(`openbuilder:176,222`) — so the marker follows an established pattern instead of inventing a
+second one.
+
+Choosing a cache directory also picks the failure mode deliberately: losing the marker (a cleared
+cache, a new laptop) costs one redundant review of a round that was already reviewed, and a
+redundant review is idempotent — the reviewer re-posts the same verdict and the same label. Losing
+it can never cause a round to be skipped, which is the failure that would matter.
+
+Round count is capped at `OPENBUILDER_MAX_ATTEMPTS` (6, `ob-poll:23`) so laptop and instance
+exhaust together instead of one outliving the other.
 
 `--watch` is a flag on the existing command rather than a new one: the interactive path stays
 exactly as it is for the times you want to read the diff yourself.
@@ -446,8 +460,10 @@ If it fails a round, it fails alone and nothing upstream is blocked.
 
 ## 12. Open assumptions
 
-- `OPENBUILDER_WORKSPACE` is writable on the laptop for the `--watch` marker. Read from
-  `.openbuilder.local` today; assumed, not verified in a fresh checkout.
+- ~~`OPENBUILDER_WORKSPACE` writability~~ — withdrawn. It cannot be unset (`openbuilder:124`
+  defaults it to `$HOME/.openbuilder/repos`) and `ob_ensure_clone` already creates it
+  (`openbuilder:491`), so there was no assumption to make; and it was the wrong directory anyway.
+  The marker lives in `OB_CACHE_DIR` — see §3.6.
 - **Verified, not assumed:** the GitHub contents API returns the git blob sha as `sha` for
   directory entries, so rule 4b's comparison needs one listing call and no content download.
   Proven 2026-08-09 on this very branch: `gh api
