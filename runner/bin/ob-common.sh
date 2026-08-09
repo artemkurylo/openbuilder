@@ -566,13 +566,16 @@ ob_learnings() {
   ob_log WARN "learnings: none found; this round runs without them"
 }
 
-# ob_learnings_proposed <file> — 0 when the round left a non-trivial candidate
-# entry behind. Blank lines and comment lines do not count, so an agent that
-# touches the file without saying anything does not produce an empty section.
+# ob_learnings_proposed <file> — 0 when the round left a candidate entry behind.
+#
+# The file starts empty, so any non-blank line is a proposal. Deliberately NOT
+# treating a leading `#` as a comment: the entry shape the prompt asks for is a
+# markdown heading (`### N. rule`), and an earlier version of this check silently
+# swallowed every real proposal for exactly that reason.
 ob_learnings_proposed() {
   local file="$1"
   [[ -s "$file" ]] || return 1
-  grep -qE '^[[:space:]]*[^[:space:]#]' -- "$file"
+  grep -qE '[^[:space:]]' -- "$file"
 }
 
 # ---------------------------------------------------------------------------
