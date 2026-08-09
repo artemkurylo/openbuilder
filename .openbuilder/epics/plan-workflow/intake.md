@@ -219,3 +219,20 @@ issue-driven path is a new rule in the rule table, and by the parity contract a 
 `waker/github.py` as well, plus a decision about who authors the single card and where the gate
 sits when the human has only a phone. Designing it now would mean designing the exception before
 the rule exists. Until then the fast path is a one-card epic.
+
+### Q10 — May openbuilder ever touch a repository on an enterprise host?
+
+**Asked because** you stated it as a boundary, and checking it turned up a live hole rather than a
+hypothetical one.
+
+**Answered** no. Personal use only: `github.com`, personal account, and no reachable path to a work
+or enterprise host.
+**Consequence** PRD gains **R11** and a constraint, so the PRD approval recorded at `d5f5736` is
+void by its own mechanism — `prd.md`'s blob no longer matches `approvals.prd.blob`, which is exactly
+the behaviour R3 demands. RFC gains §4b and a sixth slug, `plan-workflow-00-host`, ordered first.
+The hole was: `gh` on this laptop is authenticated to an enterprise host *and* to `github.com`,
+`local/bin/openbuilder` makes 23 `gh` calls without pinning `GH_HOST`, and `ob_validate_repo`
+checks only that an argument is shaped like `owner/repo` — so `openbuilder plan <work-org>/<repo> x`
+passes validation, and the host it resolves to is whatever the environment offers. Nothing has gone
+wrong only because the commands have run inside a `github.com` clone. The instance and the waker
+were already pinned (`cloud-init.yaml.tftpl:50`, `waker/github.py:27`).

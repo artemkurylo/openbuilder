@@ -141,6 +141,32 @@ An epic may produce several pull requests. The unit is the slug: the backlog sta
 slugs an epic has, each with a handful of cards, and they are dispatched one at a time. One epic,
 one PRD, one RFC, one or more slugs, one pull request each.
 
+### R11 — openbuilder operates on personal repositories only, and enforces it
+
+openbuilder must never act on a repository hosted anywhere but `github.com`, and never on a
+repository outside the personal account. This is not a configuration default; it is a boundary the
+code refuses to cross:
+
+- every entry point rejects a non-personal owner **before** any network call, naming the owner it
+  refused;
+- every GitHub call pins the host explicitly rather than inheriting whatever the environment
+  offers;
+- a host other than `github.com` anywhere in the configuration is a fatal startup error, not a
+  knob;
+- the refusal is loud, since a silent fallback to the wrong host is the failure this exists to
+  prevent.
+
+The boundary is currently held by luck, not by code: `gh` on the laptop is authenticated to an
+enterprise host as well as to `github.com`, `local/bin/openbuilder` makes twenty-three `gh` calls
+without pinning a host, and repository validation checks only that an argument looks like
+`owner/repo`. It has worked so far because the commands happen to run inside a `github.com` clone.
+That is a coincidence, and this requirement removes the dependence on it.
+
+This is the same failure class the project has already paid for twice — `ob_region()` deliberately
+ignoring an ambient `AWS_REGION`, and the AWS provider needing an explicit profile because the
+ambient one was a work account. Credential and host separation is a standing property of this
+system, not a feature of this epic; R11 finishes the job for GitHub.
+
 ## 7. Success criteria
 
 Measured on this epic itself, which goes through the workflow it defines:
@@ -155,6 +181,10 @@ Measured on this epic itself, which goes through the workflow it defines:
 5. After landing, `main` contains the PRD and the RFC, `origin` has none of the epic's branches,
    and the instance has no state directory for the slug.
 6. The four documented commands are the only ones needed from problem statement to merge.
+7. With an enterprise host authenticated in `gh` and exported in the environment, every openbuilder
+   command that takes a repository refuses a non-personal owner before making a network call, and
+   every command that does make one reaches `github.com` — demonstrated on this laptop, where both
+   hosts are in fact authenticated.
 
 ## 8. Constraints and assumptions
 
@@ -169,6 +199,9 @@ Measured on this epic itself, which goes through the workflow it defines:
 - This repository is public and its contents are processed by a third-party model. No employer,
   client, hostname, account or work-email identifier may appear in any artifact.
 - The bot never merges and never force-pushes. Both remain true after this epic.
+- **Personal use only.** `github.com`, personal account, and no path by which a work or enterprise
+  host can be reached — see R11. A repository on an enterprise host is not a supported
+  configuration to be handled carefully; it is a state the code refuses to enter.
 
 ## 9. Out of scope for this epic
 

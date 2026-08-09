@@ -320,6 +320,69 @@ method that proved the waker's five outcomes and the lock probe's four cases. Bo
 run against the same fixture branches and must produce the same decision. Asserting parity by
 reading the two files side by side is not acceptable for this rule.
 
+## 4b. The personal-host boundary (R11)
+
+Appended rather than renumbered, for the reason §4.1 gives about the rule table: a section number
+that appears in cross-references is not worth churning for tidiness.
+
+### 4b.1 What is actually wrong today
+
+| Layer | State | Verdict |
+|---|---|---|
+| waker | `API = "https://api.github.com"` (`waker/github.py:27`) | already pinned |
+| instance env | `OPENBUILDER_GH_HOST=github.com`, a literal in `infra/templates/cloud-init.yaml.tftpl:50`, defaulted again at `ob-common.sh:91` | pinned by configuration, not refused by code |
+| instance `gh` | `ob_gh` sets `GH_HOST="${OPENBUILDER_GH_HOST}"` on every call (`ob-common.sh:267`) | correct, but only as good as the env file |
+| laptop CLI | 23 `gh` invocations, **none** pinning a host | inherits ambient resolution |
+| laptop validation | `ob_validate_repo` checks only `^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$` | any owner passes |
+
+On this laptop `gh auth status` reports **two** authenticated hosts, an enterprise one and
+`github.com`, both marked active for their host. The reason nothing has gone wrong is that the
+commands have so far run inside a `github.com` clone, from which `gh` infers the host. That is a
+coincidence, and coincidences are not boundaries.
+
+### 4b.2 Three layers, cheapest first
+
+**1. Refuse the owner before the network.** `ob_validate_repo` gains an owner allowlist:
+`OPENBUILDER_OWNER`, default `artemkurylo`, comma-separated for the rare second personal account.
+A non-matching owner dies immediately, naming the owner and the allowlist, before any `gh`, `git` or
+`aws` call. This is what stops `openbuilder plan Box/www x` at argument parsing rather than at a
+404 — or worse, a 200.
+
+**2. Pin the host at one choke point.** A laptop-side `ob_gh()` wrapper, mirroring the instance's
+`ob-common.sh:261`, that runs `GH_HOST=github.com gh "$@"` and nothing else. All 23 call sites move
+to it. A wrapper rather than 23 edits because the property must hold for the *next* call site too:
+a boundary maintained by remembering is a boundary that lapses.
+
+`git` needs the same treatment for the operations that reach a remote. `gh repo clone` and the
+push in `cmd_dispatch` derive their URL from the host, so pinning `gh` covers the clone; the
+remote of an existing clone is asserted rather than assumed — `cmd_plan` refuses a clone whose
+`origin` does not point at `github.com`, which also catches a workspace directory reused from
+something else.
+
+**3. Make the host a fatal constant, not a knob.** `ob_load_env` (`ob-common.sh:78`) currently
+defaults `OPENBUILDER_GH_HOST` to `github.com` and would happily accept any other value from
+`/opt/openbuilder/etc/openbuilder.env`. It gains a check: any value other than `github.com` is
+`ob_die`, on the instance and in the laptop CLI alike. The variable stays — removing it would mean
+touching cloud-init and the environment contract in `docs/architecture.md:117` for no gain — but it
+stops being a setting and becomes an assertion.
+
+### 4b.3 Why this is a slug of its own, and first
+
+`plan-workflow-00-host`, size S, no dependencies, before everything. Three reasons:
+
+- it is a live hole, not a feature of the new workflow, and the epic's own slicing puts
+  `local/bin/openbuilder` **last** (slug 5) — so folding it in there would leave the boundary open
+  for the whole epic;
+- it is independently verifiable in a way nothing else here is: export an enterprise `GH_HOST`,
+  authenticate both hosts (already true), and assert every command still refuses or still reaches
+  `github.com`;
+- it is the smallest slug in the epic, which makes it the right one to prove the loop with.
+
+Note the interaction with §9's merge order: slug 00 touches `local/bin/openbuilder` and slug 5
+rewrites four of its commands. Slug 00 first means slug 5 is written against a file that already has
+`ob_gh()`, so its new commands inherit the boundary instead of reintroducing 4 more unpinned call
+sites.
+
 ## 5. The worker's inheritance (R5)
 
 `ob-implement` and `ob-respond` render their prompts through `ob_render_prompt` with a scalar map
@@ -390,7 +453,8 @@ fail for a reason unrelated to the code (PRD §10).
 
 | Path | Change |
 |---|---|
-| `local/bin/openbuilder` | `cmd_plan` → stage-aware launcher on the design branch; `cmd_dispatch` gains the gate check and cuts the plan branch from the design branch; `cmd_review --watch`; new `cmd_land`; `ob_install_local_assets` also mirrors `agent/local/commands/` into `<clone>/.omp/commands/`; `cmd_status` gains an `unapproved` column |
+| `local/bin/openbuilder` | **slug 00:** `ob_gh()` wrapper pinning `GH_HOST=github.com` across all 23 call sites; `ob_validate_repo` gains an owner allowlist; `origin` asserted to be `github.com`. **slug 05:** `cmd_plan` → stage-aware launcher on the design branch; `cmd_dispatch` gains the gate check and cuts the plan branch from the design branch; `cmd_review --watch`; new `cmd_land`; `ob_install_local_assets` also mirrors `agent/local/commands/` into `<clone>/.omp/commands/`; `cmd_status` gains an `unapproved` column |
+| `runner/bin/ob-common.sh` | `ob_load_env` refuses any `OPENBUILDER_GH_HOST` but `github.com` (§4b) |
 | `runner/bin/ob-poll` | rule 4b |
 | `waker/github.py`, `waker/handler.py` | rule 4b, same semantics |
 | `runner/bin/ob-implement` | resolve `- epic:`; read PRD and RFC off the plan branch; two new blocks; copy the epic docs onto the work branch idempotently |
@@ -405,22 +469,27 @@ fail for a reason unrelated to the code (PRD §10).
 
 ## 9. Proposed slicing
 
-Five slugs, five pull requests, dispatched one at a time (R10). Sized against
+Six slugs, six pull requests, dispatched one at a time (R10). Sized against
 `backlog/SCHEMA.md`. The planner stage produces the cards; this is the shape I intend and the
 reason for the order.
 
 | # | slug | size | depends on | why it is its own PR |
 |---|---|---|---|---|
+| 0 | `plan-workflow-00-host` | S | — | the personal-host boundary (§4b). A live hole, independently verifiable, and it must precede the slug that rewrites the same file |
 | 1 | `plan-workflow-01-gate` | M | — | `ob-gate` plus the layout. Self-contained, verifiable by running it, and every later slug needs it |
 | 2 | `plan-workflow-02-rule` | M | 01 | rule 4b in bash and Python plus the live parity exercise. One reviewer concern, twice |
 | 3 | `plan-workflow-03-context` | M | 01 | PRD/RFC into both prompts and the epic-docs copy. Touches `runner/` and the prompts only |
 | 4 | `plan-workflow-04-agents` | M | 01 | the command, the skill, the `architect` agent, the planner and reviewer edits, `docs/workflow.md`. No shell |
-| 5 | `plan-workflow-05-cli` | L | 01, 02 | `local/bin/openbuilder`: launcher, dispatch gate, `--watch`, `land`. The riskiest file, alone, last |
+| 5 | `plan-workflow-05-cli` | L | 00, 01, 02 | `local/bin/openbuilder`: launcher, dispatch gate, `--watch`, `land`. The riskiest file, alone, last |
 
-Merge order is 1 before 2, because rule 4b starts requiring a `state.json` that only `ob-gate`
-writes. After any slug touching `runner/` merges, the instance needs `ob-selfupdate` before the new
-code runs, and `ob-selfupdate` is allowed to decline while a lock is held and still exit 0
-(learning 18) — so those cards must assert the deployed effect, not the exit code.
+Merge order is 00 before 05 and 01 before 02. 00 first because slug 05 rewrites four commands in the
+same file, and landing the boundary afterwards would mean auditing four brand-new `gh` call sites
+for a property they should have inherited. 01 before 02 because rule 4b starts requiring a
+`state.json` that only `ob-gate` writes.
+
+After any slug touching `runner/` merges, the instance needs `ob-selfupdate` before the new code
+runs, and `ob-selfupdate` is allowed to decline while a lock is held and still exit 0 (learning 18)
+— so those cards must assert the deployed effect, not the exit code.
 
 Slug 5 is sized `L`, which `backlog/SCHEMA.md:102` calls a smell. It is honest here rather than
 mislabelled: four commands in one 1189-line file, each meaningless without the others, and
@@ -470,6 +539,7 @@ If it fails a round, it fails alone and nothing upstream is blocked.
   'repos/artemkurylo/openbuilder/contents/.openbuilder/epics/plan-workflow?ref=openbuilder/design/plan-workflow'`
   returned `prd.md 92074e0fa12b82b3b8a5be8880aa843d5bf814bf`, byte-identical to
   `git rev-parse HEAD:.openbuilder/epics/plan-workflow/prd.md`. Slug 2 must still confirm it for a
-  repository on the enterprise host if one is ever added to `OPENBUILDER_REPOS`.
+  repository on an enterprise host — which, per §4b, is a configuration openbuilder now refuses to
+  enter, so the caveat is closed rather than deferred.
 - Nothing in this epic changes cost. Rule 4b adds three API calls per unapproved slug per minute
   and no instance time; a declined slug does not wake the box, which if anything lowers spend.
