@@ -16,7 +16,8 @@
 # and fully uninstallable.
 #
 #   ob-install-hooks              # install, or report already installed
-#   ob-install-hooks --force      # replace a foreign hook, keeping it as .bak
+#   ob-install-hooks --force      # replace a foreign hook (kept as .bak), or
+#                                 # install despite a shared core.hooksPath
 #   ob-install-hooks --uninstall  # remove only a hook this tool wrote
 #   ob-install-hooks --help
 set -euo pipefail
@@ -28,7 +29,7 @@ FORCE=0
 UNINSTALL=0
 
 usage() {
-  sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # Is the existing hook ours? Anything unreadable or unmarked counts as foreign
@@ -64,7 +65,14 @@ install_hook() {
 # Installed by ob-install-hooks; remove with: local/bin/ob-install-hooks --uninstall
 set -euo pipefail
 IFS=$'\n\t'
-exec local/bin/ob-scrub-check --staged
+# A hook fires in whatever repository is committing; with a shared
+# core.hooksPath that can be a repository this hook was never installed for.
+# Resolve this one and stay silent where it does not apply.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+if [[ ! -x "$REPO_ROOT/local/bin/ob-scrub-check" ]]; then
+  exit 0
+fi
+exec "$REPO_ROOT/local/bin/ob-scrub-check" --staged
 EOF
   chmod +x "$HOOK"
   printf '%s: installed pre-commit scrub hook at %s\n' "$OB_PROG" "$HOOK"
@@ -119,6 +127,32 @@ cd "$REPO_ROOT"
 # relative to the current directory, so pin it to an absolute path.
 HOOKS_DIR="$(git rev-parse --git-path hooks)"
 [[ "$HOOKS_DIR" = /* ]] || HOOKS_DIR="$(pwd)/$HOOKS_DIR"
+
+# A `core.hooksPath` that points outside this repository's own git directory
+# is a shared hooks directory (a global ~/.githooks is the common setup): a
+# hook written there runs in every other repository too, and would block
+# commits it was never meant to guard. Refuse unless --force is explicit.
+# Never read or change the setting — the verdict comes from where git itself
+# reports the hooks directory, checked against the git directory that owns
+# this repository.
+if ((UNINSTALL == 0)) && ((FORCE == 0)); then
+  REPO_GIT_DIR="$(git rev-parse --git-common-dir)"
+  [[ "$REPO_GIT_DIR" = /* ]] || REPO_GIT_DIR="$(pwd)/$REPO_GIT_DIR"
+  case "$HOOKS_DIR" in
+    "$REPO_GIT_DIR"/*) ;;
+    *)
+      printf '%s: core.hooksPath points at %s, a hooks directory shared by\n' \
+        "$OB_PROG" "$HOOKS_DIR" >&2
+      printf '%s: other repositories; a hook installed there would run in all\n' \
+        "$OB_PROG" >&2
+      printf '%s: of them. Refusing to install. Re-run with --force to install\n' \
+        "$OB_PROG" >&2
+      printf '%s: there anyway.\n' "$OB_PROG" >&2
+      exit 1
+      ;;
+  esac
+fi
+
 if [[ ! -d "$HOOKS_DIR" ]]; then
   if ((UNINSTALL)); then
     printf '%s: no hooks directory — nothing to remove.\n' "$OB_PROG"
