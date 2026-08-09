@@ -16,7 +16,9 @@ below. Without that check a permanently failing slug would wake the instance
 every five minutes forever.
 """
 
+import base64
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -26,6 +28,8 @@ from rs256 import b64u, sign
 
 API = "https://api.github.com"
 _UA = "openbuilder-waker"
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,48}$")
+_STORY_RE = re.compile(r"^story-.*\.md$")
 _TIMEOUT = 15
 
 
@@ -131,6 +135,117 @@ def blocked_slugs(token: str, repo: str, label_prefix: str) -> set[str]:
     return slugs
 
 
+def _safe_field(value: str, limit: int) -> str:
+    """Scrub a value from branch content so it cannot break a `key=value` line."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "", value)[:limit]
+    return cleaned if cleaned else "-"
+
+
+def _contents(token: str, repo: str, ref: str, path: str) -> str | None:
+    """Body of a file at a ref, or None when unreadable or not a file body."""
+    try:
+        body = _request(
+            f"repos/{repo}/contents/{path}?ref={urllib.parse.quote(ref, safe='/')}",
+            token=token,
+        )
+    except GitHubError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    content = body.get("content")
+    if not content:
+        return None
+    try:
+        return base64.b64decode(content).decode("utf-8", errors="replace")
+    except (TypeError, ValueError):
+        return None
+
+
+def _backlog_files(token: str, repo: str, ref: str, path: str) -> dict[str, str] | None:
+    """{name: blob sha} for every file in a directory at a ref, or None.
+
+    A listing entry's `sha` is the git blob sha, so the file-set check needs no
+    card content.
+    """
+    try:
+        body = _request(
+            f"repos/{repo}/contents/{path}?ref={urllib.parse.quote(ref, safe='/')}",
+            token=token,
+        )
+    except GitHubError:
+        return None
+    if not isinstance(body, list):
+        return None
+    files = {}
+    for entry in body:
+        if (
+            isinstance(entry, dict)
+            and entry.get("type") == "file"
+            and entry.get("name")
+            and entry.get("sha")
+        ):
+            files[entry["name"]] = entry["sha"]
+    return files
+
+
+def backlog_decline_reason(
+    token: str, repo: str, branch_prefix: str, slug: str
+) -> str | None:
+    """Rule 4b: reason string when the plan branch's backlog is not approved.
+
+    Returns None when the backlog is approved on the plan branch
+    `<prefix>/plan/<slug>`. A read failure of any kind is reported as the same
+    reason as an absent file: a decline has no side effect and the next pass is
+    60 seconds later.
+    """
+    ref = f"{branch_prefix}/plan/{slug}"
+    backlog = f".openbuilder/backlog/{slug}"
+
+    body = _contents(token, repo, ref, f"{backlog}/plan.md")
+    epic = ""
+    if body is not None:
+        for line in body.splitlines():
+            if line.startswith("- epic:"):
+                fields = line.split()
+                if len(fields) >= 3:
+                    epic = fields[2]
+                break
+    if body is None or not epic or not _SLUG_RE.fullmatch(epic):
+        return "backlog-unapproved:no-epic-line"
+
+    body = _contents(token, repo, ref, f".openbuilder/epics/{epic}/state.json")
+    state = None
+    if body is not None:
+        try:
+            state = json.loads(body)
+        except ValueError:
+            state = None
+    if not isinstance(state, dict):
+        return "backlog-unapproved:no-state"
+
+    stage = state.get("stage")
+    if stage != "dispatched":
+        return f"backlog-unapproved:stage={_safe_field(str(stage or ''), 32)}"
+
+    approvals = state.get("approvals")
+    backlog_approvals = approvals.get("backlog") if isinstance(approvals, dict) else None
+    approval = backlog_approvals.get(slug) if isinstance(backlog_approvals, dict) else None
+    recorded = approval.get("files") if isinstance(approval, dict) else None
+    if not isinstance(recorded, dict) or not recorded:
+        return "backlog-unapproved:no-approval"
+
+    listed = _backlog_files(token, repo, ref, backlog) or {}
+    names = sorted(
+        set(recorded) | {n for n in listed if n == "plan.md" or _STORY_RE.match(n)}
+    )
+    for name in names:
+        rsha = recorded.get(name)
+        lsha = listed.get(name)
+        if not rsha or not lsha or rsha != lsha:
+            return f"backlog-unapproved:files-differ({_safe_field(name, 48)})"
+    return None
+
+
 def decide(token: str, repo: str, branch_prefix: str, label_prefix: str) -> list[dict]:
     """One verdict per plan branch: `actionable` plus the rule that decided it."""
     slugs = plan_slugs(token, repo, branch_prefix)
@@ -156,7 +271,11 @@ def decide(token: str, repo: str, branch_prefix: str, label_prefix: str) -> list
             if slug in blocked:
                 verdict(slug, False, 4, "blocked-issue")
             else:
-                verdict(slug, True, 5, "no-pr")
+                reason = backlog_decline_reason(token, repo, branch_prefix, slug)
+                if reason:
+                    verdict(slug, False, "4b", reason)
+                else:
+                    verdict(slug, True, 5, "no-pr")
             continue
         number, labels = found
         if f"{label_prefix}:approved" in labels:
