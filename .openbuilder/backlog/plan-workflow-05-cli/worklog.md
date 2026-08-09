@@ -48,3 +48,27 @@ Verified: `shellcheck -x -S warning` on every script via `make lint` (shellcheck
 `~/.local/bin`, learning 19); `make scrub` clean; full sandbox runs of every acceptance path that
 needs a repo (plan create/resume, dispatch refusal×4 + happy path + UNAPPR column, review --watch
 marker/round-started/approved/blocked, land refusal/confirmation/keep-delete paths + exit 6).
+## Round 1 — 2026-08-09T23:03:17Z
+
+Implementation round by `ob-implement` (attempt 1 of 6).
+
+- action: implement
+- model: `openrouter/deepseek/deepseek-v4-flash-0731`
+- new commits: 5
+- cost: 0.4980716238400001 USD
+- story cards: 4
+
+### Agent summary
+
+
+
+### Learnings proposed this round
+
+Candidates only. They reach `LEARNINGS.md` in the control repo when the reviewer commits them there, and nowhere else.
+
+### 21. The implementer instance's own IAM role cannot SSM to itself
+**Symptom** `openbuilder dispatch` stalled: `==> instance i-... already running` printed, then 300 seconds of silence and a harness `error: interrupted`. The direct calls failed with `User: arn:aws:sts::...:assumed-role/openbuilder-instance/i-... is not authorized to perform: ssm:DescribeInstanceInformation` (and the same for `ssm:SendCommand`).
+**Cause** the CLI's `ob_ensure_running` polls `ssm:DescribeInstanceInformation` for the SSM agent's Online state, and `ob_ssm_exec` sends `aws ssm send-command` to itself — but the instance role that the implementation round shell runs under intentionally has neither action (the laptop's role does). Every poll pass therefore burns the full 60×5 s `ob_wait_ssm_online` window on the very machine that hosts the instance.
+**Rule** When exercising laptop-CLI paths that touch the instance from the instance itself (dispatch/review --watch/land), expect the SSM calls to be denied and stub the two calls on PATH for sandbox runs (online=1; send-command→fake id; list-command-invocations→Failed) instead of waiting out the loop — the same PATH-stub genre the story cards already use for `omp`. Treat `land`'s prune as the documented exit 6 with the manual-prune warning, never as a land failure.
+**Proven** 2026-08-09, round 001 of `plan-workflow-05-cli`: two 240 s `dispatch` timeouts burned before the stub; after it, the full dispatch happy path ran in seconds. Verified against the quoted AccessDenied messages from the instance role.
+
