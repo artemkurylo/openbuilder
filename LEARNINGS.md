@@ -222,3 +222,15 @@ Treat "skipped" as a failure to deploy, because that is what it is.
 **Proven** 2026-08-09: `/openbuilder/state/last_stop` was still `ParameterNotFound` after a stop that
 should have written it; the installed `ob-idle-stop` had none of the new code until selfupdate was
 retried, after which the record appeared.
+
+### 19. A linter that is absent is not "lint passed"
+**Symptom** `command -v shellcheck` printed nothing on a fresh build box, and `make lint` answered `shellcheck not installed — skipping lint.` and exited **0** — so a story whose acceptance names a shellcheck run could not execute it, and the graceful skip read exactly like a pass.
+**Cause** the target degrades deliberately when the tool is missing, and `apt-get install` needs root a build box may not grant, so the missing tool is not one command away.
+**Rule** When acceptance names a linter, fetch it yourself — static release binaries run from `~/.local/bin` without root — and run the acceptance command verbatim. Never let a graceful-skip branch stand for the check, and never report a skip as a pass.
+**Proven** 2026-08-09, round 001 of `plan-workflow-00-host`: shellcheck 0.10.0 static aarch64 extracted into `~/.local/bin` and ran `shellcheck -x -S warning` on both edited scripts. Proposed by the round that earned it.
+
+### 20. `obrun` reads its script from stdin; pass it as an argument and SSM cheerfully runs nothing
+**Symptom** `obrun sed -i ... ; grep ...` returned `Success` with an empty stdout and an empty stderr, and the file it was supposed to edit was untouched. Re-running "to be sure" produced the same confident `Success`.
+**Cause** `local/bin/obrun` builds its payload with `payload="$(base64 | tr -d \n)"` — from **stdin**, not from `$1`. An argument is ignored, `base64` reads EOF, and SSM faithfully executes an empty script, which succeeds. The wrapper then prints `[Status,StandardOutputContent,StandardErrorContent]`, i.e. `Success` and two empty fields.
+**Rule** Pipe the script in: `printf %s\n cmd | obrun`, or use `obrun -f file`. And when a remote command reports success, assert the **effect** — grep the file, re-read the value — never the status. A tool that cannot fail is a tool that is not running.
+**Proven** 2026-08-09, trimming `OPENBUILDER_REPOS` in `/opt/openbuilder/etc/openbuilder.env`: two argument-style invocations reported `Success` and changed nothing; the stdin form printed the real BEFORE/AFTER and the poller then listed one repo instead of three.
