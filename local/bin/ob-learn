@@ -153,6 +153,13 @@ validate_candidate() {
       i=$((i + 1))
       continue
     fi
+    # A label that already appeared means the candidate repeats it; reject
+    # rather than silently skipping the duplicate.
+    for ((j = 0; j < i; j++)); do
+      if [[ "$stripped" == "${labels[$j]}"* ]]; then
+        die "candidate repeats the ${labels[$j]} label"
+      fi
+    done
     # A later label showing up before the expected one means the expected one
     # is missing (the labels are out of order); report the missing line.
     for ((j = i + 1; j < ${#labels[@]}; j++)); do
