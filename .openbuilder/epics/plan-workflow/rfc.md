@@ -174,7 +174,7 @@ ob-gate init    <epic> --repo <owner/repo>     create state.json at stage intake
 ob-gate stage   <epic> <stage>                 advance the stage pointer (no approval)
 ob-gate record  <epic> prd|rfc                 record approval of that stage's artifact
 ob-gate record  <epic> backlog <slug>          record approval of a backlog directory
-ob-gate verify  <epic> [prd|rfc|backlog|--all] exit 0 if intact, 3 if void, 4 if absent
+ob-gate verify  <epic> [prd|rfc|backlog [<slug>]|--all]   0 intact, 3 void, 4 absent
 ob-gate show    <epic>                         the state, human-readable
 ```
 
@@ -194,8 +194,12 @@ function, and `shellcheck -x -S warning` clean under `make lint` (`AGENTS.md`, h
 `cmd_dispatch <owner/repo> <slug>` gains a precondition and loses its scaffold assumptions:
 
 1. resolve `<epic>` from `.openbuilder/backlog/<slug>/plan.md`;
-2. `ob-gate verify <epic> backlog` — refuse on anything but 0;
-3. `ob-gate stage <epic> dispatched`, committed on the design branch;
+2. `ob-gate verify <epic> backlog <slug>` — slug-scoped, so exit 4 means "not recorded for this
+   slug" rather than "no backlog ever approved". Refuse on anything but 0;
+3. `ob-gate stage <epic> dispatched`, committed on the design branch. `dispatch` no longer commits
+   the backlog itself: `ob-gate record <epic> backlog <slug>` already committed the cards when you
+   approved them, and a second writer of the same files is how the recorded blob shas and the
+   committed bytes drift apart;
 4. create `openbuilder/plan/<slug>` **from the design branch tip**, push it;
 5. `ob_ensure_labels`, then print what happens next, as today.
 
@@ -282,7 +286,7 @@ of them to gain a tidy sequence trades a real risk of silent divergence for cosm
 where it belongs and reads unambiguously in a log line:
 
 ```
-DECISION repo=owner/x slug=y rule=4b action=skip reason=backlog-unapproved
+DECISION repo=owner/x slug=y rule=4b action=skip reason=backlog-unapproved:no-approval
 ```
 
 ### 4.2 The check
@@ -342,7 +346,7 @@ that appears in cross-references is not worth churning for tidiness.
 | waker | `API = "https://api.github.com"` (`waker/github.py:27`) | already pinned |
 | instance env | `OPENBUILDER_GH_HOST=github.com`, a literal in `infra/templates/cloud-init.yaml.tftpl:50`, defaulted again at `ob-common.sh:91` | pinned by configuration, not refused by code |
 | instance `gh` | `ob_gh` sets `GH_HOST="${OPENBUILDER_GH_HOST}"` on every call (`ob-common.sh:267`) | correct, but only as good as the env file |
-| laptop CLI | 23 `gh` invocations, **none** pinning a host | inherits ambient resolution |
+| laptop CLI | 12 `gh` invocations (lines 430, 435, 442, 468, 472, 493, 750, 808, 827, 847, 848, 849), **none** pinning a host | inherits ambient resolution |
 | laptop validation | `ob_validate_repo` checks only `^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$` | any owner passes |
 
 On this laptop `gh auth status` reports **two** authenticated hosts, an enterprise one and
@@ -359,7 +363,7 @@ A non-matching owner dies immediately, naming the owner and the allowlist, befor
 404 — or worse, a 200.
 
 **2. Pin the host at one choke point.** A laptop-side `ob_gh()` wrapper, mirroring the instance's
-`ob-common.sh:261`, that runs `GH_HOST=github.com gh "$@"` and nothing else. All 23 call sites move
+`ob-common.sh:261`, that runs `GH_HOST=github.com gh "$@"` and nothing else. All 12 call sites move
 to it. A wrapper rather than 23 edits because the property must hold for the *next* call site too:
 a boundary maintained by remembering is a boundary that lapses.
 
@@ -402,7 +406,14 @@ and a block map (`ob-common.sh:627`). Two new blocks, `PRD` and `RFC`, populated
 git -C "$SRC_DIR" show "origin/<plan>:.openbuilder/epics/<epic>/prd.md" > "$ROUND_DIR/prd.md"
 ```
 
-A missing file is not fatal — it renders as `_(no PRD for this slug)_`. Slugs planned before this
+The three helpers this needs — `ob_epic_name`, `ob_epic_doc`, `ob_epic_docs_commit` — live in
+`ob-common.sh`, not inline in `ob-implement`, because `AGENTS.md` makes that file the single home for
+shared behaviour and both round scripts need the first two. §8's file table reflects that.
+
+A missing file is not fatal — it renders the fallback string. The fallback must be written **into**
+the block file rather than left empty: `ob_render_prompt` renders an empty block as
+`_(nothing recorded)_` (`ob-common.sh:664`), which would read as "the round had no PRD to consider"
+instead of "this slug has none". Slugs planned before this
 epic have no epic directory and must keep working; making the design docs mandatory would break
 `learn-command` and `scrub-hook` and every hand-written backlog.
 
@@ -442,6 +453,12 @@ its stage pointer is stale the moment the branch is deleted, and a stale file on
 than a missing one because it is trusted (`AGENTS.md`, "leave the docs true"). The reasoning lands;
 the scaffolding dies with the branches.
 
+The copy runs between `read_backlog` and `render`, so the agent sees the documents in its own
+worktree, and `BASE_SHA` is re-read afterwards. That second read is not tidiness: `assert_progress`
+(`ob-implement:196-200`) hard-fails a round that adds no commit, and a `docs(epic)` commit made
+before the agent ran would satisfy that check on its own — masking a round in which the agent
+produced nothing at all. Re-baselining means only the agent's own commits count.
+
 The copy is idempotent: if the files already match the work branch's content, no commit is made.
 This matters mechanically, not just aesthetically — `ob-implement:196` hard-fails a round that
 produces no commits, and the second slug of an epic would otherwise attempt an empty commit and
@@ -463,8 +480,8 @@ fail for a reason unrelated to the code (PRD §10).
 
 | Path | Change |
 |---|---|
-| `local/bin/openbuilder` | **slug 00:** `ob_gh()` wrapper pinning `GH_HOST=github.com` across all 23 call sites; `ob_validate_repo` gains an owner allowlist; `origin` asserted to be `github.com`. **slug 05:** `cmd_plan` → stage-aware launcher on the design branch; `cmd_dispatch` gains the gate check and cuts the plan branch from the design branch; `cmd_review --watch`; new `cmd_land`; `ob_install_local_assets` also mirrors `agent/local/commands/` into `<clone>/.omp/commands/`; `cmd_status` gains an `unapproved` column |
-| `runner/bin/ob-common.sh` | `ob_load_env` refuses any `OPENBUILDER_GH_HOST` but `github.com` (§4b) |
+| `local/bin/openbuilder` | **slug 00:** `ob_gh()` wrapper pinning `GH_HOST=github.com` across all 12 call sites; `ob_validate_repo` gains an owner allowlist; `origin` asserted to be `github.com`. **slug 05:** `cmd_plan` → stage-aware launcher on the design branch; `cmd_dispatch` gains the gate check and cuts the plan branch from the design branch; `cmd_review --watch`; new `cmd_land`; `ob_install_local_assets` also mirrors `agent/local/commands/` into `<clone>/.omp/commands/`; `cmd_status` gains an `unapproved` column |
+| `runner/bin/ob-common.sh` | `ob_load_env` refuses any `OPENBUILDER_GH_HOST` but `github.com` (§4b); `ob_epic_name`, `ob_epic_doc`, `ob_epic_docs_commit` (§5, §7) |
 | `runner/bin/ob-poll` | rule 4b |
 | `waker/github.py`, `waker/handler.py` | rule 4b, same semantics |
 | `runner/bin/ob-implement` | resolve `- epic:`; read PRD and RFC off the plan branch; two new blocks; copy the epic docs onto the work branch idempotently |
@@ -487,7 +504,7 @@ reason for the order.
 |---|---|---|---|---|
 | 0 | `plan-workflow-00-host` | S | — | the personal-host boundary (§4b). A live hole, independently verifiable, and it must precede the slug that rewrites the same file |
 | 1 | `plan-workflow-01-gate` | M | — | `ob-gate` plus the layout. Self-contained, verifiable by running it, and every later slug needs it |
-| 2 | `plan-workflow-02-rule` | M | 01 | rule 4b in bash and Python plus the live parity exercise. One reviewer concern, twice |
+| 2 | `plan-workflow-02-rule` | M | 01 | rule 4b in bash and Python plus the live parity exercise. One reviewer concern, twice. **Operator prerequisite:** the sandbox repo `artemkurylo/openbuilder-fixture` must be in the App installation — created 2026-08-09, installation add returns 403 for a `gh` token and needs one click in the UI |
 | 3 | `plan-workflow-03-context` | M | 01 | PRD/RFC into both prompts and the epic-docs copy. Touches `runner/` and the prompts only |
 | 4 | `plan-workflow-04-agents` | M | 01 | the command, the skill, the `architect` agent, the planner and reviewer edits, `docs/workflow.md`. No shell |
 | 5 | `plan-workflow-05-cli` | L | 00, 01, 02 | `local/bin/openbuilder`: launcher, dispatch gate, `--watch`, `land`. The riskiest file, alone, last |
