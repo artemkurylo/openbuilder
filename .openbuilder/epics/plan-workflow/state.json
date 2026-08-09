@@ -17,10 +17,65 @@
       "blob": "ba6725f35e7d275b41752e51c137207373aca71f"
     },
     "rfc": {
-      "at": "2026-08-09T18:11:22Z",
-      "blob": "f6af7260918e938ede38864cdd28a4679709fb9d"
+      "at": "2026-08-09T18:40:31Z",
+      "blob": "e69f7c143dbf95dad51731228b69f0c0d98d2567"
     },
-    "backlog": {}
+    "backlog": {
+      "plan-workflow-00-host": {
+        "at": "2026-08-09T18:40:31Z",
+        "files": {
+          "plan.md": "22a00d9db0a88e996993dc50dced781df1ec8828",
+          "story-01-owner-allowlist.md": "d75c1e17dd5a0f67d8f66a3b81520b9877d6270c",
+          "story-02-pin-gh-host.md": "785c29b2b24426c066804fba307f887a2221f7e8"
+        }
+      },
+      "plan-workflow-01-gate": {
+        "at": "2026-08-09T18:40:31Z",
+        "files": {
+          "plan.md": "d3880167d920018410aaa3c1d89ec618d8234800",
+          "story-01-gate-state-file.md": "073edcab2d779a77478bdc98bb9d4532a067fe88",
+          "story-02-gate-record-verify.md": "11ee6313549966180f90d908c7af5c0063644f4a",
+          "story-03-schema-epic-line.md": "aa9eef41d2bb2262fb0cc56d7f6f4dca2b219b83"
+        }
+      },
+      "plan-workflow-02-rule": {
+        "at": "2026-08-09T18:40:31Z",
+        "files": {
+          "plan.md": "30800fd2b44c41196e9d4b87442dd178bcb5284a",
+          "story-01-ob-poll-rule-4b.md": "77967e45e9cb469e298af8945f68eec3530e2c04",
+          "story-02-waker-rule-4b.md": "fc5240a151390feff56fc7bd88682f2339ff512f",
+          "story-03-architecture-rule-4b.md": "83f539f8fcb9054bbf9d672d97e8e94ed2d3dd55"
+        }
+      },
+      "plan-workflow-03-context": {
+        "at": "2026-08-09T18:40:31Z",
+        "files": {
+          "plan.md": "add77b131835fc3faa7fd4ab39c7637b8ff2fca4",
+          "story-01-epic-doc-blocks.md": "47201aaadf70eff3664df04672e1642d7483a82e",
+          "story-02-respond-epic-blocks.md": "3e891591bc07dde7bca21fe80fd47c64db971309",
+          "story-03-epic-docs-commit.md": "07516cdeace40cf5388a837acf3dada90adcea32"
+        }
+      },
+      "plan-workflow-04-agents": {
+        "at": "2026-08-09T18:40:31Z",
+        "files": {
+          "plan.md": "7c1e70841375bbd52e3b8080e19cb8dd36034945",
+          "story-01-workflow-skill.md": "a8dfa7fa56ab1b271c1c42ce9061de833c7a4e23",
+          "story-02-architect-agent.md": "fdfc39bd0ec579fde9714f0ad43ed9fa92eebe50",
+          "story-03-workflow-doc.md": "31a25f1570163dc431a2f9b92c9349810d7a020f"
+        }
+      },
+      "plan-workflow-05-cli": {
+        "at": "2026-08-09T18:40:31Z",
+        "files": {
+          "plan.md": "64e6c263b447ae5510e995744d2292f82f91b5d4",
+          "story-01-plan-launcher.md": "b019c2a07028577ed5a3eca29fcb54c00ae131f1",
+          "story-02-dispatch-gate.md": "4400ce153a83b9f1f5e06396a569c5708289cfd1",
+          "story-03-review-watch.md": "61a5d35c7d84adbdf33cb7931556eb6647de3ad1",
+          "story-04-land-teardown.md": "a96ed52ddff69f0dea1f66b40d64caf710e6ef15"
+        }
+      }
+    }
   },
   "notes": "Recorded by hand: local/bin/ob-gate, which will own this file, is what this epic builds. Provisional layout ratified by rfc.md."
 }
