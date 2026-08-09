@@ -79,6 +79,17 @@ ensure_user_and_tree() {
     install -d -o "$OB_USER" -g "$OB_USER" -m 0755 "${OB_HOME}/${dir}"
   done
   install -d -o "$OB_USER" -g "$OB_USER" -m 0700 "${OB_HOME}/cache"
+  # run/ holds the flock files and is written by BOTH identities: the timers run
+  # as $OB_USER, ob-selfupdate is run as root. setgid + group-write means a lock
+  # created by root stays usable by the service user. Existing files are
+  # repaired here too — this function runs on every self-update, and a single
+  # root-owned lockfile is enough to defeat the idle-stop check.
+  install -d -o "$OB_USER" -g "$OB_USER" -m 2775 "${OB_HOME}/run"
+  if compgen -G "${OB_HOME}/run/*.lock" >/dev/null; then
+    chown "${OB_USER}:${OB_USER}" "${OB_HOME}"/run/*.lock
+    chmod 0664 "${OB_HOME}"/run/*.lock
+    log "normalised ownership of ${OB_HOME}/run/*.lock"
+  fi
   touch "${OB_HOME}/log/openbuilder.log"
   chown "${OB_USER}:${OB_USER}" "${OB_HOME}/log/openbuilder.log"
   chmod 0644 "${OB_HOME}/log/openbuilder.log"

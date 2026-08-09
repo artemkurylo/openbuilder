@@ -150,7 +150,16 @@ ob_require_slug() {
 #   fd 9 — the lock this process HOLDS for the rest of its lifetime (ob_lock).
 #          A process takes at most one such lock; the kernel releases it on exit.
 #   fd 8 — transient probe, opened and closed inside a subshell by ob_lock_held.
+#
+# run/ is shared by two identities: the timers run as $OB_SERVICE_USER, while
+# ob-selfupdate is legitimately run as root. Every lockfile therefore has to be
+# openable by both, and a lockfile that is NOT openable must never be mistaken
+# for a held one — that mistake kept the instance awake (and billing) for seven
+# hours on the first real deployment.
 # ---------------------------------------------------------------------------
+
+# The unprivileged identity that owns $OPENBUILDER_HOME and runs the timers.
+OB_SERVICE_USER="${OB_SERVICE_USER:-openbuilder}"
 
 ob_lock_path() {
   printf '%s/run/%s.lock' "${OPENBUILDER_HOME}" "$1"
@@ -163,6 +172,13 @@ ob_lock() {
   local name="$1" lockfile
   lockfile="$(ob_lock_path "$name")"
   exec 9>>"$lockfile"
+  # Group-writable, and owned by the service user whenever root created it, so
+  # the other identity can still take this lock afterwards. Both calls are
+  # no-ops for a file we do not own, hence the guards.
+  chmod 0664 "$lockfile" 2>/dev/null || true
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown "${OB_SERVICE_USER}:${OB_SERVICE_USER}" "$lockfile" 2>/dev/null || true
+  fi
   if ! flock -n 9; then
     exec 9>&-
     return 1
@@ -171,17 +187,30 @@ ob_lock() {
 }
 
 # ob_lock_held <name> — 0 when some OTHER process currently holds that lock.
+#
+# The probe opens the lockfile READ-ONLY and asks for a SHARED lock: an
+# exclusive holder still makes `flock -ns` fail, so detection is unchanged,
+# but it no longer needs write permission. Failing to open the file at all is
+# reported as a distinct, loud error and treated as NOT held: an ownership
+# mistake is a configuration bug to fix, never a reason to keep the instance
+# running forever.
 ob_lock_held() {
-  local name="$1" lockfile
+  local name="$1" lockfile rc=0
   lockfile="$(ob_lock_path "$name")"
   [[ -e "$lockfile" ]] || return 1
-  if (
-    exec 8>>"$lockfile"
-    flock -n 8
-  ); then
+  (
+    exec 8<"$lockfile" || exit 3
+    flock -ns 8 || exit 1
+    exit 0
+  ) || rc=$?
+  case "$rc" in
+  0) return 1 ;;
+  1) return 0 ;;
+  *)
+    ob_log ERROR "cannot open lockfile ${lockfile} as $(id -un); treating it as NOT held — fix its ownership (expected ${OB_SERVICE_USER}:${OB_SERVICE_USER}, mode 0664)"
     return 1
-  fi
-  return 0
+    ;;
+  esac
 }
 
 # ob_locks_held — names of every currently held lock, one per line.
