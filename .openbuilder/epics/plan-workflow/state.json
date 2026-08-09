@@ -77,13 +77,13 @@
         }
       },
       "plan-workflow-06-automerge": {
-        "at": "2026-08-09T21:58:28Z",
+        "at": "2026-08-09T22:04:59Z",
         "files": {
-          "plan.md": "63341e4d0c61087b9d536d790086a3de2ad15c53",
+          "plan.md": "ad211ce5ed5cfe58cdc8f884babdf38332b40a35",
           "story-01-gate-stage-advance-only.md": "f1dc0966e241ebcbd92a84030dad1746bcf905d7",
           "story-02-gate-record-automerge.md": "709576ffe692220c40545ba19ad0a9915f306816",
           "story-03-merge-check.md": "7be1dbd8e21b578e733c9db8741c976e4579bbe7",
-          "story-04-review-auto-merge.md": "2829e9f64678a7e259524ee9826646d432c7d630",
+          "story-04-review-auto-merge.md": "8b9cbb6b380827b6a817386ced906ea5af704d9a",
           "story-05-reviewer-rubric-r12.md": "80fdad7864bdd2ab2cba9d6f432509f7412ba224"
         }
       }
