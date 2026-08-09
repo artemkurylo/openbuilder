@@ -400,6 +400,19 @@ openbuilder request-changes you/your-repo 42   # -> instance runs ob-respond on 
 Each `request-changes` costs one attempt. After `OPENBUILDER_MAX_ATTEMPTS` (6) the instance labels the PR
 `openbuilder:blocked` and stops touching it.
 
+The unattended form carries the pull request to a verdict without a human driving each round:
+
+```sh
+openbuilder review --watch you/your-repo 42
+```
+
+It reviews each new head sha exactly once (the last reviewed sha lives under
+`~/.cache/openbuilder/review/`), applies its own verdict with `openbuilder approve` or
+`openbuilder request-changes`, and waits out `changes-requested` rounds the instance owns. It exits 0
+on approval, printing the `openbuilder land` command to run next; exit 4 means the PR is labelled
+`openbuilder:blocked` and a human is required; exit 5 means the round cap was hit without a verdict.
+The attended form above is still the path when you want to read the diff yourself.
+
 ### 13. Approve and merge
 
 ```sh

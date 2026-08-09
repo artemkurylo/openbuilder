@@ -500,6 +500,12 @@ itself a failure is unrelated. That is what the review gate is for.
 gh pr checks <pr> --repo you/your-repo
 gh pr diff <pr> --repo you/your-repo
 openbuilder review you/your-repo <pr>
+openbuilder review --watch you/your-repo <pr>   # unattended: reviews each new
+                                                # head sha once, applies its own
+                                                # verdict, stops after
+                                                # OPENBUILDER_MAX_ATTEMPTS (6)
+                                                # rounds; exit 4 = blocked,
+                                                # exit 5 = rounds exhausted
 ```
 
 Then hand it back with the failure quoted in a comment, which is what `ob-respond` will read:

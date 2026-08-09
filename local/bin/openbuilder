@@ -76,6 +76,14 @@ OB_LABELS=(
 OB_LOG_FOLLOW_INTERVAL=5
 OB_LOG_CHUNK_BYTES=16000
 
+# `review --watch` label-poll interval: the instance's poll timer ticks on the
+# same cadence, so both sides observe the loop once a minute. Not configurable.
+OB_WATCH_INTERVAL=60
+# One headless reviewer run is bounded like an instance round (the
+# OPENBUILDER_MAX_RUNTIME default in runner/bin/ob-common.sh); the watch loop
+# retries until its own round cap instead.
+OB_WATCH_MAX_TIME=45m
+
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
@@ -603,7 +611,7 @@ usage: openbuilder <command> [args]
 
   plan <owner/repo> <epic>          design branch + Opus 5 workflow session for an epic
   dispatch <owner/repo> <slug>      gate the backlog, cut and push the plan branch
-  review <owner/repo> <pr>          review a pull request with Opus 5
+  review [--watch] <owner/repo> <pr>  review a pull request with Opus 5; --watch runs every round
   approve <owner/repo> <pr>         label a pull request approved
   request-changes <owner/repo> <pr> ask the instance for another round
   status [owner/repo]               slugs, branches, pull requests, labels
@@ -877,7 +885,29 @@ EOF
 # ---------------------------------------------------------------------------
 
 cmd_review() {
-    local usage="usage: $OB_PROG review <owner/repo> <pr>"
+    local usage="usage: $OB_PROG review [--watch] <owner/repo> <pr>"
+    local watch=0
+    local -a positional=()
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+        --watch)
+            watch=1
+            shift
+            ;;
+        -h | --help)
+            printf '%s\n' "$usage"
+            return 0
+            ;;
+        -*)
+            ob_die "$usage"
+            ;;
+        *)
+            positional+=("$1")
+            shift
+            ;;
+        esac
+    done
+    set -- "${positional[@]}"
     [[ $# -eq 2 ]] || ob_die "$usage"
     local repo=$1 pr=$2
     ob_validate_repo "$repo"
@@ -886,6 +916,11 @@ cmd_review() {
 
     # The instance must be up: whatever verdict we post starts the next round.
     ob_ensure_running
+
+    if [[ $watch -eq 1 ]]; then
+        ob_review_watch "$repo" "$pr"
+        return $?
+    fi
 
     local dir head
     dir=$(ob_ensure_clone "$repo")
@@ -933,6 +968,140 @@ EOF
         --model "$OB_OPUS_MODEL" \
         --append-system-prompt "openbuilder reviewer session for $repo pull request #$pr. Read-only on the branch: comment and label, never merge, never push." \
         "$seed"
+}
+
+# ob_review_watch <repo> <pr> — carry a pull request to a verdict with nobody at
+# the keyboard (RFC §3.6). Poll the labels every OB_WATCH_INTERVAL s and act on
+# the first match; review each new head sha exactly once, remembering the last
+# reviewed sha in $OB_CACHE_DIR/review/; and hand out at most
+# OPENBUILDER_MAX_ATTEMPTS review rounds. The reviewer applies its own verdict
+# (cmd_approve / cmd_request_changes), because leaving the PR unlabelled stalls
+# the loop. Exit codes: 0 approved, 1 refusal, 4 blocked, 5 rounds exhausted.
+ob_review_watch() {
+    local repo=$1 pr=$2
+    ob_need git gh omp aws jq
+    ob_ensure_running
+
+    local dir
+    dir=$(ob_ensure_clone "$repo")
+    ob_install_local_assets "$dir"
+
+    local marker_dir marker rounds_max rounds
+    marker_dir="$OB_CACHE_DIR/review"
+    mkdir -p "$marker_dir"
+    marker="$marker_dir/$(ob_repo_key "$repo")__$pr"
+    # Sanitise the instance-side attempt cap the way ob-poll does: strip
+    # non-digits, then default to 6.
+    rounds_max=${OPENBUILDER_MAX_ATTEMPTS//[^0-9]/}
+    rounds_max=${rounds_max:-6}
+    rounds=0
+
+    ob_info "watching $repo#$pr every ${OB_WATCH_INTERVAL}s, at most $rounds_max review rounds (Ctrl-C to stop)"
+
+    local labels head_sha head ndjson rc seed
+    while :; do
+        labels=$(ob_pr_labels "$repo" "$pr")
+
+        # First match wins, so blocked beats approved.
+        if printf '%s\n' "$labels" | grep -qxF "$OB_LABEL_PREFIX:blocked"; then
+            ob_warn "#$pr is labelled $OB_LABEL_PREFIX:blocked; last comment follows"
+            ob_gh pr view "$pr" --repo "$repo" --json comments --jq '.comments | last | .body'
+            printf '%s\n' "$OB_PROG: $repo#$pr is blocked; a human is required" >&2
+            exit 4
+        fi
+        if printf '%s\n' "$labels" | grep -qxF "$OB_LABEL_PREFIX:approved"; then
+            printf 'approved. land it with: %s land %s %s\n' "$OB_PROG" "$repo" "$pr"
+            exit 0
+        fi
+        if printf '%s\n' "$labels" | grep -qxF "$OB_LABEL_PREFIX:changes-requested" ||
+            printf '%s\n' "$labels" | grep -qxF "$OB_LABEL_PREFIX:in-progress"; then
+            ob_info "#$pr is $OB_LABEL_PREFIX:in-progress/changes-requested; the instance owns it — waiting ${OB_WATCH_INTERVAL}s"
+            sleep "$OB_WATCH_INTERVAL"
+            continue
+        fi
+        if printf '%s\n' "$labels" | grep -qxF "$OB_LABEL_PREFIX:awaiting-review"; then
+            head_sha=$(ob_gh pr view "$pr" --repo "$repo" --json headRefOid --jq '.headRefOid') || head_sha=''
+            head=$(ob_gh pr view "$pr" --repo "$repo" --json headRefName --jq '.headRefName') || head=''
+            if [[ -z $head_sha || -z $head ]]; then
+                ob_warn "could not read the head sha of #$pr; retrying in ${OB_WATCH_INTERVAL}s"
+                sleep "$OB_WATCH_INTERVAL"
+                continue
+            fi
+            if [[ -f $marker && $(<"$marker") == "$head_sha" ]]; then
+                ob_info "#$pr head $head_sha already reviewed — waiting ${OB_WATCH_INTERVAL}s"
+                sleep "$OB_WATCH_INTERVAL"
+                continue
+            fi
+
+            # Review this round, then loop back to read the verdict label.
+            rounds=$((rounds + 1))
+            if [[ $rounds -gt $rounds_max ]]; then
+                printf '%s\n' "$OB_PROG: review rounds for $repo#$pr reached $rounds_max (OPENBUILDER_MAX_ATTEMPTS) without a verdict; a human is required" >&2
+                exit 5
+            fi
+
+            git -C "$dir" fetch --prune --quiet origin
+            if git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$head"; then
+                ob_info "checking out $head for local inspection"
+                git -C "$dir" checkout -B "$head" --track "origin/$head" --quiet
+                git -C "$dir" reset --hard --quiet "origin/$head"
+            else
+                ob_warn "origin/$head not found locally; reviewing from the GitHub API only"
+            fi
+
+            ob_info "reviewing #$pr at $head_sha headlessly (round $rounds of $rounds_max)"
+
+            seed=$(
+                cat <<EOF
+You are running as the openbuilder reviewer for $repo pull request #$pr
+(head branch \`$head\`).
+
+Start by reading \`pr://$pr\` — that gives you the description, the diff and
+every existing comment. Then delegate to the \`reviewer\` agent (task tool,
+agent: "reviewer") and follow the \`review-openbuilder-pr\` skill.
+
+The pull request was produced by a small model from the story cards in
+\`.openbuilder/backlog/\` on the plan branch, and its own notes are in
+\`.openbuilder/backlog/<slug>/worklog.md\` on \`$head\`. Check the diff against
+the acceptance criteria of every card, not against your own taste.
+
+Finish by running exactly one of these two commands yourself, and nothing else:
+  $OB_BIN_DIR/openbuilder approve $repo $pr
+  $OB_BIN_DIR/openbuilder request-changes $repo $pr
+
+Before request-changes, post line-anchored review comments a small model can act
+on without guessing. You are running unattended: there is no human to hand the
+verdict to, and leaving the pull request unlabelled stalls the loop.
+
+Never merge, never push to $head, never push to a default branch.
+EOF
+            )
+
+            ndjson="$marker_dir/$(ob_repo_key "$repo")__$pr.round-$(printf '%02d' "$rounds").ndjson"
+            rc=0
+            GH_REPO="$repo" omp --cwd "$dir" -p --no-pty --mode json --approval-mode yolo --auto-approve \
+                --no-session --max-time "$OB_WATCH_MAX_TIME" --model "$OB_OPUS_MODEL" \
+                --append-system-prompt "openbuilder reviewer session for $repo pull request #$pr. Read-only on the branch: comment and label, never merge, never push." \
+                "$seed" >"$ndjson" 2>&1 || rc=$?
+            ob_info "reviewer transcript: $ndjson"
+
+            # The marker is written only after a run exits 0: a failed run must
+            # be retried, not remembered as reviewed. The round counter has
+            # already advanced, so a repeatedly failing run is bounded by the
+            # cap instead of looping forever.
+            if [[ $rc -eq 0 ]]; then
+                printf '%s\n' "$head_sha" >"$marker"
+                ob_info "recorded reviewed head $head_sha for #$pr"
+            else
+                ob_warn "reviewer run for #$pr exited $rc; marker not written, retrying next pass"
+            fi
+            sleep "$OB_WATCH_INTERVAL"
+            continue
+        fi
+
+        ob_info "#$pr has no $OB_LABEL_PREFIX label yet — waiting ${OB_WATCH_INTERVAL}s"
+        sleep "$OB_WATCH_INTERVAL"
+    done
 }
 
 cmd_approve() {
