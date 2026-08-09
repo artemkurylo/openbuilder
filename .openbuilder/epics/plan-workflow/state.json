@@ -1,7 +1,7 @@
 {
   "epic": "plan-workflow",
   "repo": "artemkurylo/openbuilder",
-  "stage": "rfc",
+  "stage": "backlog",
   "opened": "2026-08-09",
   "slugs": [
     "plan-workflow-00-host",
@@ -17,8 +17,8 @@
       "blob": "e4914670b3ca5f7c15e45941de05d481903eee10"
     },
     "rfc": {
-      "at": "2026-08-09T18:40:31Z",
-      "blob": "e69f7c143dbf95dad51731228b69f0c0d98d2567"
+      "at": "2026-08-09T21:35:00Z",
+      "blob": "b6365a3c06a9cfa1cee08f374ec6019b2778f29b"
     },
     "backlog": {
       "plan-workflow-00-host": {
