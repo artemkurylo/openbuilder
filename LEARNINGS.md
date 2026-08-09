@@ -23,8 +23,10 @@ no instance restart.
 4. **Never delete an entry because it looks obvious.** It looks obvious because it is written down.
    Delete only when it has become false, and say so in the commit message.
 5. **The implementer proposes, the reviewer commits.** An implementation round may append a candidate
-   entry to the file named by `{{LEARNINGS_OUT}}` in its prompt; it arrives on the PR for review. Only
-   a human, or the reviewer acting for one, edits this file.
+   entry to the per-round proposal file its prompt names, and it arrives on the pull request for review.
+   Only a human, or the reviewer acting for one, edits this file. (This file is injected into that
+   prompt verbatim, so it deliberately contains no template placeholders of its own — they would reach
+   the model unexpanded.)
 
 Entry shape:
 
