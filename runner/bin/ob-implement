@@ -32,6 +32,7 @@ PR_NUMBER=""
 PR_EXISTED=0
 COST="0"
 STORY_COUNT=0
+LEARNINGS_OUT=""
 
 usage() {
   cat <<'EOF'
@@ -146,6 +147,10 @@ render() {
     worklog="${ROUND_DIR}/no-worklog.md"
     : >"$worklog"
   fi
+  # The agent may write exactly one path outside its worktree: this one.
+  LEARNINGS_OUT="${ROUND_DIR}/learnings-proposed.md"
+  : >"$LEARNINGS_OUT"
+  ob_learnings "${ROUND_DIR}/learnings.md"
   {
     printf 'REPO\t%s\n' "$REPO"
     printf 'SLUG\t%s\n' "$SLUG"
@@ -159,11 +164,13 @@ render() {
     printf 'MAX_RUNTIME\t%s\n' "$OPENBUILDER_MAX_RUNTIME"
     printf 'MODEL\t%s\n' "$OPENBUILDER_MODEL"
     printf 'STORY_COUNT\t%s\n' "$STORY_COUNT"
+    printf 'LEARNINGS_OUT\t%s\n' "$LEARNINGS_OUT"
   } >"$scalars"
   {
     printf 'PLAN\t%s\n' "${ROUND_DIR}/plan.md"
     printf 'STORIES\t%s\n' "${ROUND_DIR}/stories.md"
     printf 'WORKLOG\t%s\n' "$worklog"
+    printf 'LEARNINGS\t%s\n' "${ROUND_DIR}/learnings.md"
   } >"$blocks"
 
   ob_render_prompt "${OPENBUILDER_HOME}/prompts/implement.md" \
@@ -201,6 +208,13 @@ record_worklog() {
     printf '### Agent summary\n\n'
     cat "${ROUND_DIR}/final.md"
     printf '\n'
+    if ob_learnings_proposed "$LEARNINGS_OUT"; then
+      printf '### Learnings proposed this round\n\n'
+      printf 'Candidates only. They reach `LEARNINGS.md` in the control repo when the '
+      printf 'reviewer commits them there.\n\n'
+      cat "$LEARNINGS_OUT"
+      printf '\n'
+    fi
   } >"$detail"
   heading="Implementation round by \`ob-implement\` (attempt ${ATTEMPT} of ${OPENBUILDER_MAX_ATTEMPTS})."
   worklog="$(ob_worklog_append "$WT_DIR" "$SLUG" "$ATTEMPT" "$heading" "$detail")"

@@ -260,6 +260,15 @@ install_runner() {
     "${REPO_ROOT}/runner/prompts/"*.md "${OB_HOME}/prompts/"
   log "installed runner scripts and prompts"
 
+  # Fallback copy only. A round reads LEARNINGS.md from the control repo's remote
+  # so that publishing one takes effect immediately; this copy is what it falls
+  # back to when the network or the clone is unavailable.
+  if [[ -f "${REPO_ROOT}/LEARNINGS.md" ]]; then
+    install -o "$OB_USER" -g "$OB_USER" -m 0644 \
+      "${REPO_ROOT}/LEARNINGS.md" "${OB_HOME}/LEARNINGS.md"
+    log "installed the learnings fallback copy"
+  fi
+
   if [[ -d "${REPO_ROOT}/agent/remote" ]]; then
     cp -a "${REPO_ROOT}/agent/remote/." "${OB_HOME}/agent/"
     chown -R "${OB_USER}:${OB_USER}" "${OB_HOME}/agent"

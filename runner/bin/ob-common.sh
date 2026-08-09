@@ -522,6 +522,60 @@ ob_worklog_append() {
 }
 
 # ---------------------------------------------------------------------------
+# Learnings
+# ---------------------------------------------------------------------------
+
+# ob_learnings <out-file> — the curated LEARNINGS.md from the control repo.
+#
+# Read from the REMOTE first. Learnings are published by editing one file and
+# pushing it, and that must take effect on the very next round: routing them
+# through `ob-selfupdate` would tie a documentation change to a code deploy, and
+# an instance that is rebuilt (an EBS volume cannot follow its instance across
+# availability zones) must not lose them either. The local clone is the fallback,
+# then the copy bootstrap installed, then nothing — a missing learnings file
+# degrades a round, it never fails one.
+#
+# `fetch origin HEAD` deliberately writes FETCH_HEAD without moving any branch
+# and without making the clone shallow, which would break ob-selfupdate's
+# `merge --ff-only`. It cannot race that merge either: ob-selfupdate skips
+# entirely while any job lock is held.
+ob_learnings() {
+  local out="$1" repo_dir="${OPENBUILDER_HOME}/repo"
+  local installed="${OPENBUILDER_HOME}/LEARNINGS.md"
+  local -a git_ro=(git -C "$repo_dir" -c safe.directory='*')
+
+  : >"$out"
+  if [[ -d "${repo_dir}/.git" ]]; then
+    if "${git_ro[@]}" fetch --quiet origin HEAD 2>/dev/null &&
+      "${git_ro[@]}" show FETCH_HEAD:LEARNINGS.md >"$out" 2>/dev/null &&
+      [[ -s "$out" ]]; then
+      ob_log INFO "learnings: $(wc -l <"$out" | tr -d ' ') lines from ${OPENBUILDER_CONTROL_REPO} (remote)"
+      return 0
+    fi
+    if "${git_ro[@]}" show HEAD:LEARNINGS.md >"$out" 2>/dev/null && [[ -s "$out" ]]; then
+      ob_log WARN "learnings: remote unreachable; using the local clone at $("${git_ro[@]}" rev-parse --short HEAD)"
+      return 0
+    fi
+  fi
+  if [[ -s "$installed" ]]; then
+    cp -- "$installed" "$out"
+    ob_log WARN "learnings: using the installed copy at ${installed}"
+    return 0
+  fi
+  : >"$out"
+  ob_log WARN "learnings: none found; this round runs without them"
+}
+
+# ob_learnings_proposed <file> — 0 when the round left a non-trivial candidate
+# entry behind. Blank lines and comment lines do not count, so an agent that
+# touches the file without saying anything does not produce an empty section.
+ob_learnings_proposed() {
+  local file="$1"
+  [[ -s "$file" ]] || return 1
+  grep -qE '^[[:space:]]*[^[:space:]#]' -- "$file"
+}
+
+# ---------------------------------------------------------------------------
 # Prompt rendering
 # ---------------------------------------------------------------------------
 

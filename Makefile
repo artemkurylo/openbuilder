@@ -17,7 +17,7 @@ CACHE_DIR := $${XDG_CACHE_HOME:-$$HOME/.cache}/openbuilder
 
 .DEFAULT_GOAL := help
 
-.PHONY: help init plan-tf apply destroy secrets doctor shell logs status fmt lint repo-create
+.PHONY: help init plan-tf apply destroy secrets doctor shell logs status fmt lint scrub repo-create
 
 help: ## Show this help
 	@printf 'openbuilder — control plane for autonomous agentic coding\n\n'
@@ -84,7 +84,7 @@ lint: ## shellcheck every shell script (skipped when shellcheck is absent)
 		exit 0; \
 	fi; \
 	files=''; \
-	for f in runner/bootstrap.sh $(CLI) runner/bin/*; do \
+	for f in runner/bootstrap.sh local/bin/* runner/bin/*; do \
 		if [ -f "$$f" ]; then files="$$files $$f"; fi; \
 	done; \
 	if [ -z "$$files" ]; then \
@@ -93,6 +93,10 @@ lint: ## shellcheck every shell script (skipped when shellcheck is absent)
 	fi; \
 	echo "shellcheck -x -S warning$$files"; \
 	shellcheck -x -S warning $$files
+
+scrub: ## Check tracked files against the local deny list (see local/bin/ob-scrub-check)
+	@local/bin/ob-scrub-check
+	@local/bin/ob-scrub-check --history
 
 repo-create: ## Create the GitHub control repo and push (no-op if it exists)
 	@if gh repo view '$(CONTROL_REPO)' >/dev/null 2>&1; then \

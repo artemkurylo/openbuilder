@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# ob-scrub-check — refuse to publish identifiers that must not leave the laptop.
+#
+# Everything in this repository is public, and the plan text, story cards and
+# review comments that flow through it are processed by a third-party model. So
+# employer and client names, internal hostnames, account numbers, work email
+# addresses and local directory layouts must never be committed here.
+#
+# The patterns themselves are the sensitive part, so they are NOT in this repo:
+# they live in a gitignored deny list, one extended regex per line, blank lines
+# and `#` comments ignored. Point $OPENBUILDER_SCRUB_DENY somewhere else to share
+# one list across several repositories.
+#
+#   ob-scrub-check              # tracked files in the working tree
+#   ob-scrub-check --staged     # what you are about to commit
+#   ob-scrub-check --history    # every commit ever made (slow, thorough)
+#
+# Matches are reported as a path and a count, never as the matching text: a
+# check that echoes the string it is protecting has leaked it into your terminal,
+# your scrollback and, eventually, some log.
+set -euo pipefail
+IFS=$'\n\t'
+
+OB_PROG="ob-scrub-check"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+DENY="${OPENBUILDER_SCRUB_DENY:-${REPO_ROOT}/.scrub-deny}"
+MODE="worktree"
+
+case "${1:-}" in
+--staged) MODE="staged" ;;
+--history) MODE="history" ;;
+--worktree | "") ;;
+-h | --help)
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+  ;;
+*)
+  printf '%s: unknown argument: %s\n' "$OB_PROG" "$1" >&2
+  exit 2
+  ;;
+esac
+
+if [[ ! -r "$DENY" ]]; then
+  printf '%s: no deny list at %s; nothing to check.\n' "$OB_PROG" "$DENY"
+  printf '%s: create it (it is gitignored) with one extended regex per line —\n' "$OB_PROG"
+  printf '%s: employer and client names, internal hostnames, account ids, work\n' "$OB_PROG"
+  printf '%s: email domains, and the parent directories of your checkout.\n' "$OB_PROG"
+  exit 0
+fi
+
+# Strip comments and blanks into a temporary pattern file. `git grep -f` treats
+# every line as a pattern, including the empty one, which would match all files.
+PATTERNS="$(mktemp)"
+trap 'rm -f "$PATTERNS"' EXIT
+grep -vE '^[[:space:]]*(#|$)' -- "$DENY" >"$PATTERNS" || true
+if [[ ! -s "$PATTERNS" ]]; then
+  printf '%s: deny list %s has no usable patterns.\n' "$OB_PROG" "$DENY"
+  exit 0
+fi
+
+hits=0
+
+report() {
+  local scope="$1" path="$2" count="$3"
+  printf '%s: %s: %s — %s match(es)\n' "$OB_PROG" "$scope" "$path" "$count"
+  hits=$((hits + 1))
+}
+
+scan_revision() {
+  local rev="$1" scope="$2" line path count
+  # -c gives `path:count` per matching file and prints no matching text at all.
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    path="${line%:*}"
+    count="${line##*:}"
+    report "$scope" "$path" "$count"
+  done < <(git grep -I -i -E -c -f "$PATTERNS" "$rev" -- 2>/dev/null |
+    sed "s|^${rev}:||" || true)
+}
+
+case "$MODE" in
+worktree)
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    report "worktree" "${line%:*}" "${line##*:}"
+  done < <(git grep -I -i -E -c -f "$PATTERNS" -- 2>/dev/null || true)
+  ;;
+staged)
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    report "staged" "${line%:*}" "${line##*:}"
+  done < <(git grep -I -i -E -c --cached -f "$PATTERNS" -- 2>/dev/null || true)
+  ;;
+history)
+  while IFS= read -r rev; do
+    scan_revision "$rev" "${rev:0:8}"
+  done < <(git rev-list --all)
+  ;;
+esac
+
+if ((hits > 0)); then
+  printf '\n%s: %s location(s) matched the deny list. Nothing was printed from\n' "$OB_PROG" "$hits"
+  printf '%s: those files on purpose — open them yourself. A match already in\n' "$OB_PROG"
+  printf '%s: published history needs history rewritten, not just a new commit.\n' "$OB_PROG"
+  exit 1
+fi
+
+printf '%s: clean (%s).\n' "$OB_PROG" "$MODE"

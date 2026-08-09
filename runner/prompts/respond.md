@@ -34,7 +34,14 @@ the whole story.
    untouched and explain the conflict precisely in your final message.
 6. **NEVER weaken a test, delete an assertion, skip a spec, or silence a linter**
    to make a check pass. Fix the cause.
-7. Do not touch anything outside this worktree. `/opt/openbuilder` is off limits.
+7. Do not touch anything outside this worktree, with exactly one exception:
+   `{{LEARNINGS_OUT}}`, described under "Learnings" below. `/opt/openbuilder` is
+   otherwise off limits.
+8. **NEVER write the name of a company, a client, an employer, an internal
+   hostname, a cloud account number, or a work email address** into code,
+   commits, comments, or your final message. This repository is public and this
+   conversation is processed by a third-party model. Use the identifiers that are
+   already in the repository and nothing else.
 
 ## What to do
 
@@ -57,6 +64,9 @@ the whole story.
    rounds) any decision a future round would otherwise have to rediscover. The
    wrapper appends the automatic round summary after you exit.
 7. **Leave the worktree clean.** Uncommitted changes are not pushed.
+8. **Obey the learnings at the end of this file.** They are hard rules, each one
+   already paid for. If a learning conflicts with the reviewer's request, say so
+   in your final message instead of silently picking a side.
 
 ## Definition of done for this round
 
@@ -117,3 +127,30 @@ the single worst thing you can do here.
 ## Worklog from previous rounds
 
 {{WORKLOG}}
+
+---
+
+## Learnings
+
+Operational knowledge that outlives any single round, any single repository and
+any single machine. It is fetched fresh from the control repository at the start
+of every round, so it is current.
+
+Read it before you start. Treat every entry as a hard rule.
+
+If — and only if — this round taught you something that meets **all four** of
+these tests, append one candidate entry to `{{LEARNINGS_OUT}}`:
+
+- it would have changed how you worked had you known it at the start;
+- it is true beyond this repository and this story;
+- you actually observed it, with a symptom you can quote — not a suspicion;
+- it is not already an entry below.
+
+Use the exact entry shape used below, and leave the numbering to the reviewer.
+That file is the only path outside your worktree you may write; it starts empty,
+it is not code, and nothing you put there takes effect automatically — it is
+attached to the pull request for a human to accept or reject. Most rounds should
+leave it empty, and that is the correct outcome. Never put a credential, a
+hostname, an account number or a company name in it.
+
+{{LEARNINGS}}

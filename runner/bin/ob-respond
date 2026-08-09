@@ -26,6 +26,7 @@ PLAN_BRANCH=""
 WORK_BRANCH=""
 DEFAULT_BRANCH=""
 BASE_SHA=""
+LEARNINGS_OUT=""
 ATTEMPT="0"
 NEW_COMMITS="0"
 COST="0"
@@ -188,6 +189,10 @@ render() {
     worklog="${ROUND_DIR}/no-worklog.md"
     : >"$worklog"
   fi
+  # The agent may write exactly one path outside its worktree: this one.
+  LEARNINGS_OUT="${ROUND_DIR}/learnings-proposed.md"
+  : >"$LEARNINGS_OUT"
+  ob_learnings "${ROUND_DIR}/learnings.md"
   {
     printf 'REPO\t%s\n' "$REPO"
     printf 'SLUG\t%s\n' "$SLUG"
@@ -201,6 +206,7 @@ render() {
     printf 'MAX_ATTEMPTS\t%s\n' "$OPENBUILDER_MAX_ATTEMPTS"
     printf 'MAX_RUNTIME\t%s\n' "$OPENBUILDER_MAX_RUNTIME"
     printf 'MODEL\t%s\n' "$OPENBUILDER_MODEL"
+    printf 'LEARNINGS_OUT\t%s\n' "$LEARNINGS_OUT"
   } >"$scalars"
   {
     printf 'PLAN\t%s\n' "${ROUND_DIR}/plan.md"
@@ -208,6 +214,7 @@ render() {
     printf 'PR_BODY\t%s\n' "${ROUND_DIR}/pr-body.md"
     printf 'FEEDBACK\t%s\n' "${ROUND_DIR}/feedback.md"
     printf 'WORKLOG\t%s\n' "$worklog"
+    printf 'LEARNINGS\t%s\n' "${ROUND_DIR}/learnings.md"
   } >"$blocks"
 
   ob_render_prompt "${OPENBUILDER_HOME}/prompts/respond.md" \
@@ -247,6 +254,13 @@ record_worklog() {
     printf '### Agent summary\n\n'
     cat "${ROUND_DIR}/final.md"
     printf '\n'
+    if ob_learnings_proposed "$LEARNINGS_OUT"; then
+      printf '### Learnings proposed this round\n\n'
+      printf 'Candidates only. They reach `LEARNINGS.md` in the control repo when the '
+      printf 'reviewer commits them there.\n\n'
+      cat "$LEARNINGS_OUT"
+      printf '\n'
+    fi
   } >"$detail"
   heading="Review-response round by \`ob-respond\` (attempt ${ATTEMPT} of ${OPENBUILDER_MAX_ATTEMPTS})."
   worklog="$(ob_worklog_append "$WT_DIR" "$SLUG" "$ATTEMPT" "$heading" "$detail")"
