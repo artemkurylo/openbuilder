@@ -8,7 +8,7 @@ first unanswered question instead of re-interrogating.
 - epic: `plan-workflow`
 - repo: `artemkurylo/openbuilder`
 - opened: 2026-08-09
-- stage: `intake`
+- stage: `prd` (intake closed 2026-08-09, all eight questions answered)
 
 ## Problem statement (as given, 2026-08-09)
 
@@ -75,7 +75,11 @@ has two readings and they cost very differently.
   or serialisation on your merge latency. A new state machine, not an increment — and it buys
   smaller diffs, which A already buys.
 
-**Answered** _pending_
+**Answered** A — PR = slug. The planner emits several slugs when an epic wants several pull
+requests; each carries 1–3 cards.
+**Consequence** the state machine, the label protocol, the waker parity contract and the attempt
+budget are all unchanged. `depends_on` stays intra-slug; cross-slug order is a human dispatching
+the next slug after the previous one merges.
 
 ### Q2 — Where do the PRD and the RFC live after the branches are deleted?
 
@@ -91,7 +95,11 @@ and the work branch is deliberately cut from the merge-base so they never enter 
   the way, and unreadable as documentation.
 - **C. Let them die.** The PR body already embeds the plan.
 
-**Answered** _pending_
+**Answered** A — the epic docs ride the work branch into `main`.
+**Consequence** `ob-implement` copies `.openbuilder/epics/<epic>/` onto the work branch, so the
+PRD and the RFC appear in the review diff and survive every branch deletion. The copy must be
+idempotent, or the second slug of an epic produces an empty commit and the round fails its
+"at least one commit" check for the wrong reason.
 
 ### Q3 — How do you approve a PRD or an RFC?
 
@@ -106,7 +114,9 @@ workflow refuses to advance. The question is only the surface.
   GitHub-native audit trail; the cost is an extra PR per epic that is never merged (or is merged
   into `main` — which incidentally answers Q2 as well).
 
-**Answered** _pending_
+**Answered** A — approval happens in the session.
+**Consequence** no design-phase pull request. The approval is still tamper-evident: the artifact's
+blob sha is recorded when you approve, and an artifact edited afterwards voids its own approval.
 
 ### Q4 — Should the dispatch gate be enforced by the state machine, or by convention?
 
@@ -123,7 +133,13 @@ you approve the backlog is a complete gate — enforced by the CLI, i.e. by conv
   implement the same table by contract (architecture §2 parity), this is the same change in bash
   and Python plus its parity test, and one extra API call per rule-5 candidate.
 
-**Answered** _pending_
+**Answered** B — enforced by the state machine, overriding my recommendation.
+**Consequence** the largest piece of work in this epic. Rule 5 gains a precondition that the plan
+branch's `state.json` carries a backlog approval matching the committed cards, and because
+`ob-poll` and `waker/github.py` implement the same table by contract (architecture §2, parity),
+the rule lands twice — bash and Python — with a test that proves the two agree. In exchange the
+gate holds even when the CLI is bypassed, and a plan branch pushed by hand with an unapproved
+backlog is skipped rather than burning an attempt into `blocked`.
 
 ### Q5 — Is "backlog written" a gate, or does the worker start immediately?
 
@@ -133,7 +149,9 @@ veto a bad slice — and the planner is already instructed to surface the decisi
 implementer's behalf "so the human can veto them now rather than at review time"
 (`planner.md:139-144`). I want one keystroke there. Say so if you'd rather it were automatic.
 
-**Answered** _pending_
+**Answered** yes, a gate.
+**Consequence** dispatch never happens as a side effect of the backlog being written. Combined
+with Q4, the approval is both a keystroke and a fact on the branch.
 
 ### Q6 — Which clone does the workflow run in?
 
@@ -146,7 +164,9 @@ the agents into `<clone>/.omp/agents` with `/.omp/` added to the clone's local e
 - **B. Your current checkout, whatever it is.** Convenient, but the workflow then has to cope with
   your uncommitted work, your branch, and installing `.omp/` assets into a tree you also use.
 
-**Answered** _pending_
+**Answered** A — the CLI-managed clone.
+**Consequence** your own checkouts are never touched, and the workflow may assume a clean tree on
+a branch it created.
 
 ### Q7 — When does the grill stop?
 
@@ -156,7 +176,11 @@ requirement, an RFC decision, or a story card's acceptance list. Anything the re
 answer, I answer myself instead of asking. You can say "enough" at any point and I record every
 still-open question as a stated assumption in the PRD rather than silently guessing.
 
-**Answered** _pending_
+**Answered** agreed as proposed.
+**Consequence** the stopping rule is written into the workflow skill, not left to judgement: ask
+only while an answer would change a PRD requirement, an RFC decision, or an acceptance list;
+answer from the repository whatever the repository can answer; on "enough", every still-open
+question becomes a stated assumption in the PRD rather than a silent guess.
 
 ### Q8 — Bootstrap: who builds this workflow?
 
@@ -171,4 +195,12 @@ risk: a broken `dispatch` cannot be fixed by dispatching.
 - **B. All remote.** Maximum dogfooding, and the failure mode is that the tool breaks the tool.
 - **C. All local.** Safest and least interesting; the remote instance sits idle.
 
-**Answered** _pending_
+**Answered** B, effectively — the local side does intake, PRD, RFC and the backlog split; the
+worker implements the backlog; the local reviewer reviews; you merge.
+**Consequence** the chicken-and-egg risk is accepted, and it is smaller than it looked: a broken
+`local/bin/openbuilder` on an unmerged work branch cannot break anything, because the instance
+runs its own clone of `main` and nothing merges without review. The mitigation is slicing —
+`local/bin/openbuilder` changes late and in its own slug, so a bad round there cannot block the
+rest of the epic. After any slug touching `runner/` merges, the instance needs `ob-selfupdate`
+before the new code runs, and `ob-selfupdate` is allowed to decline while a lock is held
+(learning 18), so the acceptance for those slugs must assert the effect, not the exit code.
