@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# ob-gate — the only writer of .openbuilder/epics/<epic>/state.json.
+#
+# state.json records which artifact content a human approved. An approval
+# authored by a model is worthless, because the whole value of the record is
+# that it is mechanical: exactly one deterministic script computes the git
+# blob shas and writes the file. This script does that — init, stage, record,
+# verify, show — with every write done by jq assignment onto the parsed
+# document (so unknown keys such as `notes` survive), atomically, and with
+# every state mutation committed and pushed.
+set -euo pipefail
+IFS=$'\n\t'
+
+OB_PROG="ob-gate"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+TMP_STATE=""
+STAGES=(intake prd rfc backlog dispatched landed)
+
+usage() {
+  cat <<EOF
+usage: ob-gate init   <epic> --repo <owner/repo>
+       ob-gate stage  <epic> <stage>
+       ob-gate record <epic> prd|rfc
+       ob-gate record <epic> backlog <slug>
+       ob-gate verify <epic> [prd|rfc|backlog [<slug>]|--all]
+       ob-gate show   <epic>
+       ob-gate --help
+
+subcommands:
+  init    write .openbuilder/epics/<epic>/state.json at stage intake
+  stage   move the stage pointer; <stage> is one of
+          intake, prd, rfc, backlog, dispatched, landed
+  record  record human approval of an artifact: compute its git blob sha,
+          write state.json, advance the stage, commit with an
+          Approves-<stage>: <sha> trailer, and push
+  verify  re-check recorded approvals against the bytes on disk;
+          the default target is --all
+  show    print the recorded state, human-readable
+
+exit codes:
+  0  success; for verify, every checked approval is intact
+  1  operational refusal (artifact not committed, push failed, no state file)
+  2  usage error (unknown subcommand, bad argument, missing value)
+  3  verify: an approval is void — the artifact changed since it was recorded
+  4  verify: an approval is absent — nothing was recorded for that target
+EOF
+}
+
+cleanup() {
+  if [[ -n "$TMP_STATE" ]]; then
+    rm -f "$TMP_STATE"
+  fi
+  return 0
+}
+trap cleanup EXIT
+
+die() {
+  local msg="$1" code="${2:-1}"
+  printf '%s: %s\n' "$OB_PROG" "$msg" >&2
+  exit "$code"
+}
+
+need_jq() {
+  command -v jq >/dev/null 2>&1 ||
+    die "jq is required and was not found on PATH" 1
+}
+
+require_epic() {
+  local name="$1"
+  [[ "$name" =~ ^[a-z0-9][a-z0-9-]{1,48}$ ]] ||
+    die "invalid epic name '$name' (expected ^[a-z0-9][a-z0-9-]{1,48}\$)" 2
+}
+
+require_repo_arg() {
+  local arg="$1"
+  [[ "$arg" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] ||
+    die "not a valid <owner>/<repo>: $arg" 2
+}
+
+epic_rel() {
+  local epic="$1"
+  printf '.openbuilder/epics/%s' "$epic"
+}
+
+state_rel() {
+  local epic="$1"
+  printf '%s/state.json' "$(epic_rel "$epic")"
+}
+
+state_path() {
+  local epic="$1"
+  printf '%s/%s' "$REPO_ROOT" "$(state_rel "$epic")"
+}
+
+read_state() {
+  local epic="$1" p
+  p="$(state_path "$epic")"
+  [[ -r "$p" ]] ||
+    die "no epic state at $(state_rel "$epic"); run: ob-gate init <epic> --repo <owner/repo>" 1
+  cat "$p"
+}
+
+write_state() {
+  local epic="$1" dir
+  dir="$(dirname "$(state_path "$epic")")"
+  TMP_STATE="$(mktemp "${dir}/.ob-gate.tmp.XXXXXX")"
+  cat >"$TMP_STATE"
+  mv "$TMP_STATE" "$(state_path "$epic")"
+  TMP_STATE=""
+}
+
+commit_state() {
+  local epic="$1" subject="$2" trailer="${3:-}" rel tracked
+  rel="$(state_rel "$epic")"
+  tracked="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "HEAD:${rel}" 2>/dev/null || true)"
+  if [[ -n "$tracked" ]] && git -C "$REPO_ROOT" diff --quiet HEAD -- "$rel"; then
+    printf '%s: state.json already up to date; nothing committed\n' "$OB_PROG"
+    return 0
+  fi
+  # A pathspec commit cannot see an untracked file; stage only this one
+  # path, leaving every other staged or unstaged change untouched.
+  git -C "$REPO_ROOT" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 ||
+    git -C "$REPO_ROOT" add -- "$rel"
+  if [[ -n "$trailer" ]]; then
+    git -C "$REPO_ROOT" commit --quiet -m "$subject" -m "$trailer" -- "$rel"
+  else
+    git -C "$REPO_ROOT" commit --quiet -m "$subject" -- "$rel"
+  fi
+  local branch short
+  branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
+  if ! git -C "$REPO_ROOT" push --quiet origin "HEAD:refs/heads/${branch}"; then
+    short="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+    die "push to origin failed; state.json is committed locally as ${short} — re-run: git push origin HEAD:refs/heads/${branch}" 1
+  fi
+  printf 'pushed %s to origin\n' "$branch"
+}
+
+cmd_init() {
+  local epic="${1:-}" repo="" arg
+  [[ -n "$epic" ]] || die "missing <epic>" 2
+  require_epic "$epic"
+  shift
+  while (($# > 0)); do
+    arg="$1"
+    if [[ "$arg" == "--repo" ]]; then
+      shift
+      (($# > 0)) && [[ -n "$1" ]] || die "missing value for --repo" 2
+      repo="$1"
+    else
+      die "unknown argument: '$arg' (accepted: --repo)" 2
+    fi
+    shift
+  done
+  [[ -n "$repo" ]] || die "missing required --repo <owner/repo>" 2
+  require_repo_arg "$repo"
+  local rel opened doc
+  rel="$(state_rel "$epic")"
+  [[ ! -e "$(state_path "$epic")" ]] ||
+    die "state.json already exists at ${rel}; use 'ob-gate stage' or 'ob-gate record'" 2
+  mkdir -p "$(dirname "$(state_path "$epic")")"
+  opened="$(date -u +%Y-%m-%d)"
+  doc="$(jq -n --arg epic "$epic" --arg repo "$repo" --arg opened "$opened" \
+    '{epic: $epic, repo: $repo, stage: "intake", opened: $opened, slugs: [], approvals: {prd: {}, rfc: {}, backlog: {}}}')"
+  printf '%s\n' "$doc" | write_state "$epic"
+  printf 'opened epic %s at stage intake (%s)\n' "$epic" "$rel"
+  commit_state "$epic" "openbuilder(gate): open epic $epic"
+}
+
+cmd_stage() {
+  local epic="${1:-}" stage="${2:-}" s ok=0
+  [[ -n "$epic" ]] || die "missing <epic>" 2
+  require_epic "$epic"
+  for s in "${STAGES[@]}"; do
+    [[ "$s" == "$stage" ]] && ok=1
+  done
+  ((ok == 1)) ||
+    die "unknown stage: '$stage' (accepted: intake, prd, rfc, backlog, dispatched, landed)" 2
+  read_state "$epic" | jq --arg s "$stage" '.stage = $s' | write_state "$epic"
+  printf '%s stage -> %s\n' "$epic" "$stage"
+  commit_state "$epic" "openbuilder(gate): stage $epic -> $stage"
+}
+
+cmd_show() {
+  local epic="${1:-}" doc
+  [[ -n "$epic" ]] || die "missing <epic>" 2
+  require_epic "$epic"
+  doc="$(read_state "$epic")"
+  printf '%-8s %s\n' "epic" "$(printf '%s' "$doc" | jq -r '.epic')"
+  printf '%-8s %s\n' "repo" "$(printf '%s' "$doc" | jq -r '.repo')"
+  printf '%-8s %s\n' "stage" "$(printf '%s' "$doc" | jq -r '.stage')"
+  printf '%-8s %s\n' "opened" "$(printf '%s' "$doc" | jq -r '.opened')"
+  printf '%-8s %s\n' "slugs" "$(printf '%s' "$doc" | jq -r 'if (.slugs | length) == 0 then "none" else (.slugs | join(", ")) end')"
+  printf '%-8s %s\n' "prd" "$(printf '%s' "$doc" | jq -r 'if (.approvals.prd.blob // "") == "" then "not approved" else "approved " + (.approvals.prd.at // "") + " " + .approvals.prd.blob end')"
+  printf '%-8s %s\n' "rfc" "$(printf '%s' "$doc" | jq -r 'if (.approvals.rfc.blob // "") == "" then "not approved" else "approved " + (.approvals.rfc.at // "") + " " + .approvals.rfc.blob end')"
+  if [[ "$(printf '%s' "$doc" | jq -r '.approvals.backlog | length')" == "0" ]]; then
+    printf '%-8s %s\n' "backlog" "none recorded"
+  else
+    local slug line
+    while IFS= read -r slug; do
+      [[ -n "$slug" ]] || continue
+      line="$(printf '%s' "$doc" | jq -r --arg slug "$slug" \
+        '(.approvals.backlog[$slug].at // "") as $at | (.approvals.backlog[$slug].files | length) as $n | "\($slug) approved \($at) \($n) file(s)"')"
+      printf '%-8s %s\n' "backlog" "$line"
+    done < <(printf '%s' "$doc" | jq -r '.approvals.backlog | keys_unsorted[]')
+  fi
+}
+
+main() {
+  local sub="${1:-}"
+  need_jq
+  if [[ -z "$sub" ]]; then
+    usage >&2
+    exit 2
+  fi
+  case "$sub" in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    init)
+      shift
+      cmd_init "$@"
+      ;;
+    stage)
+      shift
+      cmd_stage "$@"
+      ;;
+    record)
+      shift
+      die "subcommand not implemented yet: record" 2
+      ;;
+    verify)
+      shift
+      die "subcommand not implemented yet: verify" 2
+      ;;
+    show)
+      shift
+      cmd_show "$@"
+      ;;
+    *)
+      die "unknown subcommand: '$sub' (accepted: init, stage, record, verify, show)" 2
+      ;;
+  esac
+}
+
+main "$@"
