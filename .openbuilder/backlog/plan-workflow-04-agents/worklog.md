@@ -66,3 +66,34 @@ Three commits on `openbuilder/work/plan-workflow-04-agents`.
 - No learnings candidate proposed this round — nothing observed met all four
   tests (the pi-uu-grep quirk is instance-specific, not general, and was
   workaroundable with python3).
+## Round 1 — 2026-08-09T22:09:13Z
+
+Implementation round by `ob-implement` (attempt 1 of 6).
+
+- action: implement
+- model: `openrouter/deepseek/deepseek-v4-flash-0731`
+- new commits: 4
+- cost: 0.13602437519999996 USD
+- story cards: 3
+
+### Agent summary
+
+## Summary
+Prompt files only, as scoped: the `openbuilder-workflow` skill (seven stages, four gates, grill stopping rule, six refusals, PRD/RFC templates) and the thin `/openbuilder-plan` command file; the `architect` agent with reviewer-shaped output schema; planner re-briefed on `prd.md`/`rfc.md` plus the `- epic:` line, reviewer's reading order extended to six items with the RFC-departure bullet; `docs/workflow.md` as the documentation authority with the six refusals byte-identical to the skill. Four commits pushed to `openbuilder/work/plan-workflow-04-agents`; worktree clean; no shell touched; no learnings candidate (nothing met all four tests).
+
+## Stories
+- story-01-workflow-skill: done — all six acceptance criteria pass (frontmatter keys, counts 8/7/7/6/17, `OK OK` verbatim strings, stage order, command file 15 lines)
+- story-02-architect-agent: done — frontmatter check `OK [...seven keys]`, scheduler schema checks, planner 0/1/q0/1/0/7/1, reviewer `OK 6` + verbatim bullet + untouched enums, `^## `=5
+- story-03-workflow-doc: done — h2=6, four command rows, refusals parity `OK 6`, stopping rule verbatim, `exit 0/3/4` literals, marker count 1, only host `github.com`
+
+## Verification
+- All story-01/02/03 acceptance scripts re-run post-commit against the final tree — every check green (exact counts listed below each story above; run as `python3` where the instance's `pi-uu-grep 0.2.0` treats `|` as alternation and miscounts `^| `openbuilder` — python confirms exactly 4 rows; GNU grep on the reviewer's laptop sees 4)
+- `git status --porcelain` -> empty; `git push origin openbuilder/work/plan-workflow-04-agents` -> new branch pushed, remote head `b0c8ebf`
+- `make lint` not run by design: all three cards put shell out of scope and `make lint` covers shell only; nothing shell changed this round
+
+## Notes for the reviewer
+- The `^| `openbuilder` grep on this instance counts every line (161) because the installed pi-uu-grep implements `|` alternation; ground truth is the file content (4 rows), verified via python. Not an acceptance failure, no file change needed.
+- Planner wording: the card both mandates the literal `openbuilder/plan/<slug>` in the dispatch sentence and forbids it in the file; wrote "cuts the per-slug plan branch from the design branch tip" — `grep -c` for the literal is 0 as required.
+- `docs/workflow.md`'s status line plus `<!-- remove when plan-workflow-05-cli lands -->`, and the skill's matching "Stages 5 to 7…" sentence, must be made truthful by slug 05 when the commands land.
+
+
