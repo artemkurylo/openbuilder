@@ -180,6 +180,10 @@ Measured on this epic itself, which goes through the workflow it defines:
 - Cross-epic or cross-slug automatic dependency resolution. A human dispatches the next slug.
 - Migrating the two existing slugs (`learn-command`, `scrub-hook`) into the new layout. Their
   branches are cleaned up by hand once `land` exists.
+- **The quick-fix path.** A one-line fix must not need four gates, and the intended answer is a
+  GitHub issue as the entry point: filed from a phone, or filed by the local agent once it has
+  diagnosed something and stated the fix. Deliberately deferred until this workflow exists, because
+  it is a second trigger, not a shortcut through this one — see §10.
 
 ## 10. Risks
 
@@ -194,5 +198,12 @@ Measured on this epic itself, which goes through the workflow it defines:
   is not idempotent, the second slug of an epic produces an empty commit and fails the round's
   "at least one commit" check for a reason that has nothing to do with the code.
 - **Gate fatigue.** Four gates on a small change is friction, and friction is what makes people
-  bypass a workflow. If a one-card epic feels heavy in practice, the answer is a documented fast
-  path, not a quietly skipped gate.
+  bypass a workflow. The answer is a documented fast path, and its shape is already decided: a
+  labelled GitHub issue becomes the unit of work for a fix small enough that the PRD, the RFC and
+  the slice are the same sentence. That is its own epic, for a structural reason — the poller's
+  only trigger today is `refs/heads/openbuilder/plan/*`, so an issue-driven path is a new rule in
+  the rule table, which by the parity contract means a new rule in the waker too, plus a decision
+  about who authors the single card and where the gate sits when the human is on a phone. Building
+  it before the gated path exists would mean designing the exception before the rule. Until then
+  the honest fast path is a one-card epic, and the failure mode to watch for is not friction but a
+  gate quietly skipped.

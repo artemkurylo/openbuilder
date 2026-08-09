@@ -204,3 +204,18 @@ runs its own clone of `main` and nothing merges without review. The mitigation i
 rest of the epic. After any slug touching `runner/` merges, the instance needs `ob-selfupdate`
 before the new code runs, and `ob-selfupdate` is allowed to decline while a lock is held
 (learning 18), so the acceptance for those slugs must assert the effect, not the exit code.
+
+### Q9 — What is the fast path for a change too small to deserve four gates?
+
+**Asked because** you raised it against the gate-fatigue risk in the PRD, unprompted, which makes
+it an intake answer rather than a review comment.
+
+**Answered** a GitHub issue is the entry point for quick fixes — filed from a phone, or filed by the
+local agent once it has diagnosed something and stated the fix — and it comes **after** this
+workflow exists.
+**Consequence** deferred, and correctly so: it is a second trigger, not a shortcut through this
+one. The poller's only trigger is `refs/heads/openbuilder/plan/*` (`ob-poll:49`), so an
+issue-driven path is a new rule in the rule table, and by the parity contract a new rule in
+`waker/github.py` as well, plus a decision about who authors the single card and where the gate
+sits when the human has only a phone. Designing it now would mean designing the exception before
+the rule exists. Until then the fast path is a one-card epic.
