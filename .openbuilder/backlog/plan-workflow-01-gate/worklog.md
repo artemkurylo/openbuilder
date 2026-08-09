@@ -152,3 +152,46 @@ feedback item.
   the live state. state.json blob identical before/after (`15886a02e…`);
   nothing written. The epics were materialized from the plan branch
   (`git archive`) and removed afterwards; tree clean.
+
+## Round 2 — 2026-08-09T20:02:55Z
+
+Review-response round by `ob-respond` (attempt 2 of 6).
+
+- action: respond to review
+- pull request: #4
+- model: `openrouter/deepseek/deepseek-v4-flash-0731`
+- new commits: 4
+- cost: 0.07369578496000001 USD
+
+### Agent summary
+
+All round-2 work complete and pushed. Final state: 4 commits on the work branch, tree clean.
+
+## Summary
+Addressed all four review items on PR #4: `write_state` now validates the staged document (non-empty, JSON object carrying `epic`/`stage`/`approvals`) before the `mv` and refuses with exit 1, removing its temp file itself since pipeline subshells never reach the parent's EXIT trap; `commit_state` refuses on a detached HEAD before staging anything; the two empty-array expansions now use the house idiom; the requested acceptance criterion is recorded in the worklog because the story cards live only on the plan branch, which this round must not push to. One focused commit per item, all pushed.
+
+## Feedback
+- `local/bin/ob-gate` (`write_state`): fixed — staged temp is checked for non-empty + parseable object with the maintained keys before `mv`; refusal `die 1` names the temp path and states `state.json` was left untouched; temp removed inside `write_state` (subshell, parent trap cannot fire). Exit-code contract restored: refused writes exit the documented 1, not jq's propagated status (was 5).
+- `local/bin/ob-gate` (`commit_state`): fixed — `rev-parse --abbrev-ref HEAD` == `HEAD` → `die "not on a branch; ob-gate must run on the epic's design branch" 1`, before staging/committing, so no local commit and no `refs/heads/HEAD` on the remote.
+- `local/bin/ob-gate` nits: fixed — `for k in "${kept[@]+"${kept[@]}"}"` (both loops) and `printf '%s\n' "${mapped[@]+"${mapped[@]}"}"`, matching `ob-implement:127`.
+- Acceptance line: recorded verbatim in the round-2 worklog section (`git diff --quiet HEAD -- <state path>` after a stub-jq run) — the story cards exist only on `openbuilder/plan/plan-workflow-01-gate`, which hard rule 2 forbids pushing to; it should be folded into `story-01-gate-state-file.md` on the next plan-branch edit.
+- "Not a finding" (backlog record leaves `stage` untouched, appends `slugs[]`): kept, untouched.
+
+## Verification
+- `/tmp/r2-runner.sh` (39 checks, scratch repo + local bare origin) -> `FAILURES=0`: story-01/story-02 core all pass; stub `jq` (exit 1) on `ob-gate stage gate-smoke rfc` -> exit 1 (not 5), stderr contains `state.json was left untouched`, `git diff --quiet HEAD -- state.json` and byte-compare both clean, no temp file; detached HEAD -> exit 1, refusal message, no `refs/heads/HEAD` on origin, no local commit.
+- `shellcheck -x -S warning local/bin/ob-gate` -> exit 0; `make lint` -> exit 0.
+- Live epic read-only (materialized from plan branch, removed after): `verify plan-workflow --all` -> exit 3 on this work branch — `prd intact ba6725f3…`, `rfc intact e69f7c14…`, six backlog slugs VOID "missing since approval" (plan cards absent from the work-branch tree — correct); state.json blob identical before/after (`15886a02e…`), nothing written.
+
+## Still open
+- none. (The acceptance-line location is the only judgment call: worklog instead of the plan-branch story card, per the no-push-to-plan-branch rule.)
+
+### Learnings proposed this round
+
+Candidates only. They reach `LEARNINGS.md` in the control repo when the reviewer commits them there, and nowhere else.
+
+### N. The last element of a pipeline must validate and clean up for itself
+**Symptom** `ob-gate stage demo rfc` zeroed a committed `state.json` when the middle `jq` stage failed: `pipefail` reported the failure only after the final element had already `mv`ed an empty temp file over the record.
+**Cause** every pipeline element runs in a subshell, so a function at the end of a pipeline cannot share variables with the parent (its `TMP_STATE=` assignment never reaches the parent's `trap cleanup EXIT`) and the unconditional `cat | mv` it performs does not know the upstream stage failed.
+**Rule** When a function can be the last element of a pipeline, treat its stdin as untrusted: validate the staged payload (non-empty, expected shape) before the atomic replace, refuse with the caller's own exit code, and remove its own temp file on the refusal path — the parent's trap will not run for it.
+**Proven** 2026-08-09, review round 2 of the ob-gate PR: with a stub `jq` on PATH exiting 1, `ob-gate stage` exited `1` and `state.json` stayed byte-identical (`git diff --quiet HEAD --` green), where before the same failure truncated the file to 0 bytes; and `TMP_STATE=parent; echo x | bash -c 'TMP_STATE='; echo "$TMP_STATE"` prints `parent`, demonstrating the subshell isolation.
+
