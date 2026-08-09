@@ -578,6 +578,36 @@ ob_learnings_proposed() {
   grep -qE '[^[:space:]]' -- "$file"
 }
 
+# ob_learnings_section <proposal-file> — the markdown block that carries a
+# round's proposed learnings, on stdout, or nothing at all when there is no
+# proposal.
+#
+# One implementation on purpose. A proposal is written into the round directory,
+# which lives on the instance's root volume — the least durable thing in the
+# system: it is destroyed by a rebuild, and an EBS volume cannot follow its
+# instance across availability zones (it happened on 2026-08-09). GitHub is the
+# only durable store here, so every exit path that talks to GitHub has to be able
+# to carry the proposal, and none of them may format it differently:
+#
+#   * a successful round appends this to the slug's worklog.md, which is
+#     committed to the work branch and therefore reviewable in the PR diff;
+#   * a FAILED round appends it to the blocked report, which comments on the PR
+#     or opens a tracking issue.
+#
+# Without the second path a round that proposed a learning and then died — a
+# failed push, a rejected test, an exhausted attempt budget — would lose it with
+# the disk, silently, which is the one outcome this whole mechanism exists to
+# prevent.
+ob_learnings_section() {
+  local file="$1"
+  ob_learnings_proposed "$file" || return 0
+  printf '### Learnings proposed this round\n\n'
+  printf 'Candidates only. They reach `LEARNINGS.md` in the control repo when the '
+  printf 'reviewer commits them there, and nowhere else.\n\n'
+  ob_redact <"$file"
+  printf '\n'
+}
+
 # ---------------------------------------------------------------------------
 # Prompt rendering
 # ---------------------------------------------------------------------------

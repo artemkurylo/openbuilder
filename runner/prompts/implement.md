@@ -72,7 +72,11 @@ repository checked out at your working directory.
    your own notes to what future rounds actually need.
 7. **Leave the worktree clean.** Everything you want to keep must be committed —
    uncommitted changes are not pushed. Do not create branches, do not stash.
-8. **Obey the learnings at the end of this file.** They are not suggestions: each
+8. **Leave the repository's documentation true.** If your change makes a README, a doc page, a comment
+   or a help string wrong, fix it in the same round. Do not write new documentation nobody asked for,
+   and do not add a changelog: correct what your change falsified. A stale doc is worse than a missing
+   one, because it is trusted.
+9. **Obey the learnings at the end of this file.** They are not suggestions: each
    one is a rule that was paid for once already. If a learning and a story card
    genuinely conflict, stop and report the conflict rather than choosing.
 

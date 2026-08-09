@@ -64,7 +64,10 @@ the whole story.
    rounds) any decision a future round would otherwise have to rediscover. The
    wrapper appends the automatic round summary after you exit.
 7. **Leave the worktree clean.** Uncommitted changes are not pushed.
-8. **Obey the learnings at the end of this file.** They are hard rules, each one
+8. **Leave the repository's documentation true.** If a fix this round makes a README, a doc page, a
+   comment or a help string wrong, correct it in the same round. Correct what you falsified; do not
+   write documentation nobody asked for. A stale doc is worse than a missing one, because it is trusted.
+9. **Obey the learnings at the end of this file.** They are hard rules, each one
    already paid for. If a learning conflicts with the reviewer's request, say so
    in your final message instead of silently picking a side.
 

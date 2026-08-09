@@ -45,15 +45,22 @@ EOF
 }
 
 on_exit() {
-  local rc=$?
+  local rc=$? proposal=""
   if [[ "$BASHPID" != "$$" ]]; then
     exit "$rc"
   fi
   trap - EXIT
   if ((rc != 0)); then
     ob_log ERROR "failed rc=${rc} repo=${REPO} slug=${SLUG} pr=${PR} attempt=${ATTEMPT}"
+    # A failed round never reaches record_worklog, so anything it proposed would
+    # die with the round directory. Carry it into the blocked report instead:
+    # GitHub is the only durable store this instance has.
+    if [[ -n "$LEARNINGS_OUT" ]]; then
+      proposal="$(ob_learnings_section "$LEARNINGS_OUT")"
+      [[ -z "$proposal" ]] || proposal=$'\n\n'"$proposal"
+    fi
     ob_report_blocked "$REPO" "$SLUG" "$PR" \
-      "\`ob-respond\` failed with exit code ${rc} on attempt ${ATTEMPT}." || true
+      "\`ob-respond\` failed with exit code ${rc} on attempt ${ATTEMPT}.${proposal}" || true
   fi
   exit "$rc"
 }
@@ -258,13 +265,7 @@ record_worklog() {
     printf '### Agent summary\n\n'
     cat "${ROUND_DIR}/final.md"
     printf '\n'
-    if ob_learnings_proposed "$LEARNINGS_OUT"; then
-      printf '### Learnings proposed this round\n\n'
-      printf 'Candidates only. They reach `LEARNINGS.md` in the control repo when the '
-      printf 'reviewer commits them there.\n\n'
-      cat "$LEARNINGS_OUT"
-      printf '\n'
-    fi
+    ob_learnings_section "$LEARNINGS_OUT"
   } >"$detail"
   heading="Review-response round by \`ob-respond\` (attempt ${ATTEMPT} of ${OPENBUILDER_MAX_ATTEMPTS})."
   worklog="$(ob_worklog_append "$WT_DIR" "$SLUG" "$ATTEMPT" "$heading" "$detail")"
