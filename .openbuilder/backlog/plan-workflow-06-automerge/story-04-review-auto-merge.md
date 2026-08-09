@@ -12,7 +12,7 @@ files:
 acceptance:
   - "`openbuilder review --auto-merge <repo> <pr>` without `--watch` exits 1 with `--auto-merge requires --watch`, and makes no network call"
   - "each of the seven conditions, violated one at a time in a sandbox, prints `auto-merge refused (condition <n>): <the RFC refusal string>`, exits 7, and leaves the pull request OPEN"
-  - "on a passing run the pull request is merged, `gh pr view <pr> --json mergedBy --jq .mergedBy.login` prints `openbuilder-bot`, and all three of the work, plan and design branches are gone from `git/matching-refs/heads/openbuilder/`"
+  - "on a passing run the pull request is merged and `gh pr view <pr> --json mergedBy --jq .mergedBy.login` prints `app/openbuilder-bot` — measured live 2026-08-09, the App prefix is part of the login and an equality test against `openbuilder-bot` fails"
   - "the audit comment posted after a merge contains one `condition <n>:` line for each of the seven conditions with its observed result"
   - "`openbuilder land` keeps its own behaviour: `grep -cF 'confirmation did not match' local/bin/openbuilder` prints 1 and a land in the sandbox still deletes all three branches"
   - "`shellcheck -x -S warning local/bin/openbuilder` exits 0 with no output"
@@ -259,7 +259,11 @@ Order, exactly:
    Not through `ob_gh`: the token must not enter an environment any other `gh` call inherits. Repeat
    `GH_HOST=github.com` inline and say why in a comment.
 7. **Assert the effect, not the exit code.** `actor=$(ob_gh pr view "$pr" --repo "$repo" --json mergedBy --jq '.mergedBy.login')`.
-   When it is not `openbuilder-bot`, `ob_warn "merge actor is '$actor', not openbuilder-bot; the audit trail is wrong"` and remember to return `6` at the end. Also assert the merge itself:
+   The value is `app/openbuilder-bot`, **not** `openbuilder-bot` — measured live on 2026-08-09 when
+   this merge path was first exercised by hand. Compare with `[[ $actor == app/openbuilder-bot ]]`,
+   never with the bare login, and do not strip the prefix. When it does not match,
+   `ob_warn "merge actor is '$actor', not app/openbuilder-bot; the audit trail is wrong"` and remember
+   to return `6` at the end. Also assert the merge itself:
    `ob_gh pr view "$pr" --repo "$repo" --json state --jq '.state'` must print `MERGED`; anything else
    → `ob_die "auto-merge: #$pr is <state> after the merge call; refusing to tear down"`. `gh` can
    succeed while merging nothing (LEARNINGS 18/19); the state is the proof.

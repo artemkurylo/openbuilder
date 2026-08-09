@@ -115,6 +115,12 @@ each is a place a human should say no now rather than at review time:
 6. **The §3.7 teardown is extracted, not copied.** `story-04` moves steps 8–11 of `cmd_land` into
    `ob_land_teardown` and has both callers use it, rather than leaving two copies to diverge.
 
+**Measured while landing the first auto-merge by hand, 2026-08-09.** `gh pr view --json mergedBy --jq
+.mergedBy.login` prints `app/openbuilder-bot`, not `openbuilder-bot`: the `app/` prefix is part of the
+login for a GitHub App actor. `story-04` asserts the prefixed form. This is exactly the class of detail
+a weak model gets wrong once and then reports as working, so it is stated twice — in the card's
+acceptance item and in its step 7.
+
 **Cross-slug prerequisites.** `plan-workflow-01-gate` must have merged (`local/bin/ob-gate` exists)
 and `plan-workflow-05-cli` must have merged (`ob_review_watch`, `cmd_land`, `ob_epic_of_plan`,
 `ob_design_branch`, `ob_gate`, `ob_land_prune_script`, `docs/runbook.md` §20). Both are epic-level
