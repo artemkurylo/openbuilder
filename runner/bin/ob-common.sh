@@ -676,6 +676,54 @@ ob_render_prompt() {
 }
 
 # ---------------------------------------------------------------------------
+# Epic documents
+# ---------------------------------------------------------------------------
+
+# ob_epic_name <plan-file> — the epic name from a plan.md `- epic:` line, or
+# nothing. The extraction is frozen by RFC §2 (it is also what ob-poll rule 4b
+# uses), and the value must match the slug contract before it is interpolated
+# into a git path. A missing, backticked or malformed line degrades to nothing
+# exactly like an absent line: backlogs that predate the epic layout are normal
+# and must never fail a round. Always returns 0.
+ob_epic_name() {
+  local plan_file="$1" epic=""
+  [[ -r "$plan_file" ]] || return 0
+  epic="$(awk '/^- epic:/ {print $3; exit}' "$plan_file")"
+  [[ "$epic" =~ ^[a-z0-9][a-z0-9-]{1,48}$ ]] || return 0
+  printf '%s' "$epic"
+}
+
+# ob_epic_doc <src-dir> <plan-ref> <epic> <PRD|RFC> <out-file> — leave the epic
+# document, or the one-line fallback, in <out-file>. Always leaves a file
+# behind: an empty block file renders as "_(nothing recorded)_", which is the
+# wrong sentence for a slug that has no PRD and hides the reason. Always
+# returns 0; a missing document degrades, it never fails a round.
+ob_epic_doc() {
+  local src_dir="$1" plan_ref="$2" epic="$3" label="$4" out_file="$5"
+  local name n
+  case "$label" in
+  PRD) name="prd.md" ;;
+  RFC) name="rfc.md" ;;
+  *) ob_die "ob_epic_doc: unknown label '${label}' (expected PRD or RFC)" ;;
+  esac
+  if [[ -n "$epic" ]]; then
+    git -C "$src_dir" show "${plan_ref}:.openbuilder/epics/${epic}/${name}" >"$out_file" 2>/dev/null || true
+    if [[ -s "$out_file" ]]; then
+      n="$(wc -l <"$out_file" | tr -d ' ')"
+      ob_log INFO "epic doc ${label}: ${n} lines from ${plan_ref}"
+      return 0
+    fi
+    ob_log WARN "epic doc ${label}: not found at ${plan_ref}:.openbuilder/epics/${epic}/${name}; using the fallback"
+  fi
+  if [[ "$label" == "PRD" ]]; then
+    printf '_(no PRD for this slug)_\n' >"$out_file"
+  else
+    printf '_(no RFC for this slug)_\n' >"$out_file"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # omp
 # ---------------------------------------------------------------------------
 
