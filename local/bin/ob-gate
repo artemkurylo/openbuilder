@@ -162,6 +162,13 @@ commit_state() {
   fi
   # A pathspec commit cannot see an untracked file; stage only this one
   # path, leaving every other staged or unstaged change untouched.
+  local branch
+  branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
+  # On a detached HEAD rev-parse prints the literal string HEAD and the push
+  # below would create refs/heads/HEAD on the remote. Refuse instead.
+  if [[ "$branch" == "HEAD" ]]; then
+    die "not on a branch; ob-gate must run on the epic's design branch" 1
+  fi
   git -C "$REPO_ROOT" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 ||
     git -C "$REPO_ROOT" add -- "$rel"
   if [[ -n "$trailer" ]]; then
@@ -169,8 +176,7 @@ commit_state() {
   else
     git -C "$REPO_ROOT" commit --quiet -m "$subject" -- "$rel"
   fi
-  local branch short
-  branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
+  local short
   if ! git -C "$REPO_ROOT" push --quiet origin "HEAD:refs/heads/${branch}"; then
     short="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
     die "push to origin failed; state.json is committed locally as ${short} — re-run: git push origin HEAD:refs/heads/${branch}" 1
