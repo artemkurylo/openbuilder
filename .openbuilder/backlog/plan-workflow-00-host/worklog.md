@@ -112,3 +112,37 @@ never `example.com`, never `unset`.
 Backlog card acceptance criteria are unchanged; this is a defect in the story
 card's enumeration (an `exec omp` line is not a `gh` call site), recorded here
 so `plan-workflow-05-cli`'s rewrite of these commands inherits the pin.
+
+## Round 2 — 2026-08-09T19:52:29Z
+
+Review-response round by `ob-respond` (attempt 2 of 6).
+
+- action: respond to review
+- pull request: #3
+- model: `openrouter/deepseek/deepseek-v4-flash-0731`
+- new commits: 2
+- cost: 0.10468025904000001 USD
+
+### Agent summary
+
+All items closed. Final state on `openbuilder/work/plan-workflow-00-host`: two focused commits, clean tree, no merges or force-pushes.
+
+## Summary
+Closed the R11 gap the review found: both `exec omp` handoffs (`cmd_plan` and `cmd_review`) now launch the child with `GH_HOST=github.com`, so every GitHub call inside the planner/reviewer session — including the reviewer's own `gh pr review` and label writes — resolves `github.com` instead of inheriting the ambient host. The `## Change` note was added to the worklog with the acceptance line proving the pin, and `ob_command_table`'s `environment:` list now names `OPENBUILDER_OWNER` and `OPENBUILDER_GH_HOST`, the two variables that can refuse a command or startup.
+
+## Feedback
+- `local/bin/openbuilder:671,835` (both `exec omp` lines): fixed — `GH_HOST=github.com GH_REPO="$repo" exec omp \`, prefixed env only, child-scoped; commit `0b98013`.
+- worklog `## Change` note: fixed — round-002 entry records that the omp child is pinned too, plus the acceptance line (`GH_HOST=example.com openbuilder review artemkurylo/openbuilder 3` must show the child receiving `github.com`).
+- `local/bin/openbuilder:594` (`ob_command_table` env list): fixed — now lists all seven variables; commit `ad985b0`.
+- Story-card acceptance criteria: declined to edit — the hole was a defect in the card's enumeration (`exec omp` is not a `gh` call site), the card text is unchanged, and the correction is recorded in the worklog exactly as the review suggested.
+
+## Verification
+- Stub `omp` on PATH recording inherited env, real code path: `GH_HOST=example.com openbuilder review artemkurylo/openbuilder 3` -> rc 0, stub saw `GH_HOST=github.com GH_REPO=artemkurylo/openbuilder`; same with `GH_HOST` unset (`env -u GH_HOST`) -> same, never `unset`. `grep -c 'GH_HOST=github.com GH_REPO' local/bin/openbuilder` -> 2 (both lines). The `cmd_plan` line is byte-identical to the `cmd_review` line; it was grep-verified, not probe-run end to end.
+- `make lint` -> rc 0; `shellcheck -x -S warning local/bin/openbuilder runner/bin/ob-common.sh` -> rc 0, no output; `make scrub` -> rc 0.
+- `git status --porcelain` -> empty; branch `openbuilder/work/plan-workflow-00-host`, commits `0b98013` + `ad985b0`.
+- During probing, two earlier probe attempts exec'd the real `omp` binary by mistake (stub dir path error; exited rc 129 via SIGHUP). Verified no side effects: PR #3 still carries exactly the one `CHANGES_REQUESTED` review and the one conversation comment; stray session dir removed.
+
+## Still open
+- none
+
+
