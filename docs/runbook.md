@@ -851,6 +851,10 @@ sudo /opt/openbuilder/repo/runner/bootstrap.sh
 omp --version
 ```
 
+`LEARNINGS.md` is deliberately outside all of this. A round re-reads it from the control repo's *remote*
+every time it runs, so publishing an entry is a push and nothing else — no `ob-selfupdate`, no restart. See
+[§17](#17-publish-a-learning).
+
 ## 16. Instance never powers off
 
 Symptom: the instance stays `running` for hours, nothing new appears in
@@ -919,7 +923,181 @@ billing — forever. Prevention is the rule from the top of this file: everythin
 [§15](#15-update-the-instance) and keep the root form for this repair. Running it as root is safe now:
 `ob_lock` creates every lockfile `0664` and chowns it to `openbuilder` whenever root is the one creating it.
 
-## 17. Quick reference
+## 17. Publish a learning
+
+`LEARNINGS.md` at the root of this control repo is the durable store of operational knowledge, and
+`ob-implement` and `ob-respond` inject it verbatim into every round as the prompt's `{{LEARNINGS}}` block.
+It is read from the **remote**, not from the instance's checkout, which is what makes publishing cheap: one
+file edit and a push apply on the very next round, with no code deploy and no restart. It is also why the
+store lives in the repo rather than on the instance — an EBS root volume cannot follow its instance to
+another availability zone, so a rebuild destroys the disk and everything on it. The mechanism is described
+in [architecture.md](architecture.md#3-the-learnings-store); what follows is the operator's half.
+
+**a. Publish one.** In your clone of the control repo:
+
+```sh
+# edit LEARNINGS.md — see its own "Rules for editing this file"; entry shape is
+#   ### N. Imperative rule, in one line  /  Symptom / Cause / Rule / Proven
+make scrub                                   # §18 — never publish an identifier by accident
+git add LEARNINGS.md
+git commit -m 'learnings: <the rule, in one line>'
+git push origin main
+```
+
+That is the whole deployment. `ob_learnings` runs `git fetch origin HEAD` in `/opt/openbuilder/repo` and
+reads `FETCH_HEAD:LEARNINGS.md`, so the next round has the new entry without `ob-selfupdate`
+([§15](#15-update-the-instance)) and without touching a service. `fetch origin HEAD` writes `FETCH_HEAD`
+without moving any branch and without making the clone shallow — a shallow clone would break
+`ob-selfupdate`'s `merge --ff-only` — and it cannot race a self-update either, because `ob-selfupdate`
+skips entirely while any job lock is held.
+
+Confirm it from the instance instead of trusting the push. Call the library function exactly as a round
+does:
+
+```sh
+openbuilder shell
+sudo -u openbuilder bash -c 'source /opt/openbuilder/bin/ob-common.sh; ob_load_env; out=$(mktemp); ob_learnings "$out"; wc -l <"$out"'
+```
+
+`ob_learnings` logs which source it used, then the `wc -l` prints the line count it produced:
+
+```
+2026-08-09T11:05:03Z INFO  bash: learnings: 138 lines from artemkurylo/openbuilder (remote)
+138
+```
+
+`(remote)` is the assertion you came for — anything else means the chain degraded (**c**), and the entry
+you just pushed is probably not in the round. The `bash:` prefix is only `OB_PROG` falling back to `$0`
+because you sourced the library by hand; a real round logs `ob-implement:` or `ob-respond:`. The line also
+lands in the operational log, so it is findable per round after the fact:
+
+```sh
+grep -F 'learnings:' /opt/openbuilder/log/openbuilder.log | tail -5
+wc -l /opt/openbuilder/state/<key>/rounds/*/learnings.md   # what each round was actually given
+```
+
+**b. Accept a learning a round proposed.** A round never edits `LEARNINGS.md`. It may append a candidate
+to the file named by `{{LEARNINGS_OUT}}` — `/opt/openbuilder/state/<key>/rounds/<NNN>/learnings-proposed.md`,
+the single path outside its worktree the agent is allowed to write. That file starts empty, so any
+non-blank line counts as a proposal; when there is one, the round appends a
+`### Learnings proposed this round` section to the slug's `worklog.md` and commits it to the work branch,
+which puts it on the pull request. Read it there:
+
+```sh
+gh api repos/you/your-repo/contents/.openbuilder/backlog/<slug>/worklog.md \
+  --ref openbuilder/work/<slug> --jq .content | base64 -d | sed -n '/Learnings proposed/,$p'
+```
+
+To accept it: in the control repo, put the entry under the heading it belongs to — "Rules the implementer
+must follow" or "Environment truths" — give it the next number, and publish it with **a**. Check it against
+that file's own editing rules first: it must have been *observed*, stated as an imperative, and be
+repo-agnostic (knowledge about one target repo belongs in that repo's `worklog.md`).
+
+**Nothing the round wrote takes effect on its own.** The proposal exists only as text on a PR; the store is
+`LEARNINGS.md` and only a human — or the reviewer acting for one — commits there. Rejecting a proposal is
+doing nothing at all. Conversely, merging the PR does not publish anything: the worklog lands in the
+*target* repo, not here.
+
+**c. Diagnose the fallback chain.** `ob_learnings` tries four sources in order and says which one it used.
+Only the first is healthy; the other three are `WARN` and each has a distinct cause:
+
+| Log line | What it means |
+|---|---|
+| `INFO  learnings: <N> lines from <control repo> (remote)` | healthy. `<N>` lines came from `FETCH_HEAD:LEARNINGS.md`, i.e. whatever is pushed right now |
+| `WARN  learnings: remote unreachable; using the local clone at <sha>` | the fetch (or the `show FETCH_HEAD:`) failed. The round ran on the clone's committed copy, so **everything pushed since `<sha>` is missing** |
+| `WARN  learnings: using the installed copy at /opt/openbuilder/LEARNINGS.md` | there is no usable clone at all. The round ran on the snapshot `bootstrap.sh` copied in, frozen at whenever bootstrap last ran |
+| `WARN  learnings: none found; this round runs without them` | no clone and no installed copy. The `{{LEARNINGS}}` block was empty and the round proceeded anyway |
+
+One check per line, in the same order:
+
+```sh
+openbuilder shell
+
+# "remote unreachable" — egress, then auth. cloud-init clones the control repo over
+# anonymous HTTPS, so DNS/NAT/security-group first; a private control repo needs the
+# App token's git credential helper instead (§6).
+sudo -u openbuilder git -C /opt/openbuilder/repo fetch origin HEAD && echo FETCH_OK
+sudo -u openbuilder git -C /opt/openbuilder/repo log --oneline -1 FETCH_HEAD
+
+# "using the installed copy" — is /opt/openbuilder/repo a clone at all?
+ls -d /opt/openbuilder/repo/.git || sudo -u openbuilder \
+  git clone https://github.com/artemkurylo/openbuilder.git /opt/openbuilder/repo
+
+# "none found" — bootstrap never ran, or ran before LEARNINGS.md existed. It installs
+# the fallback copy; running it also fixes the clone above.
+sudo /opt/openbuilder/repo/runner/bootstrap.sh
+ls -l /opt/openbuilder/LEARNINGS.md
+```
+
+A missing clone is the serious one: `ob-selfupdate` needs it too, so that instance is not receiving code
+changes either ([§15](#15-update-the-instance)). None of the three fails the round on purpose — a missing
+learnings file degrades a round, it never fails one — so nothing else in the log will point at this. The
+`learnings:` line is the only evidence, which is why it is worth grepping before you conclude the model
+ignored an entry: it may never have been given it.
+
+## 18. `make scrub` before you publish
+
+Everything in this repo is public and every prompt it produces is processed by a third-party model, so
+employer and client names, internal hostnames, cloud account numbers, work email domains and the local
+directory layout of your checkout must never be committed. `local/bin/ob-scrub-check` is the gate.
+
+The deny list is **not** in the repo, because the patterns are themselves the sensitive part. The tool reads
+`$OPENBUILDER_SCRUB_DENY`, or `.scrub-deny` at the repo root, which is gitignored: one extended regex per
+line, blank lines and `#` comments ignored. Point `$OPENBUILDER_SCRUB_DENY` at a list kept outside any
+checkout and every repo you own is checked against the same patterns.
+
+```sh
+make scrub                            # the worktree, then all history — what CI-of-one looks like
+local/bin/ob-scrub-check              # tracked files in the working tree
+local/bin/ob-scrub-check --staged     # exactly what you are about to commit
+local/bin/ob-scrub-check --history    # every commit, via `git rev-list --all` (slow, thorough)
+```
+
+Clean is two lines, exit 0:
+
+```
+ob-scrub-check: clean (worktree).
+ob-scrub-check: clean (history).
+```
+
+A hit names the path and a count, exits 1, and never prints what matched:
+
+```
+ob-scrub-check: worktree: docs/runbook.md — 2 match(es)
+
+ob-scrub-check: 1 location(s) matched the deny list. Nothing was printed from
+ob-scrub-check: those files on purpose — open them yourself. A match already in
+ob-scrub-check: published history needs history rewritten, not just a new commit.
+```
+
+The silence is the design: a check that echoes the string it is protecting has leaked it into your
+terminal, your scrollback and eventually some log. Open the named file and search it against your own deny
+list. In `--history` mode the first field is the short commit instead of `worktree`, so a hit tells you
+where in history to look:
+
+```
+ob-scrub-check: 5582097a: docs/runbook.md — 2 match(es)
+```
+
+And that is the case with real consequences. A match in a commit you have already pushed cannot be fixed by
+a follow-up commit — the string is in the published object, and removing it means **rewriting history** and
+force-pushing, which breaks the instance's clone of the control repo (`LEARNINGS.md` entry 11) and needs the
+re-clone in **§17c**. Which is the argument for running `--staged` before every commit and `make scrub`
+before every push, rather than discovering it later.
+
+With no deny list at all the tool exits **0** and tells you what to put in one — a checkout with no patterns
+has nothing to check, so it is not an error:
+
+```
+ob-scrub-check: no deny list at /path/to/openbuilder/.scrub-deny; nothing to check.
+ob-scrub-check: create it (it is gitignored) with one extended regex per line —
+ob-scrub-check: employer and client names, internal hostnames, account ids, work
+ob-scrub-check: email domains, and the parent directories of your checkout.
+```
+
+`make lint` also shellchecks `local/bin/*`, so the check itself is linted like the runner scripts.
+
+## 19. Quick reference
 
 | Want | Command |
 |---|---|
@@ -943,3 +1121,6 @@ billing — forever. Prevention is the rule from the top of this file: everythin
 | What the waker decided | `aws logs tail /aws/lambda/openbuilder-waker --region eu-central-1 --profile openbuilder-deploy --since 1h` |
 | Is the waker scheduled at all? | `terraform -chdir=infra output waker` |
 | Lock ownership (must be `openbuilder openbuilder 664`) | `stat -c "%U %G %a %n" /opt/openbuilder/run/*.lock` |
+| Confirm the instance sees a published learning | `sudo -u openbuilder bash -c 'source /opt/openbuilder/bin/ob-common.sh; ob_load_env; out=$(mktemp); ob_learnings "$out"; wc -l <"$out"'` |
+| Which source the learnings came from | `grep -F 'learnings:' /opt/openbuilder/log/openbuilder.log \| tail -5` |
+| Refuse to publish a private identifier | `make scrub` (or `local/bin/ob-scrub-check --staged` before a commit) |

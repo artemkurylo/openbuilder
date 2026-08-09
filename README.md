@@ -428,6 +428,37 @@ Everything else is observation:
 You can queue several slugs at once. `ob-poll` takes **one action per slug per pass** and holds a
 per-slug lock, so parallel plan branches make progress round-robin instead of stampeding.
 
+## Learnings
+
+`LEARNINGS.md` at the root of this repository is the durable store of operational knowledge — the things
+that cost real time or real money to discover and that no linter would have caught. Every entry is
+**Symptom / Cause / Rule / Proven**, and `ob-implement` and `ob-respond` inject the whole file into every
+round's prompt as hard rules the implementer must follow.
+
+**Publishing one is a push.** The file is read from this repository's *remote* at the start of every round, so:
+
+```sh
+$EDITOR LEARNINGS.md      # add an entry, following the rules at the top of the file
+git commit -am 'learnings: never conflate "cannot access it" with "it is busy"'
+git push
+```
+
+The next round has it — for every slug in every repo in `repos` at once, with no `ob-selfupdate`, no restart
+and no `terraform apply`. If the remote is unreachable the round falls back to the instance's own clone,
+then to the copy `bootstrap.sh` installed; with none of those it runs without learnings and logs that it
+did. A missing learnings file degrades a round, it never fails one.
+
+**Proposing one is the agent's job; committing it is yours.** A round that observed something durable
+appends a candidate to a per-round file — the only path outside its worktree it is allowed to write — and
+the wrapper copies it into `.openbuilder/backlog/<slug>/worklog.md` under **Learnings proposed this round**,
+committed on the work branch, so it lands in the pull request you are already reviewing. Nothing the agent
+writes reaches `LEARNINGS.md` by itself: only a human, or the reviewer acting for one, edits that file. Most
+rounds propose nothing, which is the expected outcome, not a failure.
+
+Repo-specific knowledge does not go there — that belongs in the slug's `worklog.md`. The reasoning behind
+the remote-first read, the fallback chain and the propose/accept split is in
+[docs/architecture.md](docs/architecture.md#3-the-learnings-store).
+
 ## What it costs
 
 Approximate `eu-central-1` on-demand pricing, 730 hours/month. The `t4g.medium` hourly rate is verified
@@ -468,7 +499,8 @@ to it.
 ```
 openbuilder/
 ├── README.md                 this file: what it is, quickstart, daily loop
-├── Makefile                  targets: help init plan-tf apply destroy secrets doctor shell logs status fmt lint repo-create
+├── LEARNINGS.md              durable operational knowledge, injected into every round's prompt
+├── Makefile                  targets: help init plan-tf apply destroy secrets doctor shell logs status fmt lint scrub repo-create
 ├── docs/                     architecture, day-2 runbook, GitHub App setup, cost math
 ├── infra/                    Terraform: VPC, public subnet, IAM, SSM params, instance, budget
 ├── infra/templates/          cloud-init template that renders openbuilder.env and calls bootstrap.sh
@@ -482,8 +514,51 @@ openbuilder/
 ├── agent/local/              omp planner + reviewer agents and their skills, for your laptop
 ├── agent/hooks/              pre-tool-call guardrails hook: no merge, no force-push, no push to main
 ├── backlog/                  SCHEMA.md — the story-card contract — plus a filled-in example
-└── local/bin/                the `openbuilder` laptop CLI
+├── local/bin/                the `openbuilder` laptop CLI
+└── local/bin/ob-scrub-check  pre-publish check: no private identifiers in the tree, the index or history
 ```
+
+## Before you push: `make scrub`
+
+Everything in this repository is public, and the plan text and review comments that flow through it are
+processed by a third-party model. Two targets keep that honest:
+
+| Target | What it does |
+|---|---|
+| `make scrub` | `local/bin/ob-scrub-check` over the tracked working tree, then over every commit (`--history`, which walks `git rev-list --all` — slow and thorough). Exits non-zero on any match |
+| `make lint` | `shellcheck -x -S warning` over `runner/bootstrap.sh`, `runner/bin/*` and `local/bin/*`; skipped with a note when shellcheck is not installed |
+
+`ob-scrub-check` matches an extended-regex deny list, case-insensitively — employer and client names,
+internal hostnames, cloud account ids, work email domains, the parent directories of your checkout —
+against the working tree, the index (`--staged`) or all of history (`--history`). It reports a path and a
+match count and **never the matching text**, because a check that echoes the string it protects has just
+leaked it into your terminal and your scrollback.
+
+**The deny list is not in this repo**, because the patterns are themselves the sensitive part. Create it
+once — `.scrub-deny` is gitignored:
+
+```sh
+cat > .scrub-deny <<'EOF'
+# one extended regex per line; blank lines and # comments are ignored.
+# Substitute the real strings — placeholders match nothing.
+<employer-or-client-name>
+internal\.<their-domain>\.(net|com)
+@<their-domain>\.(com|net)
+<your-12-digit-aws-account-id>
+/Users/[a-z]+/Development/<their-name>
+EOF
+
+make scrub
+```
+
+Set `OPENBUILDER_SCRUB_DENY=/path/to/list` to share one list across several repositories. With no list at
+all the check prints how to create one and exits 0, so a fresh clone is never blocked by it. A match that is
+already in published history needs the history rewritten, not just another commit — which is the argument
+for running `make scrub` before the first push, not after.
+
+Write the literal strings you are hiding, not generic shapes: a bare `[0-9]{12}` for "an account id" matches
+the checksums in `infra/.terraform.lock.hcl` and the `DigestInfo` constant in `waker/rs256.py`, and a check
+that cries wolf gets skipped.
 
 ## Troubleshooting
 
@@ -511,9 +586,11 @@ purpose, because idle auto-stop watches that file's mtime. For the noisy per-dec
 
 ## Where to read next
 
-- [docs/architecture.md](docs/architecture.md) — components, the full state machine, the sequence
-  diagram, the design decisions and their tradeoffs, and the security model.
+- [docs/architecture.md](docs/architecture.md) — components, the full state machine, the learnings store,
+  the sequence diagram, the design decisions and their tradeoffs, and the security model.
 - [docs/github-app-setup.md](docs/github-app-setup.md) — one-time identity setup.
 - [docs/runbook.md](docs/runbook.md) — symptom-driven day-2 operations.
 - [docs/cost.md](docs/cost.md) — the money, itemised.
+- [LEARNINGS.md](LEARNINGS.md) — the operational knowledge every round is handed, and the rules for adding
+  to it.
 - [backlog/SCHEMA.md](backlog/SCHEMA.md) — how to write a story card the remote agent can actually execute.

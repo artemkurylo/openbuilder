@@ -7,7 +7,7 @@
 | Component | Path | What it is |
 |---|---|---|
 | `openbuilder` CLI | `local/bin/openbuilder` | Bash. The only thing you type. Reads `OPENBUILDER_INSTANCE_ID`, `OPENBUILDER_REGION`, `OPENBUILDER_AWS_PROFILE`, `OPENBUILDER_TARGET_REPO`, sourcing `.openbuilder.local` if present. Ignores ambient `AWS_REGION`/`AWS_PROFILE` for instance calls so the local model provider's account cannot be targeted by mistake. Subcommands: `plan`, `dispatch`, `review`, `approve`, `request-changes`, `status`, `logs`, `shell`, `doctor`, `start`, `stop`, `cost`. |
-| `Makefile` | `Makefile` | Wrappers for the one-time setup and the observation commands: `help` (default), `init`, `plan-tf`, `apply`, `destroy`, `secrets`, `doctor`, `shell`, `logs`, `status`, `fmt`, `lint`, `repo-create`. |
+| `Makefile` | `Makefile` | Wrappers for the one-time setup and the observation commands: `help` (default), `init`, `plan-tf`, `apply`, `destroy`, `secrets`, `doctor`, `shell`, `logs`, `status`, `fmt`, `lint`, `scrub`, `repo-create`. |
 | planner agent | `agent/local/agents/planner.md` | Opus 5. Emits story cards per `backlog/SCHEMA.md`. |
 | reviewer agent | `agent/local/agents/reviewer.md` | Opus 5. Emits `approve` or `changes-requested` plus line-anchored comments. Read-only tools plus `github` and `bash`. |
 | skills | `agent/local/agents/skills/write-backlog/`, `.../review-openbuilder-pr/` | How to slice work; the review rubric and the exact `gh` commands. |
@@ -55,11 +55,13 @@ no database — if it is not a branch, a commit, a comment or a label, it does n
 /opt/openbuilder/agent/                          omp config.yml + agents/
 /opt/openbuilder/etc/openbuilder.env             non-secret config, rendered by cloud-init
 /opt/openbuilder/repo/                           checkout of this control repo (self-update source)
+/opt/openbuilder/LEARNINGS.md                    fallback copy of the control repo's LEARNINGS.md (§3)
 /opt/openbuilder/src/<owner>__<repo>/            git clone of a target repo
 /opt/openbuilder/work/<owner>__<repo>__<slug>/   git worktree for one story set
 /opt/openbuilder/state/<owner>__<repo>__<slug>/               attempts counter, blocked-reported marker
 /opt/openbuilder/state/<owner>__<repo>__<slug>/rounds/<NNN>/  per-round forensics: prompt.md, run.ndjson,
-                                                              final.md, feedback.md, pr-body.md
+                                                              final.md, feedback.md, pr-body.md,
+                                                              learnings.md, learnings-proposed.md
 /opt/openbuilder/log/openbuilder.log             append-only operational log
 /opt/openbuilder/run/                            lockfiles
 /opt/openbuilder/cache/gh-token.json             cached installation token, mode 0600
@@ -238,7 +240,112 @@ stateDiagram-v2
     blocked --> [*]: human intervenes
 ```
 
-## 3. One full cycle
+## 3. The learnings store
+
+There are two kinds of memory in this design, and confusing them is the main way to get this wrong.
+
+| Store | Lives in | Scope | Written by |
+|---|---|---|---|
+| `.openbuilder/backlog/<slug>/worklog.md` | the **target** repo, on the work branch | one slug: decisions taken, dead ends, deviations from a card, what was left undone | the agent, every round, plus an automatic round summary |
+| `LEARNINGS.md` | the root of the **control** repo | every round, every target repo, every machine | a human, by commit |
+
+The split is a rule, not a taste. "This service's retry helper is called `withBackoff`" is repo-specific and
+belongs in the worklog; "a probe must fail for exactly one reason" is true everywhere and belongs in
+`LEARNINGS.md`. Entries there have a fixed shape — **Symptom / Cause / Rule / Proven** — under two headings,
+"Rules the implementer must follow" and "Environment truths", and the file carries its own admission criteria
+at the top, because a store with no stated criteria fills up with plausible advice and then stops being read.
+
+### Why the control repo
+
+Not the instance, because the instance is disposable and its disk is not durable. An EBS root volume cannot
+follow its instance to another availability zone, so moving the box — `eu-central-1a` to `eu-central-1b`, done
+on 2026-08-09 — destroys the volume and everything only that volume knew. Any store under `/opt/openbuilder`
+is one rebuild away from empty.
+
+Not a chat log either. Every round is a fresh `--no-session` process (§5), so there is no conversation to
+carry forward, and a transcript is the wrong shape anyway: nobody re-reads six rounds of tool calls to find
+the one sentence that mattered. The control repository is the only artifact in the design that is versioned,
+diffable, reviewed, off-box, and already read by every round on every machine. So the store is a file in it,
+and adding an entry is a commit with a message.
+
+### How it reaches the implementer — `ob_learnings`
+
+`ob_learnings <out-file>` in `ob-common.sh` takes the first of four sources that yields a non-empty file:
+
+| # | Source | What it logs |
+|---|---|---|
+| 1 | the control repo's **remote** — `git fetch origin HEAD`, then `git show FETCH_HEAD:LEARNINGS.md` | `INFO learnings: <n> lines from <control-repo> (remote)` |
+| 2 | the local clone at `/opt/openbuilder/repo` — `git show HEAD:LEARNINGS.md` | `WARN ... remote unreachable; using the local clone at <sha>` |
+| 3 | the copy `bootstrap.sh` installed at `/opt/openbuilder/LEARNINGS.md` | `WARN ... using the installed copy at ...` |
+| 4 | nothing — the out-file is left empty | `WARN ... none found; this round runs without them` |
+
+Step 4 is why the chain exists at all: a missing learnings file **degrades** a round, it never fails one.
+Nothing about fetching a documentation file is worth failing an implementation over. Every step below the
+first says so at WARN, so the degradation is visible afterwards instead of silent.
+
+**Remote first, because publishing must be one push.** Steps 2 and 3 are both snapshots of a past deploy: the
+local clone only moves when `ob-selfupdate` runs, and the installed copy only moves when `bootstrap.sh`
+re-runs. Reading either of them first would make a new learning wait on a code deploy — and a learning is at
+its most valuable in the minutes after it was paid for. Reading the remote first makes the whole publication
+path *edit one file, push*: the next round of every slug in every allowlisted repo has it, with no
+`ob-selfupdate`, no restart and nothing to deploy.
+
+**`fetch origin HEAD`, not a pull and not a shallow fetch.** `fetch origin HEAD` writes `FETCH_HEAD` and moves
+no branch, so reading a learning cannot advance the code the instance is running: `ob-selfupdate` stays the
+only thing that changes what executes. `--depth 1` would be cheaper and is forbidden, because it marks the
+clone shallow permanently and `ob-selfupdate`'s `merge --ff-only` cannot fast-forward out of that — a
+documentation fetch would have broken self-update. Nor can the two race: `ob-selfupdate` skips entirely while
+any job lock is held, and `ob_learnings` only ever runs inside a job that holds one. Both reads pass
+`-c safe.directory='*'`, so a clone whose ownership was disturbed by an earlier root-run `git` cannot quietly
+demote the round to step 3.
+
+### Injection, and the one writable path
+
+`ob-implement` and `ob-respond` render two placeholders per round:
+
+- `{{LEARNINGS}}` — a block placeholder, replaced by the resolved file verbatim under a `## Learnings` heading
+  that tells the agent to read it first and treat every entry as a hard rule. "What to do" item 8 says the
+  same from the other side: obey them, and when a learning and a story card genuinely conflict, stop and
+  report the conflict rather than pick a winner.
+- `{{LEARNINGS_OUT}}` — a scalar naming `state/<owner>__<repo>__<slug>/rounds/<NNN>/learnings-proposed.md`,
+  which the wrapper truncates to empty before the round starts.
+
+That second file is the **only** path outside the worktree a round may write (hard rule 7 in both prompts,
+§6). The alternatives were no capture at all — the knowledge dies with the round that paid for it — or a
+writable directory, which is a foothold in the control plane for a model running `--approval-mode yolo`. One
+named file avoids both, and it is cheap for four reasons: the wrapper names it, so nothing has to be
+discovered or guessed; it is per-round, so it cannot accumulate; it starts empty, so whatever is in it is
+unambiguously this round's; and it is not code — nothing sources it, executes it, or configures anything from
+it. It is `cat`-ed into a markdown document and read by a human. Its worst case is noise in a pull request.
+
+### Cheap to propose, deliberate to accept
+
+Capture is asymmetric on purpose. Proposing costs the agent one append and no ceremony — the prompt does not
+even ask it to number the entry — and the four tests a candidate must pass are stated rather than enforced: it
+would have changed how the round worked had it been known at the start, it is true beyond this repository and
+this story, it was actually observed with a symptom that can be quoted, and it is not already an entry. The
+prompt also says most rounds should leave the file empty, so an empty file is a correct outcome rather than a
+missed one.
+
+Acceptance is the expensive side. `ob_learnings_proposed` counts any non-blank line as a proposal; when there
+is one, the round appends a **Learnings proposed this round** section to the slug's `worklog.md` and commits
+it on the work branch, so it arrives in the pull request the reviewer is already reading. A human — or the
+reviewer acting for one — copies the entry into `LEARNINGS.md` and pushes. Nothing the agent writes takes
+effect on its own.
+
+That asymmetry mirrors an asymmetry in cost. A missed learning is bounded: you pay for it a second time and
+write it down then. A wrong learning is not, because `LEARNINGS.md` is injected verbatim into every future
+round of every repository — one confident, wrong imperative degrades all of them at once, and no test can
+catch it, because it is prose. So the write path is free and the commit path goes through the review gate that
+already exists.
+
+**The gate itself had to be exercised.** An earlier `ob_learnings_proposed` skipped lines beginning with `#`,
+treating them as comments — and the entry shape the prompt asks for is a markdown heading, `### N. rule`. It
+therefore discarded every real proposal and logged nothing, in a code path whose most common *correct* outcome
+is "nothing proposed". That is a bug with no symptom, and it was found by running the gate against a real
+proposal on the instance rather than by reading it.
+
+## 4. One full cycle
 
 ```mermaid
 sequenceDiagram
@@ -299,7 +406,7 @@ reviewer has the PR and once after the merge. Nothing but the instance ever stop
 leaving `U` is a human decision — plan, tighten the cards, review, merge — and the whole right-hand branch
 of that `alt` runs whether or not a laptop is open.
 
-## 4. Design decisions
+## 5. Design decisions
 
 Each of these was a real fork in the road. The tradeoff is named, not hidden.
 
@@ -420,6 +527,9 @@ PR that you can read, and it is the first thing to look at when the agent goes s
 the model can repeat a mistake the worklog failed to record. At $0.09/Mtok input that is cents, and it
 makes worklog discipline a load-bearing instruction in the implementer prompt rather than a nicety.
 
+The worklog is the per-slug half of the design's memory. The cross-repo half is `LEARNINGS.md` in the control
+repository, injected into the same prompt from the same fresh session (§3).
+
 ### Always-on with idle auto-stop instead of ephemeral instances
 
 One long-lived instance that stops itself after `OPENBUILDER_IDLE_STOP_MINUTES` of nothing to do, rather
@@ -458,7 +568,7 @@ what `OPENBUILDER_MAX_ATTEMPTS` and the `openbuilder:blocked` label are for — 
 give up loudly rather than to grind. Story-card quality carries the whole load: a vague card produces a
 vague PR, and this is the design's real dependency on human effort.
 
-## 5. Security model
+## 6. Security model
 
 ### What is enforced
 
@@ -501,6 +611,26 @@ vague PR, and this is the design's real dependency on human effort.
   `anthropic`, `openai`, `google`, `ollama`, `llama.cpp` and `lm-studio`, so a stray config or an
   environment variable cannot make the instance talk to a model you did not intend to pay for. The
   implementer agent's tool list excludes `browser` and `web_search`.
+- **The agent may write in exactly one place outside its worktree.** Hard rule 7 in both prompts permits
+  `{{LEARNINGS_OUT}}` — one per-round, non-code file the wrapper creates empty and names for it (§3) — and
+  nothing else anywhere under `/opt/openbuilder`. The guardrails hook backs up the half of that which matters
+  most: any write under `/opt/openbuilder/etc` is blocked outright.
+- **No employer identifiers, by instruction and by check.** Hard rule 8 in both prompts forbids writing the
+  name of a company, a client or an employer, an internal hostname, a cloud account number or a work email
+  address into code, commits, comments or the final message — and says why: this repository is public *and*
+  the round is processed by a third-party model, so such an identifier has left your control twice over the
+  moment it is typed. A prompt is a request, so `local/bin/ob-scrub-check` is the mechanical half. It matches
+  an extended-regex deny list against the tracked working tree (default), the index (`--staged`) or every
+  commit reachable from `git rev-list --all` (`--history`), reports each hit as `path — N match(es)`, and
+  exits 1. **The deny list is not in the repository**, because the patterns are themselves the sensitive
+  part — a list of your employer's hostnames is precisely the file you must not publish. It comes from
+  `$OPENBUILDER_SCRUB_DENY` or a gitignored `.scrub-deny` at the repo root; with neither present the tool
+  prints how to create one and exits 0, so it never blocks a fresh clone. It never prints the matching text,
+  only a path and a count, because a check that echoes the string it protects has leaked it to the terminal,
+  the scrollback and eventually a log. On a hit it also states the real remedy: a match already in published
+  history needs history rewritten, not just another commit. `make scrub` runs the worktree and history modes;
+  `make lint` shellchecks `local/bin/*` along with the rest. Like the guardrails hook it is a denylist — it
+  catches the identifiers you thought of, not the ones you did not.
 - **Fail loud.** Every failure path exits non-zero, adds `openbuilder:blocked`, and posts a PR comment
   with the log tail. Attempts are counted and capped at `OPENBUILDER_MAX_ATTEMPTS`.
 - **A human merges.** Nothing in the system can land code on a default branch. That is the last gate and
