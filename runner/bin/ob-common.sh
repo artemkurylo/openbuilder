@@ -89,6 +89,10 @@ ob_load_env() {
   : "${OPENBUILDER_REPOS:=}"
   : "${OPENBUILDER_CONTROL_REPO:=artemkurylo/openbuilder}"
   : "${OPENBUILDER_GH_HOST:=github.com}"
+  # OPENBUILDER_GH_HOST is not a setting; any other value is a misconfigured
+  # instance, not a supported deployment (R11).
+  [[ "${OPENBUILDER_GH_HOST}" == "github.com" ]] ||
+    ob_die "OPENBUILDER_GH_HOST is '${OPENBUILDER_GH_HOST}'; openbuilder supports github.com only"
   : "${OPENBUILDER_MODEL:=openrouter/deepseek/deepseek-v4-flash-0731}"
   : "${OPENBUILDER_SMOL_MODEL:=openrouter/deepseek/deepseek-v4-flash-0731}"
   : "${OPENBUILDER_MAX_RUNTIME:=45m}"

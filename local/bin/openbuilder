@@ -24,6 +24,11 @@
 #   OPENBUILDER_TARGET_REPO   Default <owner>/<repo> for `status`.
 #   OPENBUILDER_WORKSPACE     Where target repos are cloned.
 #                             Default: $HOME/.openbuilder/repos
+#   OPENBUILDER_OWNER         Comma-separated allowlist of owners this CLI may
+#                             touch; defaults to artemkurylo. An owner not in
+#                             the list is refused before any network call.
+#   OPENBUILDER_GH_HOST       Asserted, not configurable: only github.com is
+#                             supported. Any other value refuses startup.
 #
 # `./.openbuilder.local` (and `<repo-root>/.openbuilder.local`) is sourced when
 # present so you can keep those values next to the checkout. That file is
@@ -100,6 +105,7 @@ ob_load_local_config() {
     local saved_repo=${OPENBUILDER_TARGET_REPO:-}
     local saved_workspace=${OPENBUILDER_WORKSPACE:-}
     local saved_profile=${OPENBUILDER_AWS_PROFILE:-}
+    local saved_owner=${OPENBUILDER_OWNER:-}
     local candidate previous=''
 
     for candidate in "$PWD/.openbuilder.local" "$OB_ROOT/.openbuilder.local"; do
@@ -117,12 +123,20 @@ ob_load_local_config() {
     [[ -n $saved_repo ]] && OPENBUILDER_TARGET_REPO=$saved_repo
     [[ -n $saved_workspace ]] && OPENBUILDER_WORKSPACE=$saved_workspace
     [[ -n $saved_profile ]] && OPENBUILDER_AWS_PROFILE=$saved_profile
+    [[ -n $saved_owner ]] && OPENBUILDER_OWNER=$saved_owner
 
     OPENBUILDER_INSTANCE_ID=${OPENBUILDER_INSTANCE_ID:-}
     OPENBUILDER_REGION=${OPENBUILDER_REGION:-}
     OPENBUILDER_TARGET_REPO=${OPENBUILDER_TARGET_REPO:-}
     OPENBUILDER_WORKSPACE=${OPENBUILDER_WORKSPACE:-$HOME/.openbuilder/repos}
     OPENBUILDER_AWS_PROFILE=${OPENBUILDER_AWS_PROFILE:-}
+    OPENBUILDER_OWNER=${OPENBUILDER_OWNER:-artemkurylo}
+
+    # OPENBUILDER_GH_HOST is an assertion, not a setting: openbuilder is a
+    # personal-account tool and github.com is the only supported host (R11).
+    OPENBUILDER_GH_HOST=${OPENBUILDER_GH_HOST:-github.com}
+    [[ $OPENBUILDER_GH_HOST == github.com ]] ||
+        ob_die "OPENBUILDER_GH_HOST is '$OPENBUILDER_GH_HOST'; openbuilder supports github.com only"
     return 0
 }
 
@@ -242,8 +256,17 @@ ob_repo_arg() {
 }
 
 ob_validate_repo() {
-    [[ $1 =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] ||
-        ob_die "not a valid <owner>/<repo>: $1"
+    local repo=$1 owner entry
+    local -a allowed=()
+    [[ $repo =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] ||
+        ob_die "not a valid <owner>/<repo>: $repo"
+    owner=${repo%%/*}
+    IFS=',' read -r -a allowed <<<"$OPENBUILDER_OWNER"
+    for entry in "${allowed[@]}"; do
+        [[ -n $entry ]] || continue
+        [[ $entry == "$owner" ]] && return 0
+    done
+    ob_die "refusing $repo: owner '$owner' is not in OPENBUILDER_OWNER ($OPENBUILDER_OWNER)"
 }
 
 ob_validate_slug() {
@@ -422,24 +445,33 @@ ob_ensure_running() {
 # GitHub helpers
 # ---------------------------------------------------------------------------
 
+# ob_gh <args...> — run the GitHub CLI pinned to github.com. Its host otherwise
+# comes from the ambient GH_HOST or the cwd's git remote, and this laptop's
+# CLI is authenticated to more than one host. openbuilder is a personal-account
+# tool; the host must not come from the environment (R11), so pin it in the
+# child environment only and return the CLI's own exit status.
+ob_gh() {
+    GH_HOST=github.com gh "$@"
+}
+
 ob_ensure_labels() {
     local repo=$1 spec name color desc
     ob_need gh
     for spec in "${OB_LABELS[@]}"; do
         IFS='|' read -r name color desc <<<"$spec"
-        if gh label create "$name" \
+        if ob_gh label create "$name" \
             --repo "$repo" --color "$color" --description "$desc" >/dev/null 2>&1; then
             ob_info "created label $name"
         else
             # Already there (or a color drift) — converge, never fail.
-            gh label edit "$name" \
+            ob_gh label edit "$name" \
                 --repo "$repo" --color "$color" --description "$desc" >/dev/null 2>&1 || true
         fi
     done
 }
 
 ob_pr_labels() {
-    gh pr view "$2" --repo "$1" --json labels --jq '.labels[].name' 2>/dev/null || true
+    ob_gh pr view "$2" --repo "$1" --json labels --jq '.labels[].name' 2>/dev/null || true
 }
 
 # ob_pr_relabel <repo> <pr> <add> <remove-csv>
@@ -465,16 +497,28 @@ ob_pr_relabel() {
     if [[ ${#args[@]} -eq 0 ]]; then
         return 0
     fi
-    gh pr edit "$pr" --repo "$repo" "${args[@]}" >/dev/null
+    ob_gh pr edit "$pr" --repo "$repo" "${args[@]}" >/dev/null
 }
 
 ob_default_branch() {
-    gh repo view "$1" --json defaultBranchRef --jq '.defaultBranchRef.name'
+    ob_gh repo view "$1" --json defaultBranchRef --jq '.defaultBranchRef.name'
 }
 
 # ---------------------------------------------------------------------------
 # Local clone / omp asset helpers
 # ---------------------------------------------------------------------------
+
+# ob_assert_origin_host <dir> — refuse to touch a clone whose origin points
+# anywhere but github.com. A workspace directory reused from another host would
+# otherwise receive a fetch (ob_ensure_clone) or a push (cmd_dispatch) against
+# that host's remote; this assertion runs before either network call.
+ob_assert_origin_host() {
+    local dir=$1 url
+    url=$(git -C "$dir" remote get-url origin 2>/dev/null) ||
+        ob_die "clone at $dir has no 'origin' remote"
+    [[ $url =~ ^(https://github\.com/|git@github\.com:|ssh://git@github\.com/) ]] ||
+        ob_die "refusing clone $dir: origin is $url, which is not on github.com"
+}
 
 ob_clone_dir() {
     printf '%s/%s\n' "$OPENBUILDER_WORKSPACE" "$(ob_repo_key "$1")"
@@ -485,12 +529,13 @@ ob_ensure_clone() {
     dir=$(ob_clone_dir "$repo")
     ob_need git gh
     if [[ -d $dir/.git ]]; then
+        ob_assert_origin_host "$dir"
         ob_info "fetching $repo into $dir"
         git -C "$dir" fetch --prune --quiet origin
     else
         mkdir -p "$(dirname "$dir")"
         ob_info "cloning $repo into $dir"
-        gh repo clone "$repo" "$dir" -- --quiet
+        ob_gh repo clone "$repo" "$dir" -- --quiet
     fi
     printf '%s\n' "$dir"
 }
@@ -679,6 +724,7 @@ cmd_dispatch() {
     dir=$(ob_clone_dir "$repo")
     [[ -d $dir/.git ]] ||
         ob_die "no local clone at $dir — run '$OB_PROG plan $repo $slug' first"
+    ob_assert_origin_host "$dir"
     branch=$(ob_plan_branch "$slug")
     backlog=.openbuilder/backlog/$slug
 
@@ -747,7 +793,7 @@ cmd_review() {
 
     local dir head
     dir=$(ob_ensure_clone "$repo")
-    head=$(gh pr view "$pr" --repo "$repo" --json headRefName --jq '.headRefName') ||
+    head=$(ob_gh pr view "$pr" --repo "$repo" --json headRefName --jq '.headRefName') ||
         ob_die "cannot read pull request #$pr in $repo"
 
     if git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$head"; then
@@ -805,7 +851,7 @@ cmd_approve() {
     ob_pr_relabel "$repo" "$pr" "$OB_LABEL_PREFIX:approved" \
         "$OB_LABEL_PREFIX:awaiting-review,$OB_LABEL_PREFIX:changes-requested,$OB_LABEL_PREFIX:queued,$OB_LABEL_PREFIX:in-progress,$OB_LABEL_PREFIX:blocked"
 
-    gh pr comment "$pr" --repo "$repo" --body \
+    ob_gh pr comment "$pr" --repo "$repo" --body \
         "**openbuilder: approved.** Reviewed with \`$OB_OPUS_MODEL\`. The remote agent will stop touching this branch. A human may merge." >/dev/null
 
     ob_info "$repo#$pr labelled $OB_LABEL_PREFIX:approved — the instance will ignore it from now on"
@@ -824,7 +870,7 @@ cmd_request_changes() {
     ob_pr_relabel "$repo" "$pr" "$OB_LABEL_PREFIX:changes-requested" \
         "$OB_LABEL_PREFIX:awaiting-review,$OB_LABEL_PREFIX:approved,$OB_LABEL_PREFIX:queued"
 
-    gh pr comment "$pr" --repo "$repo" --body \
+    ob_gh pr comment "$pr" --repo "$repo" --body \
         "**openbuilder: changes requested.** See the review comments above. The remote agent will pick this up within 60s, start a fresh session against the existing worktree and push another round." >/dev/null
 
     # The instance only reacts while it is up.
@@ -844,9 +890,9 @@ cmd_status() {
     ob_need gh jq
 
     local plan_refs work_refs prs rows
-    plan_refs=$(gh api "repos/$repo/git/matching-refs/heads/$OB_BRANCH_PREFIX/plan/" --paginate 2>/dev/null || printf '[]')
-    work_refs=$(gh api "repos/$repo/git/matching-refs/heads/$OB_BRANCH_PREFIX/work/" --paginate 2>/dev/null || printf '[]')
-    prs=$(gh pr list --repo "$repo" --state all --limit 200 \
+    plan_refs=$(ob_gh api "repos/$repo/git/matching-refs/heads/$OB_BRANCH_PREFIX/plan/" --paginate 2>/dev/null || printf '[]')
+    work_refs=$(ob_gh api "repos/$repo/git/matching-refs/heads/$OB_BRANCH_PREFIX/work/" --paginate 2>/dev/null || printf '[]')
+    prs=$(ob_gh pr list --repo "$repo" --state all --limit 200 \
         --json number,headRefName,labels,updatedAt,state 2>/dev/null || printf '[]')
 
     rows=$(jq -rn \
