@@ -1,18 +1,22 @@
 ---
 id: story-05-reviewer-rubric-r12
 title: Teach the reviewer rubric which merges R12 permits, and which stay blocking
-size: S
+size: M
 depends_on: []
 files:
   - agent/local/agents/reviewer.md
   - agent/local/agents/skills/review-openbuilder-pr/SKILL.md
+  - agent/local/agents/skills/openbuilder-workflow/SKILL.md
+  - docs/workflow.md
 acceptance:
   - "`grep -cF 'automatically blocking' agent/local/agents/reviewer.md` prints 1, and the surrounding bullet names both the permitted reviewer path and the still-forbidden implementer path"
   - "`grep -cF 'A human merges' agent/local/agents/skills/review-openbuilder-pr/SKILL.md` prints 0 — every such claim is replaced by wording that survives R12"
   - "`grep -nF 'gh pr merge' agent/local/agents/skills/review-openbuilder-pr/SKILL.md` still reports the line under the remote agent's prohibitions, and that line still forbids it"
   - "both files name PRD R12 and RFC §3.8 at least once: `grep -cF 'R12' agent/local/agents/reviewer.md` and the same for the skill each print 1 or more"
   - "the `openbuilder:approved` label description in the skill's table and in its `gh label create` call say the same thing as `local/bin/openbuilder`'s `OB_LABELS` entry — compare the three strings and they agree word for word"
-  - "no file outside the two listed above is modified: `git diff --name-only` prints exactly those two paths"
+  - "`grep -cF 'human-invoked' agent/local/agents/skills/openbuilder-workflow/SKILL.md` still finds Stage 7's merge sentence, and that sentence now names both authorised forms — `openbuilder land` and an authorised `--auto-merge`"
+  - "`docs/workflow.md`'s `land` row names both forms too, and `grep -cF 'the only' docs/workflow.md` does not appear in any sentence about merging"
+  - "no file outside the four listed above is modified: `git diff --name-only` prints exactly those four paths"
 ---
 
 ## Context
@@ -43,7 +47,11 @@ be.
 
 ## Change
 
-### 1. `agent/local/agents/reviewer.md`, the git-boundaries bullet (currently lines 85-86)
+### 1. `agent/local/agents/reviewer.md`, the git-boundaries bullet
+
+**Find it by content, never by line number.** `grep -n 'automatically blocking' agent/local/agents/reviewer.md`
+locates it. Every line number in this card would be wrong: `plan-workflow-04-agents` inserted six lines
+above this bullet after the card was written, and `plan-workflow-05-cli` may shift it again.
 
 Replace the single bullet with one that draws the line by execution context, keeping the phrase
 `automatically blocking` (other acceptance items and the skill grep for it):
@@ -72,18 +80,35 @@ position, because it is one.
 
 Four edits, no more:
 
-- `:15` — `openbuilder:approved` no longer means "A human merges". It means the instance stops touching
+Locate each by content — `grep -nF` on the quoted phrase — not by the line numbers below, which are
+from before slug 04 landed and are already stale:
+
+- `A human merges` (was `:15`) — `openbuilder:approved` no longer means "A human merges". It means the instance stops touching
   the pull request forever, and the merge is then either a human's `openbuilder land` or an authorised
   `--auto-merge`. Say that.
-- `:290` and `:328` — the label description and the table row. Both must match `OB_LABELS` in
+- the `gh label create` description and the label table row (were `:290`, `:328`). Both must match `OB_LABELS` in
   `local/bin/openbuilder` word for word, because `story-04` changes that string and the rubric's own
   "frozen names hold" rule (`reviewer.md:100-104`) greps for agreement between them. Read the array
   first and copy from it; do not invent wording and do not edit `local/bin/openbuilder` from this card.
-- `:339` — the **remote agent's** prohibition. It stays a prohibition. Add only the clause that makes
+- the **remote agent's** prohibition, the bullet containing `no merge queue` (was `:339`). It stays a prohibition. Add only the clause that makes
   it survive R12: no merge, no `--auto`, no merge queue **from the instance**, and the existence of
   `--auto-merge` on the laptop is not a licence for the remote agent to merge anything, ever.
 
-### 4. Nothing else
+### 4. `openbuilder-workflow/SKILL.md` and `docs/workflow.md`
+
+Both describe the merge gate as though `land` were the only way code reaches the default branch. Stage 7
+of the skill says the merge gate "is `openbuilder land`, human-invoked"; `docs/workflow.md` carries the
+same claim in its command table. After R12 there are **two** authorised forms and exactly two:
+
+- `openbuilder land` — a human, with the typed confirmation;
+- `openbuilder review --watch --auto-merge` — the reviewer, under all seven conditions, on a per-epic
+  `approvals.automerge` a human recorded.
+
+Say that in both files, in one sentence each, and keep the surrounding prose. Do not restate the seven
+conditions in either file — they live in the PRD and the RFC, and a third copy would drift. Do not add a
+new stage: auto-merge is Stage 7 performed by the reviewer, not a Stage 8.
+
+### 5. Nothing else
 
 You are not implementing auto-merge in this card, not editing `local/bin/openbuilder`, and not touching
 `runner/prompts/implement.md` or `agent/remote/agents/implementer.md` — those forbid the implementer from

@@ -35,7 +35,9 @@ because this is the slug that adds the fourth `record` target and therefore alre
 
 Five stories: two small ones in `local/bin/ob-gate` that make the authorization recordable and stop
 the pointer rewinding, two in `local/bin/openbuilder` split on the line between *checking* and
-*merging*, and one that repairs the reviewer rubric R12 makes false.
+*merging*, and one that repairs every document R12 makes false — the reviewer rubric, the review
+skill, the workflow skill's Stage 7 and `docs/workflow.md`. That last story grew from S to M when
+`plan-workflow-04-agents` landed two more files claiming `land` is the only way anything merges.
 
 **Why the merge-result check is its own story and its own subcommand.** RFC §3.8.2 conditions 4, 5
 and 6 need a scratch worktree, a trial merge, two `make` targets and an unconditional teardown; they
@@ -135,7 +137,7 @@ only.
 | story-02-gate-record-automerge | Add `ob-gate record <epic> automerge` and show it in `ob-gate show` | S | [] |
 | story-03-merge-check | Add `openbuilder merge-check` for lint and scrub on the merge result | M | [] |
 | story-04-review-auto-merge | Add `review --watch --auto-merge` with R12's seven conditions | M | [story-02-gate-record-automerge, story-03-merge-check] |
-| story-05-reviewer-rubric-r12 | Teach the reviewer rubric which merges R12 permits, and which stay blocking | S | [] |
+| story-05-reviewer-rubric-r12 | Teach the reviewer rubric which merges R12 permits, and which stay blocking | M | [] |
 
 `story-04` genuinely needs both parents: it calls `ob_merge_check` for conditions 4–6, and its
 condition-1 refusal names `ob-gate record <epic> automerge`, which must exist for the refusal to be
