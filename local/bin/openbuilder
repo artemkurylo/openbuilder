@@ -592,7 +592,8 @@ usage: openbuilder <command> [args]
   help                              this table
 
 environment: OPENBUILDER_INSTANCE_ID, OPENBUILDER_REGION, OPENBUILDER_AWS_PROFILE,
-             OPENBUILDER_TARGET_REPO, OPENBUILDER_WORKSPACE
+             OPENBUILDER_TARGET_REPO, OPENBUILDER_WORKSPACE,
+             OPENBUILDER_OWNER, OPENBUILDER_GH_HOST
              (./.openbuilder.local is sourced when present; it is gitignored)
 EOF
 }
