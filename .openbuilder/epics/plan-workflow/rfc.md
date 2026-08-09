@@ -325,6 +325,35 @@ the PR head into a fresh checkout of the default branch, then `make lint` and `m
 worktree. The worktree is removed on every exit path, success or failure. Nothing is pushed from it,
 ever.
 
+### 3.8.3.1 Both checks pass vacuously by default, and must be forced not to
+
+A fresh worktree does not inherit what git does not track, and neither check fails when its tooling is
+missing — both report success. Measured on this laptop, 2026-08-09:
+
+| run | exit | output |
+|---|---|---|
+| `make scrub` in a scratch worktree | `0` | `ob-scrub-check: no deny list at <wt>/.scrub-deny; nothing to check.` |
+| same, with `OPENBUILDER_SCRUB_DENY` pointing at the operator's list | `0` | `ob-scrub-check: clean (history).` |
+
+The deny list is **gitignored on purpose** (`ob-scrub-check:26`, `:43`), so it is absent from every
+scratch worktree, on every machine, always. Condition 6 as first written would therefore have checked
+nothing while reporting a pass. `make lint` has the same shape for a different reason: it prints
+`shellcheck not installed - skipping lint.` and exits `0` when the linter is absent (`Makefile:80`,
+LEARNINGS 19).
+
+So the auto-merge path must, before it accepts either result:
+
+- export `OPENBUILDER_SCRUB_DENY` as an absolute path to the operator's deny list outside the
+  worktree, and refuse — `scrub deny list unreadable at <path>; refusing to treat a skipped check as
+  a pass` — when it is not readable;
+- require `shellcheck` on `PATH`, and refuse with `lint tool unavailable; refusing to treat a skipped
+  check as a pass`;
+- assert the **output** of each check, not its exit status: scrub must say `clean`, and a skip must
+  never be accepted.
+
+This is LEARNINGS 18 and 19 arriving together in the one place where believing an exit code merges
+code without reading it.
+
 ### 3.8.4 Attribution and halting
 
 The merge is performed with the **App installation token**, so GitHub records `openbuilder-bot` as
