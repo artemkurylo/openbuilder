@@ -549,7 +549,7 @@ ob_install_local_assets() {
     local dir=$1
     local exclude="$dir/.git/info/exclude"
 
-    mkdir -p "$dir/.omp/agents" "$dir/.omp/hooks/pre"
+    mkdir -p "$dir/.omp/agents" "$dir/.omp/hooks/pre" "$dir/.omp/commands"
     if [[ -d $OB_ROOT/agent/local/agents ]]; then
         cp -R "$OB_ROOT/agent/local/agents/." "$dir/.omp/agents/"
     else
@@ -557,6 +557,11 @@ ob_install_local_assets() {
     fi
     if [[ -f $OB_ROOT/agent/hooks/pre/guardrails.ts ]]; then
         cp "$OB_ROOT/agent/hooks/pre/guardrails.ts" "$dir/.omp/hooks/pre/guardrails.ts"
+    fi
+    if [[ -d $OB_ROOT/agent/local/commands ]]; then
+        cp -R "$OB_ROOT/agent/local/commands/." "$dir/.omp/commands/"
+    else
+        ob_warn "missing $OB_ROOT/agent/local/commands — /openbuilder-plan will not be available in the session"
     fi
 
     mkdir -p "$(dirname "$exclude")"
@@ -568,6 +573,25 @@ ob_install_local_assets() {
 
 ob_plan_branch() { printf '%s/plan/%s\n' "$OB_BRANCH_PREFIX" "$1"; }
 ob_work_branch() { printf '%s/work/%s\n' "$OB_BRANCH_PREFIX" "$1"; }
+ob_design_branch() { printf '%s/design/%s\n' "$OB_BRANCH_PREFIX" "$1"; }
+
+# ob_gate <clone-dir> <args...> — run local/bin/ob-gate inside the clone, so its
+# own `git rev-parse --show-toplevel` resolves to the target repository. The
+# gate's exit code is the interface (RFC §3.4): 0 intact, 1 operational refusal,
+# 2 usage, 3 void, 4 absent. Returned unchanged; no logging here.
+ob_gate() {
+    local dir=$1
+    shift
+    ( cd "$dir" && "$OB_BIN_DIR/ob-gate" "$@" )
+}
+
+# ob_need_gate — refuse when the gate is missing. There is no graceful
+# degradation: every call site reads its exit code, so absence must be a dead
+# stop with a message that names the missing piece.
+ob_need_gate() {
+    [[ -x $OB_BIN_DIR/ob-gate ]] ||
+        ob_die "local/bin/ob-gate is missing or not executable at $OB_BIN_DIR/ob-gate — the epic gate cannot run without it"
+}
 
 # ---------------------------------------------------------------------------
 # help
@@ -577,7 +601,7 @@ ob_command_table() {
     cat <<'EOF'
 usage: openbuilder <command> [args]
 
-  plan <owner/repo> <slug>          scaffold a backlog and plan it with Opus 5
+  plan <owner/repo> <epic>          design branch + Opus 5 workflow session for an epic
   dispatch <owner/repo> <slug>      commit + push the plan branch, hand it to the instance
   review <owner/repo> <pr>          review a pull request with Opus 5
   approve <owner/repo> <pr>         label a pull request approved
@@ -608,101 +632,98 @@ cmd_help() {
 # ---------------------------------------------------------------------------
 
 cmd_plan() {
-    local usage="usage: $OB_PROG plan <owner/repo> <slug>"
+    local usage="usage: $OB_PROG plan <owner/repo> <epic>"
     [[ $# -eq 2 ]] || ob_die "$usage"
-    local repo=$1 slug=$2
+    local repo=$1 epic=$2
     ob_validate_repo "$repo"
-    ob_validate_slug "$slug"
+    ob_validate_slug "$epic"
     ob_need git gh omp
+    ob_need_gate
 
-    local dir branch base backlog
+    local dir branch base current rc
     dir=$(ob_ensure_clone "$repo")
-    branch=$(ob_plan_branch "$slug")
+    branch=$(ob_design_branch "$epic")
     base=$(ob_default_branch "$repo")
+    current=$(git -C "$dir" rev-parse --abbrev-ref HEAD)
 
-    if git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
-        ob_info "checking out existing plan branch $branch"
+    # Exactly three cases, in this order: already on the design branch (no git
+    # command at all — `checkout -B --track` would reset the branch to origin's
+    # tip and discard the session's uncommitted work), dirty tree (refuse), and
+    # existing-or-new branch. Push only on creation, never on checkout.
+    if [[ $current == "$branch" ]]; then
+        ob_info "already on design branch $branch"
+    elif ! git -C "$dir" diff --quiet || ! git -C "$dir" diff --cached --quiet; then
+        ob_die "$dir has uncommitted changes on branch $current; commit or stash them before switching to $branch
+  git -C $dir status --short"
+    elif git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+        ob_info "checking out existing design branch $branch"
         git -C "$dir" checkout -B "$branch" --track "origin/$branch" --quiet
     else
-        ob_info "creating plan branch $branch from origin/$base"
+        ob_info "creating design branch $branch from origin/$base"
         git -C "$dir" checkout -B "$branch" "origin/$base" --quiet
-    fi
-
-    backlog=$dir/.openbuilder/backlog/$slug
-    mkdir -p "$backlog"
-    if [[ ! -f $backlog/plan.md ]]; then
-        ob_write_plan_scaffold "$backlog/plan.md" "$repo" "$slug" "$base"
-        ob_info "scaffolded .openbuilder/backlog/$slug/plan.md"
-    else
-        ob_info "reusing existing .openbuilder/backlog/$slug/plan.md"
+        git -C "$dir" push --quiet --set-upstream origin "$branch"
+        ob_info "pushed $branch to origin"
     fi
 
     ob_install_local_assets "$dir"
 
+    # Verify every approval already recorded for the epic. Absent is normal
+    # before the first gate (the session starts intake); void is fatal, because
+    # the sessions would resume from unapproved text.
+    if [[ ! -f $dir/.openbuilder/epics/$epic/state.json ]]; then
+        ob_info "no epic directory for $epic yet — the session will start intake"
+    else
+        rc=0
+        ob_gate "$dir" verify "$epic" --all || rc=$?
+        case $rc in
+        0)
+            ob_info "approvals for epic $epic verified"
+            ;;
+        3)
+            ob_die "an approval for epic $epic is void: an approved artifact changed after it was approved.
+  Inspect it:   (cd $dir && $OB_BIN_DIR/ob-gate show $epic)
+  Re-approve:   (cd $dir && $OB_BIN_DIR/ob-gate record $epic <stage>)"
+            ;;
+        4)
+            ob_info "no approvals recorded for epic $epic yet"
+            ;;
+        2)
+            ob_die "ob-gate rejected 'verify $epic --all' as a usage error (exit 2); the CLI and ob-gate disagree about the command surface"
+            ;;
+        *)
+            ob_die "ob-gate verify $epic --all failed with exit $rc"
+            ;;
+        esac
+    fi
+
     local seed
     seed=$(
         cat <<EOF
-You are running as the openbuilder planner for $repo, slug \`$slug\`.
+You are running as the openbuilder workflow session for $repo, epic \`$epic\`.
 
-Delegate the planning work to the \`planner\` agent (task tool, agent: "planner")
-and use the \`write-backlog\` skill for the story-card format.
+Load the \`openbuilder-workflow\` skill and resume epic \`$epic\`. Do not ask me what
+to do first — the skill and the recorded stage decide that.
 
-Deliverables, all inside \`.openbuilder/backlog/$slug/\` in this checkout
-(current branch: \`$branch\`, base branch: \`$base\`):
+The epic's durable state is \`.openbuilder/epics/$epic/\` on the current branch
+(\`$branch\`): intake.md, prd.md, rfc.md, state.json. Read state.json first and
+continue at the stage it names. If that directory does not exist this is a new
+epic: run \`$OB_BIN_DIR/ob-gate init $epic --repo $repo\` and start intake.
 
-1. \`plan.md\` — replace the scaffold. The first \`# \` heading becomes the pull
-   request title, so make it a real, specific title.
-2. \`story-<NN>-<name>.md\` — one card per story, numbered 01, 02, ... in
-   dependency order, matching the contract in the openbuilder repo's
-   \`backlog/SCHEMA.md\` (frontmatter: id, title, size, depends_on, files,
-   acceptance; body sections: ## Context, ## Change, ## Acceptance,
-   ## Out of scope).
+\`$OB_BIN_DIR/ob-gate\` is the only thing that may write state.json or record an
+approval. Never edit state.json by hand, and never record an approval I did not
+give in this session.
 
-Read the actual code in this repository before writing any card. Cards are
-consumed by a smaller model with no access to this conversation, so every card
-must be self-contained: exact file paths, exact identifier names, explicit
-acceptance criteria, explicit non-goals.
-
-Do not commit, do not push, do not create branches. \`openbuilder dispatch\`
-does that. Stop and ask when a requirement is genuinely missing.
+Never create or push a branch under \`openbuilder/plan/\` — \`openbuilder dispatch\`
+does that, and it is the gate that spends money.
 EOF
     )
 
-    ob_info "launching omp planner ($OB_OPUS_MODEL) in $dir"
+    ob_info "launching omp workflow session ($OB_OPUS_MODEL) in $dir"
     GH_HOST=github.com GH_REPO="$repo" exec omp \
         --cwd "$dir" \
         --model "$OB_OPUS_MODEL" \
-        --append-system-prompt "openbuilder planner session for $repo slug $slug. Produce backlog story cards under .openbuilder/backlog/$slug/. Never commit, push, or merge." \
+        --append-system-prompt "openbuilder workflow session for $repo epic $epic on branch $branch. Artifacts live in .openbuilder/epics/$epic/. Only local/bin/ob-gate writes state.json. Never push a branch under openbuilder/plan/, never merge." \
         "$seed"
-}
-
-ob_write_plan_scaffold() {
-    local path=$1 repo=$2 slug=$3 base=$4
-    cat >"$path" <<EOF
-# $slug
-
-- repo: \`$repo\`
-- slug: \`$slug\`
-- base branch: \`$base\`
-- plan branch: \`$(ob_plan_branch "$slug")\`
-- work branch: \`$(ob_work_branch "$slug")\`
-
-## Goal
-
-_Replace this section with the outcome you want, in one paragraph._
-
-## Context
-
-_What exists today, and which parts of the repository are involved._
-
-## Stories
-
-_One line per story card in this directory, in dependency order._
-
-## Out of scope
-
-_What the implementer must not touch._
-EOF
 }
 
 # ---------------------------------------------------------------------------

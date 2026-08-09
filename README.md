@@ -345,12 +345,16 @@ and start the instance. The same Terraform output carries the matching `aws logs
 openbuilder plan you/your-repo healthz-endpoint
 ```
 
-Opus 5 runs locally with the planner agent and scaffolds
-`.openbuilder/backlog/healthz-endpoint/` — a `plan.md` plus one `story-NN-*.md` per slice. Read them.
-Edit them. This is the highest-leverage five minutes in the whole loop; the remote agent will do exactly
-what these cards say and nothing more. The contract is [backlog/SCHEMA.md](backlog/SCHEMA.md), and
-[backlog/example/plan.md](backlog/example/plan.md) plus its story card is a filled-in pair to compare
-against.
+`openbuilder plan` works on an **epic**, not a slug. It prepares the clone, holds
+`openbuilder/design/healthz-endpoint` (invisible to the instance's poller), verifies every approval
+already recorded for the epic, and launches one Opus 5 workflow session on that branch. The session
+runs intake → PRD → RFC → backlog, with a human approval gate at each of the last three — nothing you
+approved in words can silently change behind your back, because `ob-gate` re-checks the recorded bytes.
+The story cards land under `.openbuilder/backlog/<slug>/` in the clone, and the contract is
+[backlog/SCHEMA.md](backlog/SCHEMA.md), with [backlog/example/plan.md](backlog/example/plan.md) plus its
+story card as a filled-in pair to compare against. Once the cards exist, you read and edit them — this
+is the highest-leverage pause in the whole loop; the remote agent will do exactly what these cards say
+and nothing more.
 
 ### 10. Dispatch
 
