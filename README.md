@@ -63,12 +63,18 @@ covered anyway, because exhausting the budget is precisely what makes the instan
 `openbuilder:blocked`. Without that check one permanently failing slug would wake the instance every
 five minutes forever.
 
-A **flap guard** stops the waker fighting the instance: it refuses to start an instance whose
-`LaunchTime` is younger than `waker_flap_guard_minutes` (default 20) when that instance is already
-`stopped` again. `ob-idle-stop` needs 30 minutes of quiet before it stops, so a legitimate cycle can
-never be that short — a shorter one means the instance and the waker disagree about whether there is
-work, which is a bug to investigate, not a reason to pay for a start every five minutes. The refusal is
-logged in full.
+A **flap guard** keeps the waker from fighting the instance, and it takes *two* conditions, because
+elapsed time alone accuses the wrong party. The instance's `LaunchTime` must be younger than
+`waker_flap_guard_minutes` (default 20) **and** `ob-idle-stop` must have recorded that it stopped the
+instance itself for having no work, during that same uptime — a plain String parameter at
+`<ssm_prefix>/state/last_stop`, written best effort immediately before `ec2:StopInstances`. "Same uptime"
+is the record's timestamp being newer than the current `LaunchTime`; a leftover from an earlier uptime
+does not fire the guard. Only the pair is a real contradiction: the instance looked and found nothing
+while the waker is looking and finding something, and that is the only thing that can become a
+five-minute billing loop. A short uptime on its own is usually you, starting the box by hand and
+stopping it again, which is not a fault. When the record is missing, stale or unreadable the waker starts
+the instance anyway — being too eager costs one wake, being too cautious strands a backlog. The refusal
+is logged in full, with both the launch time and the recorded stop.
 
 Every pass ends in exactly one `outcome`, which is the whole of the waker's observable behaviour:
 
@@ -76,7 +82,7 @@ Every pass ends in exactly one `outcome`, which is the whole of the waker's obse
 |---|---|
 | `nothing-to-do` | no plan branch in any repo is actionable |
 | `instance-running`, `instance-pending`, `instance-stopping` | work exists, but the instance is not `stopped`: it already owns the work, or it is mid-shutdown and the next tick will pick it up |
-| `flap-guard` | work exists and the instance is stopped, but it stopped again too soon after launching — see above |
+| `flap-guard` | work exists and the instance is stopped, but `ob-idle-stop` recorded that it stopped itself for having no work less than `waker_flap_guard_minutes` into that uptime — see above |
 | `started` | `ec2:StartInstances` accepted; the poll timer is live in ~30-45 s |
 | `start-refused` | EC2 declined transiently (`InsufficientInstanceCapacity`, `Unsupported`, `RequestLimitExceeded`) — the work stays queued in GitHub and the next tick retries, so this is logged plainly rather than raised. Any other error still raises, which keeps the function's error metric meaningful |
 
@@ -238,8 +244,9 @@ The waker's four knobs are defaulted too, and documented in `infra/variables.tf`
 #                                   # CLI; the Lambda stays deployed and manually invokable
 # waker_interval_minutes   = 5      # 1-60; the worst-case delay between a label landing on GitHub and
 #                                   # the instance booting
-# waker_flap_guard_minutes = 20     # refuse to start an instance that stopped again this recently; must
-#                                   # stay below idle_stop_minutes or it would block legitimate wakes
+# waker_flap_guard_minutes = 20     # window in which the instance's own "stopped, no work" verdict blocks
+#                                   # a restart; must stay below idle_stop_minutes or it would block
+#                                   # legitimate wakes
 # waker_log_retention_days = 14     # it logs a few lines every interval, forever
 ```
 
@@ -568,7 +575,7 @@ Full playbook in [docs/runbook.md](docs/runbook.md). The fast table:
 |---|---|---|
 | `openbuilder dispatch` pushed but no PR after 5 min | instance stopped, or poll timer not firing | `openbuilder status` then `openbuilder start`, then `openbuilder shell` and `systemctl list-timers 'openbuilder-*'` |
 | A label applied in the GitHub web UI never woke the instance | waker disabled (`waker_enabled = false`), its schedule, SSM access or App credentials broken, or EC2 short of capacity in the subnet's AZ (`outcome: start-refused`, retried every tick) | `eval "$(cd infra && terraform output -json waker \| jq -r .invoke)"`, then the `.logs` command from the same output |
-| Waker logs `REFUSING to start` | flap guard: the instance was `stopped` again within `waker_flap_guard_minutes` of launching, so it and the waker disagree about whether there is work | `openbuilder start`, then `openbuilder shell` and `sudo -u openbuilder /opt/openbuilder/bin/ob-poll --dry-run` |
+| Waker logs `REFUSING to start` | flap guard: `ob-idle-stop` recorded that it stopped the instance for having no work within `waker_flap_guard_minutes` of that launch, yet GitHub still looks actionable — the two disagree | `openbuilder start`, then `openbuilder shell` and `sudo -u openbuilder /opt/openbuilder/bin/ob-poll --dry-run`, comparing its `DECISION` lines with the waker's |
 | PR stuck on `openbuilder:in-progress` | job died mid-run, stale lock, or `OPENBUILDER_MAX_RUNTIME` hit | `openbuilder logs` then `openbuilder shell` and `ls -l /opt/openbuilder/run/` |
 | `openbuilder:blocked` appeared | max attempts reached, or a hard failure — the reason is in a PR comment, or in a `openbuilder blocked: <slug>` issue if it failed before the PR existed | `gh pr view <pr> --repo you/your-repo --comments` |
 | No commits, agent "explained" instead | story card was ambiguous; the agent is told to stop rather than guess | read `.openbuilder/backlog/<slug>/worklog.md` on the work branch, tighten the card, re-dispatch |

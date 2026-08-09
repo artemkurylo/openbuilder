@@ -37,7 +37,7 @@ no database — if it is not a branch, a commit, a comment or a label, it does n
 | `ob-poll` | `/opt/openbuilder/bin/ob-poll` | The clock. Runs the §2 state machine. Emits one `DECISION repo=<r> slug=<s> rule=<n> action=<implement\|respond\|block\|skip> reason=<...>` line per slug plus a final `ACTIONABLE=<n>`, to the journal. `--dry-run` prints those decisions and takes no action. Global `poll` lock so passes never overlap. Ensures the six labels exist once per pass. |
 | `ob-implement` | `/opt/openbuilder/bin/ob-implement` | `<owner/repo> <slug>`. Clone/fetch to `src/`, branch off the plan branch's merge-base with the default branch, create the worktree, read every `story-*.md` in slug order, render `prompts/implement.md`, run omp, require ≥1 new commit, append to `worklog.md`, push, `gh pr create`. |
 | `ob-respond` | `/opt/openbuilder/bin/ob-respond` | `<owner/repo> <slug> <pr>`. Pull the PR body, review comments and review threads via `gh api --paginate`, render `prompts/respond.md`, run a **fresh** omp session in the existing worktree, require ≥1 new commit, append the round to `worklog.md`, push, comment. |
-| `ob-idle-stop` | `/opt/openbuilder/bin/ob-idle-stop` | Stops the instance when no lock is held, `ob-poll --dry-run` reports no actionable work, and the newest mtime across `state/` and the log is older than `OPENBUILDER_IDLE_STOP_MINUTES`. |
+| `ob-idle-stop` | `/opt/openbuilder/bin/ob-idle-stop` | Stops the instance when no lock is held, `ob-poll --dry-run` reports no actionable work, and the newest mtime across `state/` and the log is older than `OPENBUILDER_IDLE_STOP_MINUTES`. Immediately before the stop it publishes its own verdict to `<ssm_prefix>/state/last_stop` in Parameter Store, best effort, for the waker's flap guard. |
 | `ob-token` | `/opt/openbuilder/bin/ob-token` | Mints a GitHub App installation access token: RS256 JWT via `openssl dgst -sha256 -sign`, `iat = now-60`, `exp = now+540`, POST to `/app/installations/<id>/access_tokens`. Caches at `cache/gh-token.json` (0600), reuses while >5 min from `expires_at`. |
 | `ob-doctor` | `/opt/openbuilder/bin/ob-doctor` | Preflight PASS/FAIL table. Non-zero exit on any FAIL. |
 | `ob-selfupdate` | `/opt/openbuilder/bin/ob-selfupdate` | `git -C /opt/openbuilder/repo pull --ff-only` then re-run `bootstrap.sh`. |
@@ -71,15 +71,16 @@ no database — if it is not a branch, a commit, a comment or a label, it does n
 
 | Component | Path | What it is |
 |---|---|---|
-| `openbuilder-waker` | `waker/handler.py` | The power-on half of the loop. python3.13 on arm64, 256 MB, 30 s timeout, no VPC attachment, no layer. Reads `github_app_id`, `github_app_installation_id` and `github_app_private_key` from SSM, mints an installation token, evaluates the §2 rule table against every repo in `var.repos`, and calls `ec2:StartInstances` when — and only when — at least one slug is actionable **and** the instance state is exactly `stopped`. Emits one `DECISION repo=<r> slug=<s> rule=<n> actionable=<bool> reason=<...>` line per slug, deliberately shaped like `ob-poll`'s, then the JSON result. |
+| `openbuilder-waker` | `waker/handler.py` | The power-on half of the loop. python3.13 on arm64, 256 MB, 30 s timeout, no VPC attachment, no layer. Reads `github_app_id`, `github_app_installation_id` and `github_app_private_key` from SSM — plus `state/last_stop` when it reaches the flap guard — mints an installation token, evaluates the §2 rule table against every repo in `var.repos`, and calls `ec2:StartInstances` when — and only when — at least one slug is actionable **and** the instance state is exactly `stopped`. Emits one `DECISION repo=<r> slug=<s> rule=<n> actionable=<bool> reason=<...>` line per slug, deliberately shaped like `ob-poll`'s, then the JSON result. |
 | the predicate | `waker/github.py` | GitHub App auth plus `decide()`, the "is there work?" rule evaluation. Standard library only, and it imports no AWS SDK, so the whole decision path can be exercised off-Lambda against live GitHub with a local PEM. |
 | RS256 | `waker/rs256.py` | RSASSA-PKCS1-v1_5 over SHA-256 with nothing but the standard library: PEM/DER parse to `(n, d)` accepting PKCS#1 and PKCS#8, the RFC 8017 §9.2 pad, one `pow()`. Signing only. The instance-side equivalent is `openssl dgst -sha256 -sign` inside `ob-token`. |
 | schedule and IAM | `infra/waker.tf` | EventBridge rule `rate(<waker_interval_minutes> minutes)` — 5 by default — `ENABLED`/`DISABLED` from `waker_enabled`, its Lambda target and invoke permission, the function's role and inline policy, and the log group `/aws/lambda/openbuilder-waker` at `waker_log_retention_days` (14). The deployment zip is built by `hashicorp/archive`'s `archive_file` at plan time, so there is no build step. |
 
-The waker's inputs are three SSM parameters and `var.repos`. Its single side effect is `ec2:StartInstances`.
-**It never stops the instance.** Power-off stays with `ob-idle-stop`, which is the only party that can see
-whether a lock is held or a job is mid-flight; the waker sees GitHub and an instance state, and nothing
-else. That asymmetry is what keeps the two halves of the loop from fighting over the power button.
+The waker's inputs are three SSM parameters, `state/last_stop` and `var.repos`. Its single side effect is
+`ec2:StartInstances`. **It never stops the instance.** Power-off stays with `ob-idle-stop`, which is the
+only party that can see whether a lock is held or a job is mid-flight; the waker sees GitHub and an
+instance state, and nothing else. That asymmetry is what keeps the two halves of the loop from fighting
+over the power button.
 
 `ob_ensure_running` in the laptop CLI is unchanged and still starts the instance for interactive commands.
 The waker makes the laptop unnecessary for the loop to close, not redundant: before it, a review submitted
@@ -90,9 +91,11 @@ from the GitHub web UI stalled until somebody opened a terminal.
 One VPC, one internet gateway, **one public subnet** with `map_public_ip_on_launch = true`, one route
 table, and a security group with **zero ingress rules** and egress-all. One IAM role and instance
 profile with `AmazonSSMManagedInstanceCore` plus an inline policy for the four SSM parameters,
-`kms:Decrypt` on `alias/aws/ssm` (via a `kms:ViaService` condition), tag-conditioned `ec2:StopInstances`,
-read-only `ec2:DescribeInstances`/`ec2:DescribeTags`, and `cloudwatch:PutMetricData` scoped to the
-`OpenBuilder` namespace. Four SSM parameters under `/openbuilder`. One `t4g.medium` instance with
+`ssm:PutParameter` on `<ssm_prefix>/state/*` and nothing wider, `kms:Decrypt` on `alias/aws/ssm` (via a
+`kms:ViaService` condition), tag-conditioned `ec2:StopInstances`, read-only
+`ec2:DescribeInstances`/`ec2:DescribeTags`, and `cloudwatch:PutMetricData` scoped to the `OpenBuilder`
+namespace. Four SSM parameters under `/openbuilder`, plus `/openbuilder/state/last_stop`, which the
+instance itself creates at its first self-stop rather than Terraform. One `t4g.medium` instance with
 `http_tokens = "required"` and an encrypted 40 GB gp3 root volume. One optional monthly cost budget.
 
 Outside the VPC: one Lambda function, its role and inline policy, its log group, one EventBridge scheduled
@@ -124,7 +127,8 @@ The waker has a separate contract and never reads `openbuilder.env`, because it 
 instance. Terraform renders its Lambda environment instead: `OPENBUILDER_SSM_PREFIX`, `OPENBUILDER_REPOS`,
 `OPENBUILDER_INSTANCE_ID`, `OPENBUILDER_BRANCH_PREFIX`, `OPENBUILDER_LABEL_PREFIX` and
 `OPENBUILDER_FLAP_GUARD_MINUTES`. It receives no secret either — it reads the three GitHub App parameters
-itself, with `WithDecryption`, on every invocation. The branch and label prefixes are the literal
+itself, with `WithDecryption`, on every invocation, and `<ssm_prefix>/state/last_stop`, which holds nothing
+secret, only when the flap guard needs it. The branch and label prefixes are the literal
 `openbuilder` in both places (cloud-init and `waker.tf`) and they must agree: those two strings are the
 wire format of the message bus.
 
@@ -187,21 +191,60 @@ and for the same slug the two rule numbers must agree.
 ### The flap guard — second line of defence
 
 The blocked label is the first line of defence against a wake loop, and it depends on the instance
-behaving correctly. The flap guard does not. Before starting anything, the waker reads the instance's
-`LaunchTime` and **refuses** to start an instance that was launched less than `waker_flap_guard_minutes`
-(20) ago and is already `stopped` again. It logs the refusal loudly, returns `outcome: flap-guard`, and
-takes no action at all.
+behaving correctly. The flap guard does not. Before starting anything, the waker requires **two** things to
+hold together, and refuses only when both do:
 
-That is a bound, not a heuristic. `ob-idle-stop` requires `idle_stop_minutes` (30) of no held lock, no
-actionable work and no filesystem activity before it stops, so the shortest *legitimate* on→off cycle is 30
-minutes. Anything shorter means the instance concluded there was nothing to do while the waker concluded
-the opposite — the two evaluations of the table above disagree. That is a bug to go and read
-`ob-poll --dry-run` about, not a reason to bill an instance start every five minutes.
+1. the instance's `LaunchTime` is less than `waker_flap_guard_minutes` (20) ago, **and**
+2. `ob-idle-stop` left a record that it stopped *this* uptime because it found no work.
 
-`waker_flap_guard_minutes` must therefore stay strictly below `idle_stop_minutes`. At or above it the guard
-would fire on legitimate cycles and refuse real work, silently, which is the failure mode it exists to
+It logs the refusal loudly, returns `outcome: flap-guard` carrying `minutes_since_launch` and
+`self_stopped_at`, and takes no action at all.
+
+**Condition 1 used to be the whole guard, and it accused the wrong party.** `ob-idle-stop` requires
+`idle_stop_minutes` (30) of no held lock, no actionable work and no filesystem activity before it stops, so
+the shortest *legitimate* on→off cycle is 30 minutes — from which the old guard concluded that a young
+launch on an already-`stopped` instance meant the instance and the waker disagreed about whether work
+existed. It does not follow. Elapsed time cannot tell "I stopped myself after finding no work" apart from
+"a human stopped me", and only the first is a fault. Observed for real on 2026-08-09: an operator started
+the box by hand for an unrelated test and stopped it two minutes later, and a genuinely queued story then
+sat unstarted for the full twenty minutes while the waker refused it on every five-minute tick — at 6.5
+minutes, again at 11.5, and so on.
+
+**So the party that made the decision records its own verdict**, instead of leaving the waker to infer it
+from a clock every actor shares. Immediately *before* calling `ec2:StopInstances`, `ob-idle-stop` writes a
+String parameter at `<ssm_prefix>/state/last_stop`:
+
+```
+{"instance":"i-0123456789abcdef0","at":"2026-08-09T11:05:03Z","actionable":0,"quiet_minutes":30,"by":"ob-idle-stop"}
+```
+
+That write is **best effort by design**: failing to publish it must never keep a paid instance running.
+`ob-idle-stop` logs `recorded the stop verdict at /openbuilder/state/last_stop` on success, or
+`could not write /openbuilder/state/last_stop; the flap guard has nothing to fire on, so the waker may
+start this instance again as soon as work appears` on failure, and stops either way.
+
+**Not knowing resolves in favour of starting.** `_last_stop_verdict()` returns `None` for every case where
+the answer is unclear — no record yet, malformed JSON, `actionable` not zero, any `ClientError` — and the
+guard reads `None` as "no disagreement observed" and starts the instance. It also requires the record to be
+*newer* than the current `LaunchTime`, so one left behind by an earlier uptime does not fire it. The
+asymmetry is deliberate: a needless start costs cents, a stranded backlog costs the whole point of the
+system.
+
+Condition 1 still carries the bound it always did, so `waker_flap_guard_minutes` must stay strictly below
+`idle_stop_minutes`. At or above it the guard would fire on legitimate cycles — which are exactly the
+cycles that write the record — and refuse real work, silently, which is the failure mode it exists to
 prevent. At 20 against 30 it keeps a 10-minute margin for the 5-minute granularity of
 `openbuilder-idle.timer` and for boot time.
+
+**The instance's `ssm:PutParameter` grant covers `<ssm_prefix>/state/*` and deliberately not
+`<ssm_prefix>/*`.** It reads its OpenRouter key and GitHub App PEM from that same prefix, and an instance
+able to overwrite the credentials it reads is one bad round away from a far worse day than a wake loop. The
+waker's read was already path-scoped to `<ssm_prefix>/*`, so it covers `state/last_stop` with no widening;
+only the instance writes under `state/`.
+
+One operator-visible consequence: a manual `aws ec2 stop-instances` or `openbuilder stop` no longer creates
+a twenty-minute blind spot. No self-stop record is written for it, so the waker starts the box again within
+`waker_interval_minutes` if GitHub has work. To keep it off regardless, set `waker_enabled = false`.
 
 ### Label transitions performed by the instance
 
@@ -382,7 +425,7 @@ sequenceDiagram
     else labelled from the GitHub web UI, no terminal open
         U->>G: add openbuilder:changes-requested
         W->>G: waker tick: same rule table, rule 6 matches
-        W->>A: state=stopped, launched >20 min ago -> ec2 start-instances
+        W->>A: state=stopped, no self-stop record this uptime -> ec2 start-instances
     end
     B->>G: poll: rule 6 matches
     B->>G: add openbuilder:in-progress, remove openbuilder:changes-requested
@@ -643,11 +686,13 @@ or sustained volume past the break-even above.
   Secrets are fetched with `--with-decryption` at job start and exported into the omp child process only.
   `ob-common.sh` redacts `sk-or-`, `ghs_`, `github_pat_` and `-----BEGIN` from everything it logs.
 - **Encrypted volume.** The gp3 root volume is `encrypted = true`, `delete_on_termination = true`.
-- **Least-privilege IAM.** The instance role can read exactly `<ssm_prefix>/*`, decrypt only via
-  `ssm.<region>.amazonaws.com` (`kms:ViaService`), put metrics only into the `OpenBuilder` namespace, and
-  stop instances **only where `ec2:ResourceTag/openbuilder:managed = "true"`**. The self-stop permission
-  is tag-scoped rather than ARN-scoped, so it survives instance replacement without ever letting the instance
-  stop something it does not own. It has no `ec2:TerminateInstances`, no `iam:*`, no `s3:*`.
+- **Least-privilege IAM.** The instance role can read exactly `<ssm_prefix>/*`, write exactly
+  `<ssm_prefix>/state/*` — `state/last_stop` and no wider, so it can never overwrite the credentials it
+  reads from the same prefix — decrypt only via `ssm.<region>.amazonaws.com` (`kms:ViaService`), put metrics
+  only into the `OpenBuilder` namespace, and stop instances **only where
+  `ec2:ResourceTag/openbuilder:managed = "true"`**. The self-stop permission is tag-scoped rather than
+  ARN-scoped, so it survives instance replacement without ever letting the instance stop something it does
+  not own. It has no `ec2:TerminateInstances`, no `iam:*`, no `s3:*`.
 - **The waker role is the mirror image.** The same `<ssm_prefix>/*` read and the same
   `kms:ViaService`-conditioned `kms:Decrypt`, `ec2:DescribeInstances` for state and `LaunchTime`, and
   `logs:CreateLogStream`/`logs:PutLogEvents` on its own log group only — plus exactly one mutation:
@@ -655,10 +700,11 @@ or sustained volume past the break-even above.
   instance may stop and not start; the waker may start and not stop. **Neither may terminate.**
   `ec2:TerminateInstances` is granted to no principal in this design, and the guardrails hook additionally
   blocks `aws ec2 terminate-instances` as a command shape on the instance. The waker has no VPC
-  attachment, no write access to Parameter Store, and no shell for anything to get execution in. It reads
-  three parameters and never the OpenRouter key — though its path-scoped `ssm:GetParameter*` on
-  `<ssm_prefix>/*` does cover it, which is the one place this policy is wider than the function's needs:
-  splitting the prefix to exclude a single parameter buys nothing while the instance role can read it all.
+  attachment, no write access to Parameter Store — including under `state/`, which it only reads — and no
+  shell for anything to get execution in. It reads the three GitHub App parameters plus `state/last_stop`,
+  and never the OpenRouter key — though its path-scoped `ssm:GetParameter*` on `<ssm_prefix>/*` does cover
+  it, which is the one place this policy is wider than the function's needs: splitting the prefix to
+  exclude a single parameter buys nothing while the instance role can read it all.
 - **Short-lived, narrowly-scoped GitHub credentials.** Installation tokens expire in an hour and only
   cover the repositories the App is installed on. The token cache is mode 0600 and is never logged.
 - **The agent cannot merge or force-push.** By convention (the prompt says so) *and* by enforcement:

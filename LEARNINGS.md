@@ -207,3 +207,18 @@ re-minting.
 **Cause** `git rev-parse --git-path hooks` honours `core.hooksPath`. When that setting points at a shared directory (a global `~/.githooks` is the common setup), one hook file runs in every repository, and a hook body that references `local/bin/...` relative to the working tree resolves it against whichever repository happens to be committing.
 **Rule** Treat the resolved hooks directory like any shared location: before writing to it, verify it lies inside the repository's own git directory (`git rev-parse --git-common-dir`) and refuse otherwise, naming `--force` for the deliberate case; and write the hook so it resolves its own repository (`git rev-parse --show-toplevel`) and exits 0 quietly when the command it would run is not present there.
 **Proven** 2026-08-09 on the instance while addressing the review of `ob-install-hooks` (artemkurylo/openbuilder#2): a hook body of `exec local/bin/ob-scrub-check --staged` installed under `core.hooksPath=/tmp/shared-hooks` died in an unrelated repository with exactly the quoted error; after the fix, the same hook exits 0 in a repository without the tool and still refuses a staged deny-list match in its own repository.
+
+### 18. A deploy that is allowed to decline must be verified, not assumed
+**Symptom** a change was committed, pushed and "deployed", yet the behaviour it added never happened.
+The deploy had logged `ob-selfupdate: jobs are running (poll); skipping self-update for now` — one line,
+exit 0, easy to read as success.
+**Cause** `ob-selfupdate` deliberately declines while any job lock is held, because swapping scripts
+under a running round would be worse. The poll timer takes that lock every 60 seconds, so a single
+attempt on a busy instance is a coin flip. Half of a two-part change was live — the Lambda that read a
+record — while the half that wrote it was not.
+**Rule** After deploying, assert the effect, not the exit status: grep the installed file for the new
+symbol, or exercise the behaviour. Retry a decline in a loop until it reports `self-update complete`.
+Treat "skipped" as a failure to deploy, because that is what it is.
+**Proven** 2026-08-09: `/openbuilder/state/last_stop` was still `ParameterNotFound` after a stop that
+should have written it; the installed `ob-idle-stop` had none of the new code until selfupdate was
+retried, after which the record appeared.

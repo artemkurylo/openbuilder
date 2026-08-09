@@ -220,6 +220,8 @@ To raise the ceiling durably, set `max_attempts` in `infra/terraform.tfvars` and
 
 Expected: `ob-idle-stop` stops the instance after `OPENBUILDER_IDLE_STOP_MINUTES` (default 30) of no lock
 held, no actionable work from `ob-poll --dry-run`, and no mtime change under `state/` or the log.
+Immediately before the stop it records that verdict at `/openbuilder/state/last_stop` in Parameter Store,
+which is the half of the waker's flap guard that distinguishes a self-stop from a hand-run one (**e**).
 
 Two things power it back on. The laptop CLI starts it for any interactive command — `openbuilder dispatch`
 and `openbuilder review` both call `aws ec2 start-instances` and wait. The waker starts it when nobody is
@@ -256,6 +258,11 @@ To stop it deliberately:
 openbuilder stop
 ```
 
+A hand-run stop does **not** keep the box off. Nothing writes a self-stop record for it, so the waker starts
+it again within `waker_interval_minutes` if GitHub has actionable work — that is deliberate, and the flap
+guard no longer masks it for twenty minutes. To keep the instance off regardless, set `waker_enabled = false`
+(**d**).
+
 **b. Ask the waker what it sees.** This is the same code path the schedule runs, side effect included: if
 the answer is yes and the instance is stopped, this call starts it.
 
@@ -273,7 +280,7 @@ healthy loop answers `{"actionable": 0, "slugs": [], "started": false, "outcome"
 | `nothing-to-do` | no plan branch is actionable — every slug matched rule 2, 3, 4 or 7 | nothing. Read the `DECISION` lines (**c**) to confirm which rule, then [§9](#9-poll-timer-not-firing) if you disagree |
 | `instance-running` / `instance-pending` | work is waiting, but the instance is already on and its own poll timer owns it | nothing. If it stays that way for more than a minute or two, [§9](#9-poll-timer-not-firing) |
 | `instance-stopping` | it caught `ob-idle-stop` mid-shutdown; starting now would race the stop | nothing. The next tick starts it |
-| `flap-guard` | it refused to start: the instance stopped again too fast, so the waker and the instance disagree | **e** below. Do not start it in a loop |
+| `flap-guard` | it refused to start: `ob-idle-stop` recorded that it stopped itself for having no work only minutes into this uptime, yet the waker sees work — a genuine disagreement | **e** below. Do not start it in a loop |
 | `start-refused` | EC2 refused the start with a transient error (`error` names the code) | nothing. The work stays queued and the next tick retries; **f** below |
 | `started` | `ec2:StartInstances` was called; `slugs` names what triggered it | expect `openbuilder status` to show movement within a minute or two |
 
@@ -312,7 +319,7 @@ tracking issue when there is no PR, and the waker refuses on both (rule 3 and ru
 ```hcl
 waker_enabled            = false   # stop the schedule; the Lambda stays deployed
 waker_interval_minutes   = 5       # worst-case delay between labelling a PR and the instance booting
-waker_flap_guard_minutes = 20      # keep this below idle_stop_minutes
+waker_flap_guard_minutes = 20      # keep below idle_stop_minutes; one of the guard's two conditions
 ```
 
 Then `make apply`. `waker_enabled = false` sets the EventBridge rule to `DISABLED` and changes nothing
@@ -330,20 +337,42 @@ terraform -chdir=infra output waker
 That prints the live `function_name`, `schedule` (`rate(5 minutes)`), `enabled`, and the two commands above
 with your own region and profile already filled in.
 
-**e. `outcome: flap-guard`.** The waker refuses to start an instance whose `LaunchTime` is younger than
-`waker_flap_guard_minutes` (default 20) when that instance is already `stopped` again, and says so in the
-log:
+**e. `outcome: flap-guard`.** The waker refuses to start the instance only when **both** halves of the
+guard hold: `LaunchTime` younger than `waker_flap_guard_minutes` (default 20) **and** an `ob-idle-stop`
+record saying it stopped itself for having no work during that same uptime. The reasoning is in
+[architecture.md](architecture.md#the-flap-guard--second-line-of-defence); what matters here is that a
+refusal is evidence of a real disagreement between the two evaluations, not an artefact of somebody stopping
+the box by hand. It says so in the log:
 
 ```
-REFUSING to start i-0123456789abcdef0: it was launched 3.4 min ago and is already stopped again, but
-['you/your-repo#healthz-endpoint'] still looks actionable. The instance and the waker disagree — check
-`ob-poll --dry-run` on the instance instead of starting it in a loop.
+REFUSING to start i-0123456789abcdef0: ob-idle-stop stopped it at 2026-08-09T11:05:03+00:00 for having no
+work, only 3.4 min after it launched, yet ['you/your-repo#healthz-endpoint'] looks actionable from here. The
+instance and the waker disagree — run `ob-poll --dry-run` on the instance and compare its DECISION lines
+with the ones above, rather than starting it in a loop.
 ```
 
-`ob-idle-stop` needs 30 minutes of quiet before it stops, so no legitimate cycle is shorter than that. A
-shorter one means the instance concluded there was nothing to do while the waker concluded the opposite.
-That disagreement is the bug; starting the instance every five minutes only bills it. So do **not** loop
-`openbuilder start`. Start it once, and put the two verdicts side by side:
+The JSON result carries both halves — `minutes_since_launch`, and `self_stopped_at` taken from the record —
+so you can tell which uptime it is talking about without parsing the prose.
+
+Read the record itself:
+
+```sh
+aws ssm get-parameter --name /openbuilder/state/last_stop --region eu-central-1 \
+  --profile openbuilder-deploy --query 'Parameter.Value' --output text
+```
+
+```
+{"instance":"i-0123456789abcdef0","at":"2026-08-09T11:05:03Z","actionable":0,"quiet_minutes":30,"by":"ob-idle-stop"}
+```
+
+`ParameterNotFound` means nothing has ever self-stopped under this prefix, so the guard cannot fire at all. A
+record whose `at` predates the current `LaunchTime` belongs to an earlier uptime and does not fire it either.
+Every unreadable, malformed or unexpected record is treated the same way — as "we do not know" — and the
+waker starts the instance, because a needless start costs cents while a stranded backlog costs the loop.
+
+A refusal therefore says the instance found no work minutes before the waker found some. That disagreement
+is the bug; starting the instance every five minutes only bills it. So do **not** loop `openbuilder start`.
+Start it once, and put the two verdicts side by side:
 
 ```sh
 openbuilder start
@@ -354,12 +383,13 @@ sudo -u openbuilder /opt/openbuilder/bin/ob-poll --dry-run
 Compare per slug. Both sides print `DECISION ... rule=<n>`, so line them up:
 
 - **Both sides call the same slug actionable** — then condition 2 (`ob-poll --dry-run` reporting
-  `ACTIONABLE=0`) cannot have held when it stopped. Either the work appeared *after* the stop, which is
-  legitimate and the next tick handles, or something else powered it down: look for a hand-run
-  `openbuilder stop` and read `sudo journalctl -u openbuilder-idle.service --since '1 hour ago' --no-pager`
-  for the `stopping` line it actually printed.
-- **Instance says `rule=1`** — a lock was held during its pass. The waker cannot see locks, so this
-  asymmetry is expected and harmless; the instance would have picked the work up itself.
+  `ACTIONABLE=0`) cannot have held when it stopped, even though the record says it did. Either the work
+  appeared *after* the stop, which is legitimate and the next tick handles, or the two sides read GitHub
+  differently: a stale token on the instance, or a repo in `var.repos` but not in `OPENBUILDER_REPOS`. Read
+  what it actually printed: `sudo journalctl -u openbuilder-idle.service --since '1 hour ago' --no-pager`.
+- **Instance says `rule=1`** — a lock is held during the dry run you just made. The waker cannot see locks,
+  so the asymmetry is expected and harmless, but it cannot explain the refusal either: a held lock fails
+  `ob-idle-stop`'s condition 1, so no record would have been written. Re-run the dry run once it clears.
 - **Instance says `rule=4`, waker says `rule=5` or `6`** — the attempt budget is exhausted but the
   `openbuilder:blocked` label never reached GitHub, so the waker keeps thinking there is work. Apply the
   label by hand and fix the reporting path per [§4](#4-attempts-hit-openbuilder_max_attempts).
@@ -900,8 +930,22 @@ down:
 ```sh
 sudo journalctl -u openbuilder-idle.service -f
 # expect, within OPENBUILDER_IDLE_STOP_MINUTES:
+# ob-idle-stop: recorded the stop verdict at /openbuilder/state/last_stop
 # ob-idle-stop: idle for more than 30m with no locks and no actionable work; stopping i-0123456789abcdef0
+# ob-idle-stop: stop requested for i-0123456789abcdef0
 ```
+
+The verdict comes first because the record has to exist before the stop for the waker's flap guard
+([§5](#5-instance-is-stopped-and-not-picking-up-work), **e**) to mean anything. Publishing it is best effort:
+a failure is a WARN and the instance stops anyway, because nothing justifies keeping a paid instance running.
+
+```
+2026-08-09T11:05:03Z WARN  ob-idle-stop: could not write /openbuilder/state/last_stop; the flap guard has nothing to fire on, so the waker may start this instance again as soon as work appears
+```
+
+That is the safe direction, and the message says so: with no record the guard's second condition can never
+hold, so the waker does not hold the instance back at all — it starts it on the next tick if GitHub has
+work.
 
 A fresh occurrence of this class of bug is loud rather than silent. `ob_lock_held` opens the lockfile
 read-only and takes a *shared* lock — an exclusive holder still makes `flock -ns` fail, so detection is

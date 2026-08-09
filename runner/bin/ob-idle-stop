@@ -94,7 +94,7 @@ record_stop_verdict() {
     --value "$payload" --region "$AWS_REGION" >/dev/null 2>&1; then
     ob_log INFO "recorded the stop verdict at ${name}"
   else
-    ob_log WARN "could not write ${name}; the waker will fall back to elapsed time only"
+    ob_log WARN "could not write ${name}; the flap guard has nothing to fire on, so the waker may start this instance again as soon as work appears"
   fi
 }
 
