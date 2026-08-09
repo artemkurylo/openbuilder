@@ -61,3 +61,21 @@ Candidates only. They reach `LEARNINGS.md` in the control repo when the reviewer
 **Rule** End every EXIT trap on a command guaranteed to succeed (`return 0` in the trap function, or `|| true`), and verify a script's exit status, not just its output, after any refactor around traps.
 **Proven** 2026-08-09, story-01 of the learn-command round: changing the cleanup trap's final `[[ ]] && rm` guard to `return 0` fixed `--help`'s exit code from 1 to 0.
 
+
+## Round 003 (review round 3)
+
+- Addressed the three review items on PR #1, one commit each:
+  - `while IFS= read -r line || [[ -n "$line" ]]` in `read_candidate` (both file and stdin
+    paths), `next_number` and `write_learnings`, so a candidate whose last line lacks a
+    trailing newline is not silently dropped. `printf '### r\n...\n**Proven** d'` (no final
+    `\n`) now validates and dry-runs cleanly instead of reporting "missing the **Proven**
+    line". The guard is latent in the two LEARNINGS.md readers (file ends in newline).
+  - `.ob-learn.tmp.*` added to `.gitignore` under "Operator-local config", so an interrupted
+    run's leftover temp file is never `git add -A`-ed into the public repo.
+  - `main` now declares `local line`; `--dry-run` prints the section via
+    `section_display_name` (`Rules the implementer must follow` / `Environment truths`),
+    matching the write path.
+- Also took the reviewer's optional item: duplicate label lines are now rejected
+  ("candidate repeats the **...** label") instead of silently skipped.
+- `LEARNINGS.md` unmodified in the final commit; restored via `git checkout` after each real
+  insertion test.
