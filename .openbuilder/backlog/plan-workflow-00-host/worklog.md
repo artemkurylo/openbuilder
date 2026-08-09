@@ -76,3 +76,39 @@ Candidates only. They reach `LEARNINGS.md` in the control repo when the reviewer
 **Rule** When a round's acceptance criteria name a linter, fetch it yourself — static release binaries run from `~/.local/bin` without root — and run the acceptance lint verbatim. Never let a tool's graceful-skip branch stand for the check, and never report a skip as a pass.
 **Proven** 2026-08-09, round 001 of plan-workflow-00-host: shellcheck 0.10.0's static Linux aarch64 tarball extracted straight into `~/.local/bin` and ran `shellcheck -x -S warning` on both edited scripts; the box is a fresh EC2 build instance with no apt access for this user.
 
+
+## Round 002 — review round 2 (feedback on PR #3)
+
+Reviewer: R11 was held for the CLI's own `gh` calls but not for the two `exec omp`
+handoffs, whose sessions end in `gh` calls of their own (`gh pr review`, label
+writes). Card said "all 12 `gh` call sites"; an `exec omp` line is not a `gh` call
+site, so the card was followed exactly and the hole remained.
+
+## Change (review round 2)
+
+- Both `exec omp` lines now pin the host for the child session:
+  `GH_HOST=github.com GH_REPO="$repo" exec omp \` in `cmd_plan` and `cmd_review`.
+  The omp child inherits `GH_HOST=github.com` — not the ambient environment — so
+  every GitHub call the planner/reviewer session makes (the reviewer's own
+  `gh pr review` and label writes included) resolves `github.com`. The prefix
+  applies to the child only; the wrapper's own `GH_HOST` is untouched by it.
+- `ob_command_table`'s `environment:` list now names the two variables that can
+  refuse a command or startup — `OPENBUILDER_OWNER` and `OPENBUILDER_GH_HOST` —
+  matching the header comment and the refusal messages.
+
+## Acceptance (proving the pin)
+
+With a stub `omp` on `PATH` that prints the `GH_HOST` its process inherited:
+
+```
+GH_HOST=example.com openbuilder review artemkurylo/openbuilder 3
+```
+
+must show the child receiving `github.com` (and the same with `GH_HOST` unset).
+Verified this round on the build box with a stub `omp` writing to a probe log
+through the real `cmd_plan` handoff: both runs record `GH_HOST=github.com`,
+never `example.com`, never `unset`.
+
+Backlog card acceptance criteria are unchanged; this is a defect in the story
+card's enumeration (an `exec omp` line is not a `gh` call site), recorded here
+so `plan-workflow-05-cli`'s rewrite of these commands inherits the pin.

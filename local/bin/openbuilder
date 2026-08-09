@@ -668,7 +668,7 @@ EOF
     )
 
     ob_info "launching omp planner ($OB_OPUS_MODEL) in $dir"
-    GH_REPO="$repo" exec omp \
+    GH_HOST=github.com GH_REPO="$repo" exec omp \
         --cwd "$dir" \
         --model "$OB_OPUS_MODEL" \
         --append-system-prompt "openbuilder planner session for $repo slug $slug. Produce backlog story cards under .openbuilder/backlog/$slug/. Never commit, push, or merge." \
@@ -832,7 +832,7 @@ EOF
     )
 
     ob_info "launching omp reviewer ($OB_OPUS_MODEL) in $dir"
-    GH_REPO="$repo" exec omp \
+    GH_HOST=github.com GH_REPO="$repo" exec omp \
         --cwd "$dir" \
         --model "$OB_OPUS_MODEL" \
         --append-system-prompt "openbuilder reviewer session for $repo pull request #$pr. Read-only on the branch: comment and label, never merge, never push." \
