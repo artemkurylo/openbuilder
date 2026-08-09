@@ -85,19 +85,27 @@ uninstall_hook() {
   printf '%s: removed the pre-commit hook at %s\n' "$OB_PROG" "$HOOK"
 }
 
-case "${1:-}" in
--h | --help)
-  usage
-  exit 0
-  ;;
---force) FORCE=1 ;;
---uninstall) UNINSTALL=1 ;;
-"") ;;
-*)
-  printf '%s: unknown argument: %s\n' "$OB_PROG" "$1" >&2
+while (($# > 0)); do
+  case "$1" in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --force) FORCE=1 ;;
+    --uninstall) UNINSTALL=1 ;;
+    "") ;;
+    *)
+      printf '%s: unknown argument: %s\n' "$OB_PROG" "$1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+if ((FORCE)) && ((UNINSTALL)); then
+  printf '%s: --force and --uninstall contradict each other; pick one.\n' "$OB_PROG" >&2
   exit 2
-  ;;
-esac
+fi
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   printf '%s: not inside a git working tree; nothing to install.\n' "$OB_PROG" >&2
