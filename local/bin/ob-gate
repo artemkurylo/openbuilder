@@ -271,14 +271,14 @@ record_backlog() {
     esac
   done < <(git -C "$REPO_ROOT" ls-tree --name-only HEAD -- "${dir}/")
   local has_plan=0 has_story=0 k
-  for k in "${kept[@]}"; do
+  for k in "${kept[@]+"${kept[@]}"}"; do
     [[ "$k" == "plan.md" ]] && has_plan=1
     [[ "$k" == story-*.md ]] && has_story=1
   done
   ((has_plan == 1)) || die "${dir}/plan.md is not committed at HEAD" 1
   ((has_story == 1)) || die "${dir}/ has no story-*.md; a backlog with no cards cannot be approved" 1
   local lines="" blob
-  for k in "${kept[@]}"; do
+  for k in "${kept[@]+"${kept[@]}"}"; do
     blob="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "HEAD:${dir}/${k}" || true)"
     lines+="${k}"$'\t'"${blob}"$'\n'
   done
@@ -405,7 +405,7 @@ verify_backlog_slug() {
       plan.md | story-*.md) ;;
       *) continue ;;
     esac
-    if ! printf '%s\n' "${mapped[@]}" | grep -qx -- "$base"; then
+    if ! printf '%s\n' "${mapped[@]+"${mapped[@]}"}" | grep -qx -- "$base"; then
       printf '%s: backlog/%s VOID — %s is not covered by the approval\n' "$OB_PROG" "$slug" "$base"
       void=1
     fi
