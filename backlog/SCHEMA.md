@@ -15,10 +15,15 @@ Cards live in the **target** repo, committed on the plan branch `openbuilder/pla
 `<slug>` matches `^[a-z0-9][a-z0-9-]{1,48}$`. `ob-implement` reads **every** `story-*.md` in the directory
 in filename order and hands them all to one omp run, so `NN` is what controls the sequence on disk.
 
-Two hard requirements outside the frontmatter:
+Three hard requirements outside the frontmatter:
 
 - **`plan.md` must start with a `# ` heading.** `ob-implement` derives the pull request title from it. No
   heading, no usable PR title.
+- **`plan.md` must carry an `- epic:` line.** Directly under the `# ` heading, as a plain bullet, written
+  `- epic: <epic>`, it names the directory `.openbuilder/epics/<epic>/` that holds the PRD and the RFC
+  this backlog implements. It is a plain bullet and not frontmatter because `plan.md` has no frontmatter
+  and the value is read with `awk '/^- epic:/ {print $3; exit}'`. Omit it and nothing can find the design
+  documents or the recorded approval for this slug from the card alone.
 - **`worklog.md` is not yours to write.** The instance creates and appends to it on the work branch, one entry
   per round. Do not commit one on the plan branch.
 
