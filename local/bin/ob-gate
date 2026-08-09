@@ -92,6 +92,35 @@ state_path() {
   printf '%s/%s' "$REPO_ROOT" "$(state_rel "$epic")"
 }
 
+artifact_rel() {
+  local epic="$1" t="$2"
+  printf '.openbuilder/epics/%s/%s.md' "$epic" "$t"
+}
+
+backlog_rel() {
+  local slug="$1"
+  printf '.openbuilder/backlog/%s' "$slug"
+}
+
+require_committed() {
+  local rel="$1" fix="$2" line base
+  if ! git -C "$REPO_ROOT" diff --quiet HEAD -- "$rel"; then
+    die "$rel has uncommitted changes; commit them first, then re-run: $fix" 1
+  fi
+  # An untracked plan.md or story-*.md means the recorded sha would describe
+  # bytes nobody read; any other untracked name is ignored.
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    base="${line##*/}"
+    case "$base" in
+      plan.md | story-*.md)
+        die "$line is not committed at HEAD; commit it first, then re-run: $fix" 1
+        ;;
+      *) ;;
+    esac
+  done < <(git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "$rel")
+}
+
 read_state() {
   local epic="$1" p
   p="$(state_path "$epic")"
@@ -180,6 +209,88 @@ cmd_stage() {
   commit_state "$epic" "openbuilder(gate): stage $epic -> $stage"
 }
 
+record_artifact() {
+  local epic="$1" stage="$2" rel blob at next doc
+  doc="$(read_state "$epic")"
+  rel="$(artifact_rel "$epic" "$stage")"
+  [[ -f "${REPO_ROOT}/${rel}" ]] || die "no such artifact: $rel" 1
+  blob="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "HEAD:${rel}" || true)"
+  [[ -n "$blob" ]] ||
+    die "$rel is not committed at HEAD; commit it first, then re-run: ob-gate record $epic $stage" 1
+  require_committed "$rel" "ob-gate record $epic $stage"
+  at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ "$stage" == "prd" ]]; then
+    next="rfc"
+  else
+    next="backlog"
+  fi
+  printf '%s' "$doc" | jq --arg at "$at" --arg blob "$blob" --arg next "$next" --arg stage "$stage" \
+    '.approvals[$stage] = {at: $at, blob: $blob} | .stage = $next' | write_state "$epic"
+  printf 'recorded %s approval for %s: %s\n' "$stage" "$epic" "$blob"
+  printf '%s stage -> %s\n' "$epic" "$next"
+  commit_state "$epic" "openbuilder(gate): approve $stage for $epic" "Approves-$stage: $blob"
+}
+
+record_backlog() {
+  local epic="${1:-}" slug="${2:-}" doc dir
+  [[ -n "$slug" ]] || die "missing <slug> for 'record backlog'" 2
+  [[ "$slug" =~ ^[a-z0-9][a-z0-9-]{1,48}$ ]] ||
+    die "invalid slug '$slug' (expected ^[a-z0-9][a-z0-9-]{1,48}\$)" 2
+  doc="$(read_state "$epic")"
+  dir="$(backlog_rel "$slug")"
+  require_committed "$dir" "ob-gate record $epic backlog $slug"
+  # Enumerate in ls-tree order: plan.md before every story-*.md.
+  local -a kept=()
+  local name base
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    base="${name##*/}"
+    case "$base" in
+      plan.md | story-*.md) kept+=("$base") ;;
+      *) ;; # worklog.md and any other name never enter the record
+    esac
+  done < <(git -C "$REPO_ROOT" ls-tree --name-only HEAD -- "${dir}/")
+  local has_plan=0 has_story=0 k
+  for k in "${kept[@]}"; do
+    [[ "$k" == "plan.md" ]] && has_plan=1
+    [[ "$k" == story-*.md ]] && has_story=1
+  done
+  ((has_plan == 1)) || die "${dir}/plan.md is not committed at HEAD" 1
+  ((has_story == 1)) || die "${dir}/ has no story-*.md; a backlog with no cards cannot be approved" 1
+  local lines="" blob
+  for k in "${kept[@]}"; do
+    blob="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "HEAD:${dir}/${k}" || true)"
+    lines+="${k}"$'\t'"${blob}"$'\n'
+  done
+  local files at tree n
+  files="$(printf '%s' "$lines" | jq -R -s 'split("\n") | map(select(length > 0) | split("\t")) | map({(.[0]): .[1]}) | add')"
+  at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '%s' "$doc" | jq --arg slug "$slug" --arg at "$at" --argjson files "$files" \
+    '.approvals.backlog[$slug] = {at: $at, files: $files} | (if (.slugs | index($slug)) then . else .slugs += [$slug] end)' |
+    write_state "$epic"
+  n="${#kept[@]}"
+  tree="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "HEAD:${dir}" || true)"
+  printf 'recorded backlog approval for %s/%s: %s file(s)\n' "$epic" "$slug" "$n"
+  commit_state "$epic" "openbuilder(gate): approve backlog $slug for $epic" "Approves-backlog: $tree"
+}
+
+cmd_record() {
+  local epic="${1:-}" target="${2:-}" slug="${3:-}"
+  [[ -n "$epic" ]] || die "missing <epic>" 2
+  require_epic "$epic"
+  case "$target" in
+    prd | rfc)
+      record_artifact "$epic" "$target"
+      ;;
+    backlog)
+      record_backlog "$epic" "$slug"
+      ;;
+    *)
+      die "unknown record target: '$target' (accepted: prd, rfc, backlog)" 2
+      ;;
+  esac
+}
+
 cmd_show() {
   local epic="${1:-}" doc
   [[ -n "$epic" ]] || die "missing <epic>" 2
@@ -205,6 +316,148 @@ cmd_show() {
   fi
 }
 
+verify_artifact() {
+  local epic="$1" t="$2" doc="$3" recorded rel abs blob
+  recorded="$(printf '%s' "$doc" | jq -r --arg t "$t" '.approvals[$t].blob // ""')"
+  if [[ -z "$recorded" || "$recorded" == "null" ]]; then
+    printf '%s: %s ABSENT — no approval recorded\n' "$OB_PROG" "$t"
+    printf '%s: fix: ob-gate record %s %s\n' "$OB_PROG" "$epic" "$t"
+    absent_seen=1
+    return 0
+  fi
+  rel="$(artifact_rel "$epic" "$t")"
+  abs="${REPO_ROOT}/${rel}"
+  if [[ ! -f "$abs" ]]; then
+    printf '%s: %s VOID — %s.md missing since approval\n' "$OB_PROG" "$t" "$t"
+    printf '%s: fix: ob-gate record %s %s\n' "$OB_PROG" "$epic" "$t"
+    void_seen=1
+    return 0
+  fi
+  blob="$(git hash-object -- "$abs")"
+  if [[ "$blob" != "$recorded" ]]; then
+    printf '%s: %s VOID — %s.md changed since approval\n' "$OB_PROG" "$t" "$t"
+    printf '%s: fix: ob-gate record %s %s\n' "$OB_PROG" "$epic" "$t"
+    void_seen=1
+    return 0
+  fi
+  printf '%s: %s intact %s\n' "$OB_PROG" "$t" "$recorded"
+}
+
+verify_backlog_slug() {
+  local epic="$1" doc="$2" slug="$3" files n rel abs
+  files="$(printf '%s' "$doc" | jq -c --arg slug "$slug" '.approvals.backlog[$slug].files // {}')"
+  n="$(printf '%s' "$files" | jq 'length')"
+  if [[ "$files" == "{}" || "$n" == "0" ]]; then
+    printf '%s: backlog/%s ABSENT — no approval recorded\n' "$OB_PROG" "$slug"
+    printf '%s: fix: ob-gate record %s backlog %s\n' "$OB_PROG" "$epic" "$slug"
+    absent_seen=1
+    return 0
+  fi
+  rel="$(backlog_rel "$slug")"
+  abs="${REPO_ROOT}/${rel}"
+  local -a mapped=()
+  local key
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    mapped+=("$key")
+  done < <(printf '%s' "$files" | jq -r 'keys[]')
+  local void=0 blob expected
+  for key in "${mapped[@]}"; do
+    if [[ ! -f "${abs}/${key}" ]]; then
+      printf '%s: backlog/%s VOID — %s missing since approval\n' "$OB_PROG" "$slug" "$key"
+      void=1
+    else
+      blob="$(git hash-object -- "${abs}/${key}")"
+      expected="$(printf '%s' "$files" | jq -r --arg key "$key" '.[$key]')"
+      if [[ "$blob" != "$expected" ]]; then
+        printf '%s: backlog/%s VOID — %s changed since approval\n' "$OB_PROG" "$slug" "$key"
+        void=1
+      fi
+    fi
+  done
+  # Any plan.md or story-*.md on disk that the record does not cover voids
+  # the approval, exactly as rule 4b enforces on the plan branch.
+  local name base
+  for name in "${abs}"/*; do
+    [[ -f "$name" ]] || continue
+    base="${name##*/}"
+    case "$base" in
+      plan.md | story-*.md) ;;
+      *) continue ;;
+    esac
+    if ! printf '%s\n' "${mapped[@]}" | grep -qx -- "$base"; then
+      printf '%s: backlog/%s VOID — %s is not covered by the approval\n' "$OB_PROG" "$slug" "$base"
+      void=1
+    fi
+  done
+  if ((void == 1)); then
+    printf '%s: fix: ob-gate record %s backlog %s\n' "$OB_PROG" "$epic" "$slug"
+    void_seen=1
+    return 0
+  fi
+  printf '%s: backlog/%s intact %s file(s)\n' "$OB_PROG" "$slug" "$n"
+}
+
+verify_backlog() {
+  local epic="$1" doc="$2" slug="${3:-}" total s
+  if [[ -n "$slug" ]]; then
+    verify_backlog_slug "$epic" "$doc" "$slug"
+    return 0
+  fi
+  total="$(printf '%s' "$doc" | jq -r '.approvals.backlog | length')"
+  if [[ "$total" == "0" ]]; then
+    printf '%s: backlog ABSENT — no approval recorded\n' "$OB_PROG"
+    absent_seen=1
+    return 0
+  fi
+  while IFS= read -r s; do
+    [[ -n "$s" ]] || continue
+    verify_backlog_slug "$epic" "$doc" "$s"
+  done < <(printf '%s' "$doc" | jq -r '.approvals.backlog | keys_unsorted[]')
+}
+
+cmd_verify() {
+  local epic="${1:-}" target="${2:---all}" p doc
+  [[ -n "$epic" ]] || die "missing <epic>" 2
+  require_epic "$epic"
+  case "$target" in
+    --all | prd | rfc | backlog) ;;
+    *)
+      die "unknown verify target: '$target' (accepted: prd, rfc, backlog, --all)" 2
+      ;;
+  esac
+  # Absence is reported as 4, not 1, so verify must not use read_state.
+  p="$(state_path "$epic")"
+  if [[ ! -r "$p" ]]; then
+    printf '%s: no approval recorded for %s: %s does not exist\n' "$OB_PROG" "$epic" "$(state_rel "$epic")"
+    exit 4
+  fi
+  doc="$(cat "$p")"
+  void_seen=0
+  absent_seen=0
+  case "$target" in
+    --all)
+      verify_artifact "$epic" "prd" "$doc"
+      verify_artifact "$epic" "rfc" "$doc"
+      verify_backlog "$epic" "$doc"
+      ;;
+    prd | rfc)
+      verify_artifact "$epic" "$target" "$doc"
+      ;;
+    backlog)
+      verify_backlog "$epic" "$doc" "${3:-}"
+      ;;
+  esac
+  # Void outranks absent: a voided approval is what a human must see first.
+  if ((void_seen == 1)); then
+    exit 3
+  fi
+  if ((absent_seen == 1)); then
+    exit 4
+  fi
+  exit 0
+}
+
 main() {
   local sub="${1:-}"
   need_jq
@@ -227,11 +480,11 @@ main() {
       ;;
     record)
       shift
-      die "subcommand not implemented yet: record" 2
+      cmd_record "$@"
       ;;
     verify)
       shift
-      die "subcommand not implemented yet: verify" 2
+      cmd_verify "$@"
       ;;
     show)
       shift
