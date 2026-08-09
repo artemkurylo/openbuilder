@@ -60,12 +60,14 @@ data "aws_iam_policy_document" "waker" {
     resources = ["${aws_cloudwatch_log_group.waker.arn}:*"]
   }
 
-  # 2. The GitHub App id / installation id / PEM. Note it does NOT need the
-  #    OpenRouter key — the waker never calls a model — but Parameter Store
-  #    permissions are path-scoped, and splitting the prefix to exclude one
-  #    parameter buys nothing here.
+  # 2. The GitHub App id / installation id / PEM, plus `state/last_stop`, which
+  #    the flap guard reads to tell a real instance/waker disagreement from an
+  #    operator who stopped the box by hand. Note it does NOT need the OpenRouter
+  #    key — the waker never calls a model — but Parameter Store permissions are
+  #    path-scoped, and splitting the prefix to exclude one parameter buys
+  #    nothing here. Read-only: only the instance writes under `state/`.
   statement {
-    sid    = "ReadGitHubAppCredentials"
+    sid    = "ReadOwnParameters"
     effect = "Allow"
 
     actions = [

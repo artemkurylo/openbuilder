@@ -68,6 +68,28 @@ def _instance() -> tuple[str, datetime.datetime]:
     return instance["State"]["Name"], instance["LaunchTime"]
 
 
+def _last_stop_verdict() -> datetime.datetime | None:
+    """When `ob-idle-stop` last stopped the instance for having no work, if ever.
+
+    `None` covers every "we do not know" case — no record yet, malformed record,
+    a stop by someone other than `ob-idle-stop` — and callers must treat not
+    knowing as "no disagreement observed". Being wrong in that direction starts
+    an instance that might have been held back; being wrong the other way leaves
+    a backlog stranded, which is worse.
+    """
+    prefix = os.environ["OPENBUILDER_SSM_PREFIX"].rstrip("/")
+    try:
+        value = _ssm.get_parameter(Name=f"{prefix}/state/last_stop")["Parameter"]["Value"]
+        record = json.loads(value)
+        if record.get("actionable") not in (0, "0"):
+            return None
+        return datetime.datetime.fromisoformat(record["at"].replace("Z", "+00:00"))
+    except _ssm.exceptions.ParameterNotFound:
+        return None
+    except (botocore.exceptions.ClientError, ValueError, KeyError, TypeError):
+        return None
+
+
 def lambda_handler(event, context):  # noqa: ARG001 — EventBridge passes both
     branch_prefix = os.environ.get("OPENBUILDER_BRANCH_PREFIX", "openbuilder")
     label_prefix = os.environ.get("OPENBUILDER_LABEL_PREFIX", "openbuilder")
@@ -112,23 +134,37 @@ def lambda_handler(event, context):  # noqa: ARG001 — EventBridge passes both
         print(json.dumps(result))
         return result
 
-    # Flap guard. ob-idle-stop needs OPENBUILDER_IDLE_STOP_MINUTES (30 by
-    # default) of quiet before it stops, so a legitimate cycle can never be
-    # shorter than that. A stopped instance that was launched minutes ago means
-    # the instance concluded there was nothing to do while we concluded the
-    # opposite — starting it again would bill a loop. Refuse, loudly.
+    # Flap guard, in two parts, because elapsed time alone accuses the wrong
+    # party. `ob-idle-stop` needs OPENBUILDER_IDLE_STOP_MINUTES (30 by default)
+    # of quiet before it stops, so a legitimate work cycle is never shorter than
+    # the guard window — but neither is an operator who started the box by hand
+    # and stopped it two minutes later, and that is not a fault. Observed for
+    # real on 2026-08-09: a manual start/stop during testing made the waker
+    # refuse a genuinely queued story for the full twenty minutes.
+    #
+    # So require BOTH a suspiciously young launch AND `ob-idle-stop`'s own record
+    # that it stopped this very uptime for having no work. That pair is the
+    # actual contradiction — it says the instance looked and found nothing while
+    # we are looking and finding something — and it is the only thing that could
+    # become a five-minute billing loop.
     age_minutes = (
         datetime.datetime.now(datetime.timezone.utc) - launch_time
     ).total_seconds() / 60
-    if age_minutes < flap_guard:
+    stopped_itself_at = _last_stop_verdict()
+    self_stopped_this_uptime = (
+        stopped_itself_at is not None and stopped_itself_at > launch_time
+    )
+    if age_minutes < flap_guard and self_stopped_this_uptime:
         result["outcome"] = "flap-guard"
         result["minutes_since_launch"] = round(age_minutes, 1)
+        result["self_stopped_at"] = stopped_itself_at.isoformat()
         print(
-            f"REFUSING to start {instance_id}: it was launched "
-            f"{age_minutes:.1f} min ago and is already stopped again, but "
-            f"{result['slugs']} still looks actionable. The instance and the "
-            "waker disagree — check `ob-poll --dry-run` on the instance instead "
-            "of starting it in a loop."
+            f"REFUSING to start {instance_id}: ob-idle-stop stopped it at "
+            f"{stopped_itself_at.isoformat()} for having no work, only "
+            f"{age_minutes:.1f} min after it launched, yet {result['slugs']} "
+            "looks actionable from here. The instance and the waker disagree — "
+            "run `ob-poll --dry-run` on the instance and compare its DECISION "
+            "lines with the ones above, rather than starting it in a loop."
         )
         print(json.dumps(result))
         return result

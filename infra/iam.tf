@@ -58,6 +58,25 @@ data "aws_iam_policy_document" "instance" {
     ]
   }
 
+  # 1b. Publish its own operational state — today just `state/last_stop`, which
+  #     tells the waker that this instance stopped itself for having no work, so
+  #     the flap guard can tell a real disagreement from an operator who stopped
+  #     the box by hand. Deliberately scoped to the `state/` subtree and NOT to
+  #     `${var.ssm_prefix}/*`: the instance must never be able to overwrite the
+  #     credentials it reads from the very same prefix.
+  statement {
+    sid    = "PublishOwnState"
+    effect = "Allow"
+
+    actions = [
+      "ssm:PutParameter",
+    ]
+
+    resources = [
+      "arn:aws:ssm:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:parameter${var.ssm_prefix}/state/*",
+    ]
+  }
+
   # 2. Decrypt the two SecureStrings. The AWS-managed `alias/aws/ssm` key has no
   #    stable ARN we can hardcode, so scope by service instead: this grant is
   #    only usable when SSM is the caller on the instance's behalf.

@@ -78,6 +78,26 @@ self_instance_id() {
   printf '%s' "$id"
 }
 
+# record_stop_verdict <instance-id> <quiet-minutes> — publish "I stopped myself
+# because there was no work" to Parameter Store, for the waker's flap guard.
+#
+# Best effort by design: failing to write this must never keep a paid instance
+# running. A missing record makes the waker slightly more eager, never less
+# safe — it starts an instance it might have held back, which is the direction
+# that keeps the backlog moving.
+record_stop_verdict() {
+  local instance_id="$1" minutes="$2" name payload
+  name="${OPENBUILDER_SSM_PREFIX%/}/state/last_stop"
+  payload="$(printf '{"instance":"%s","at":"%s","actionable":0,"quiet_minutes":%s,"by":"ob-idle-stop"}' \
+    "$instance_id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$minutes")"
+  if aws ssm put-parameter --name "$name" --type String --overwrite \
+    --value "$payload" --region "$AWS_REGION" >/dev/null 2>&1; then
+    ob_log INFO "recorded the stop verdict at ${name}"
+  else
+    ob_log WARN "could not write ${name}; the waker will fall back to elapsed time only"
+  fi
+}
+
 main() {
   ob_load_env
   local minutes detail instance_id
@@ -101,6 +121,15 @@ main() {
     ob_log ERROR "all three idle conditions hold but IMDSv2 did not return an instance id; not stopping"
     return 1
   fi
+
+  # Record the verdict BEFORE stopping, so the waker can tell a real
+  # disagreement from an operator. The waker refuses to start an instance that
+  # was launched moments ago and is already stopped again — but on elapsed time
+  # alone, "I stopped myself because there was nothing to do" and "a human
+  # stopped me" look identical, and the second one is not a fault. This record is
+  # the difference: it exists only on the path that saw no work, and the waker
+  # only holds back when it is newer than the current launch.
+  record_stop_verdict "$instance_id" "$minutes"
 
   ob_log INFO "idle for more than ${minutes}m with no locks and no actionable work; stopping ${instance_id}"
   if ! aws ec2 stop-instances --instance-ids "$instance_id" \

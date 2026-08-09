@@ -89,6 +89,22 @@ actually using. For an App token the authority is the installation's permission 
 (`contents=write`), not the repository's user-facing permission block.
 **Proven** 2026-08-09; the check now uses repository reachability plus the installation's permissions.
 
+### 16. A guard that infers a fault from elapsed time will accuse the operator
+**Symptom** a genuinely queued story sat unstarted for twenty minutes while the waker logged
+`REFUSING to start ...: it was launched 6.5 min ago and is already stopped again` every five minutes.
+Nothing was wrong: an operator had started the box by hand for an unrelated test and stopped it two
+minutes later.
+**Cause** the flap guard tried to detect "the instance and the waker disagree" from one observable —
+a young `LaunchTime` on a stopped instance. A self-stop after finding no work and a human stop are
+indistinguishable by that measure, so the guard blamed a fault that had not happened and blocked real
+work for its whole window.
+**Rule** Do not infer intent from a clock. Have the party that made the decision record it, and gate on
+that record: `ob-idle-stop` now writes `state/last_stop` before stopping, and the guard fires only when
+that record is newer than the launch. When the evidence is missing, choose the direction that keeps work
+moving — a needless start costs cents, a stranded backlog costs the whole point of the system.
+**Proven** 2026-08-09: two consecutive ticks refused a real story with `minutes_since_launch` 6.5 and
+11.5; the same situation after the change starts the instance, because no self-stop was recorded.
+
 ## Environment truths
 
 ### 6. SSM `AWS-RunShellScript` runs `/bin/sh` (dash) on Ubuntu, not bash
