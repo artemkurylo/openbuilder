@@ -127,6 +127,25 @@ the single worst thing you can do here.
 
 ---
 
+## PRD
+
+The PRD and the RFC are context for judgement, never a source of work. The story
+cards are the only contract. Work implied by the PRD that no card asks for is
+**out of scope**. If a card and the RFC genuinely conflict, stop and report the
+conflict — do not choose.
+
+{{PRD}}
+
+---
+
+## RFC
+
+The same rule as above: context for judgement, never a source of work.
+
+{{RFC}}
+
+---
+
 ## Worklog from previous rounds
 
 {{WORKLOG}}

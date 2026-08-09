@@ -33,6 +33,7 @@ PR_EXISTED=0
 COST="0"
 STORY_COUNT=0
 LEARNINGS_OUT=""
+EPIC=""
 
 usage() {
   cat <<'EOF'
@@ -118,6 +119,11 @@ read_backlog() {
   git -C "$SRC_DIR" show "${ref}:${backlog_dir}/plan.md" >"${ROUND_DIR}/plan.md" ||
     ob_die "missing ${backlog_dir}/plan.md on ${PLAN_BRANCH}"
 
+  EPIC="$(ob_epic_name "${ROUND_DIR}/plan.md")"
+  ob_log INFO "epic=${EPIC:-none}"
+  ob_epic_doc "$SRC_DIR" "$ref" "$EPIC" PRD "${ROUND_DIR}/prd.md"
+  ob_epic_doc "$SRC_DIR" "$ref" "$EPIC" RFC "${ROUND_DIR}/rfc.md"
+
   local -a paths=()
   mapfile -t paths < <(git -C "$SRC_DIR" ls-tree -r --name-only "$ref" \
     -- "${backlog_dir}/" | sort)
@@ -143,6 +149,16 @@ read_backlog() {
   ((STORY_COUNT >= 1)) ||
     ob_die "no story-*.md cards found under ${backlog_dir} on ${PLAN_BRANCH}"
   ob_log INFO "loaded ${STORY_COUNT} story card(s) for ${SLUG}"
+}
+
+# copy_epic_docs — land the epic's intake.md, prd.md and rfc.md on the work
+# branch before the agent runs, then re-baseline BASE_SHA unconditionally:
+# assert_progress counts rev-list BASE_SHA..HEAD, so without the re-baseline a
+# docs-only commit would satisfy its "at least one commit" check on behalf of
+# an agent that produced nothing.
+copy_epic_docs() {
+  ob_epic_docs_commit "$SRC_DIR" "origin/${PLAN_BRANCH}" "$EPIC" "$WT_DIR"
+  BASE_SHA="$(git -C "$WT_DIR" rev-parse HEAD)"
 }
 
 render() {
@@ -176,6 +192,8 @@ render() {
   {
     printf 'PLAN\t%s\n' "${ROUND_DIR}/plan.md"
     printf 'STORIES\t%s\n' "${ROUND_DIR}/stories.md"
+    printf 'PRD\t%s\n' "${ROUND_DIR}/prd.md"
+    printf 'RFC\t%s\n' "${ROUND_DIR}/rfc.md"
     printf 'WORKLOG\t%s\n' "$worklog"
     printf 'LEARNINGS\t%s\n' "${ROUND_DIR}/learnings.md"
   } >"$blocks"
@@ -329,6 +347,7 @@ main() {
 
   prepare_repo
   read_backlog
+  copy_epic_docs
   render
   run_agent
   assert_progress
