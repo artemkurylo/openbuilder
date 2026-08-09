@@ -22,6 +22,7 @@ import json
 import os
 
 import boto3
+import botocore.exceptions
 
 import github
 
@@ -30,6 +31,17 @@ _ssm = boto3.client("ssm")
 _ec2 = boto3.client("ec2")
 
 _PARAMETERS = ("github_app_id", "github_app_installation_id", "github_app_private_key")
+
+# StartInstances failures that are the AZ's fault, not ours, and that the next
+# tick may well succeed at. The instance is pinned to one subnet — its EBS root
+# volume is AZ-bound, so it cannot be started anywhere else — which makes
+# "come back in a few minutes" the only available strategy. Observed for real:
+# t4g.medium in eu-central-1a refused a start with InsufficientInstanceCapacity.
+_TRANSIENT_START_ERRORS = (
+    "InsufficientInstanceCapacity",
+    "Unsupported",
+    "RequestLimitExceeded",
+)
 
 
 def _config() -> dict:
@@ -121,7 +133,25 @@ def lambda_handler(event, context):  # noqa: ARG001 — EventBridge passes both
         print(json.dumps(result))
         return result
 
-    _ec2.start_instances(InstanceIds=[instance_id])
+    try:
+        _ec2.start_instances(InstanceIds=[instance_id])
+    except botocore.exceptions.ClientError as error:
+        code = error.response.get("Error", {}).get("Code", "")
+        if code not in _TRANSIENT_START_ERRORS:
+            raise
+        # Not an error to alarm on: the work stays queued in GitHub, and the
+        # next tick tries again. Swallowing it keeps the function's error metric
+        # meaningful — reserved for bugs and broken credentials.
+        result["outcome"] = "start-refused"
+        result["error"] = code
+        print(
+            f"could not start {instance_id}: {code}. {result['slugs']} stays "
+            "queued; retrying on the next tick. Capacity in the instance's "
+            "availability zone is the usual cause and it clears on its own."
+        )
+        print(json.dumps(result))
+        return result
+
     result["started"] = True
     result["outcome"] = "started"
     print(f"started {instance_id} for {result['slugs']}")

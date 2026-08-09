@@ -50,6 +50,13 @@ repos = [
 # vpc_cidr    = "10.42.0.0/16"
 # subnet_cidr = "10.42.1.0/24"
 
+# Empty picks the region's first AZ. Set it explicitly when starting the stopped
+# instance keeps failing with InsufficientInstanceCapacity — that AZ has no host
+# slot free for your instance_type. Changing it REPLACES the subnet and the
+# instance (the root volume is AZ-bound and cannot follow), so move early, while
+# the disk holds nothing but caches.
+# availability_zone = "eu-central-1b"
+
 # --- Cost guardrails ----------------------------------------------------------
 
 # monthly_budget_usd = 20         # AWS spend only; OpenRouter model spend is invisible to it

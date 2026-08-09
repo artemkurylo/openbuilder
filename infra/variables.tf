@@ -146,6 +146,12 @@ variable "subnet_cidr" {
   default     = "10.42.1.0/24"
 }
 
+variable "availability_zone" {
+  description = "Availability zone for the subnet, and therefore for the instance and its root volume (e.g. eu-central-1b). Empty picks the region's first AZ. Change this when `ec2:StartInstances` keeps failing with InsufficientInstanceCapacity: the AZ has no host slot free for your instance_type, and because an EBS volume cannot cross an AZ, moving the subnet is the only cure. CAUTION: changing it REPLACES the subnet and the instance, which destroys the root volume — cheap while the disk only holds caches, so do it before starting long-lived work."
+  type        = string
+  default     = ""
+}
+
 # -----------------------------------------------------------------------------
 # Cost guardrails
 # -----------------------------------------------------------------------------

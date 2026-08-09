@@ -41,10 +41,16 @@ resource "aws_internet_gateway" "main" {
   })
 }
 
+# The AZ is a knob, not an accident. `ec2:StartInstances` on a stopped instance
+# asks for a host slot in exactly one AZ — the one its EBS root volume lives in —
+# and AWS can refuse with InsufficientInstanceCapacity. Observed for real:
+# t4g.medium was unavailable in eu-central-1a for over half an hour while 1b and
+# 1c both had room. When that happens, the waker retries and says so, but the
+# actual cure is to move the instance, which means moving this subnet.
 resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = var.subnet_cidr
-  availability_zone       = data.aws_availability_zones.available.names[0]
+  availability_zone       = var.availability_zone != "" ? var.availability_zone : data.aws_availability_zones.available.names[0]
   map_public_ip_on_launch = true
 
   tags = merge(local.tags, {
