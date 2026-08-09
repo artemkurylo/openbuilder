@@ -94,3 +94,61 @@ Candidates only. They reach `LEARNINGS.md` in the control repo when the reviewer
 **Rule** When a helper or script commits exactly one path, stage that path first (`git ls-files --error-unmatch -- <path> || git add -- <path>`) before the pathspec commit, so the first commit of a new file behaves the same as every re-commit.
 **Proven** 2026-08-09 in the ob-gate scratch-repo exercise: `ob-gate init` failed with exactly the quoted error on a fresh `state.json`, and passed unchanged once the one-path stage was added to the shared commit helper.
 
+
+## Round 2 (2026-08-09) — review of PR #4
+
+Addressed the CHANGES_REQUESTED review by @artemkurylo. Three commits, one per
+feedback item.
+
+### Decisions a future round must not re-derive
+
+- **`write_state` refuses a failed pipeline instead of mv-ing garbage.** The
+  reviewer reproduced `ob-gate stage demo rfc` zeroing a committed
+  `state.json` when the middle `jq` stage failed: `pipefail` reports the
+  failure only after the last pipeline element has run. Fix: before the `mv`,
+  the staged temp file must be non-empty and parse as an object carrying
+  `epic`, `stage`, `approvals`
+  (`jq -e 'type == "object" and has("epic") and has("stage") and has("approvals")'`);
+  on refusal `die 1` naming the temp path, stating `state.json` was left
+  untouched, and removing the temp file **in `write_state` itself** — as a
+  pipeline element it runs in a subshell, its `TMP_STATE` never reaches the
+  parent, and the parent's `EXIT` trap cannot clean up. This also restores the
+  documented exit-code contract: the reproduced jq parse-error run exited 5
+  (jq's status via `pipefail`); refused writes now exit 1.
+- **New acceptance criterion (round 2), requested by the reviewer:** with a
+  stub `jq` on PATH that exits 1, `ob-gate stage <epic> rfc` must exit
+  non-zero and `state.json` must be byte-identical to before — assert with
+  `git diff --quiet HEAD -- <state path>`. The story cards live only on
+  `openbuilder/plan/plan-workflow-01-gate`, which this round must not push to,
+  so the criterion is recorded here; the next plan-branch edit should fold it
+  into `story-01-gate-state-file.md`. Verified in the scratch repo exactly as
+  stated: stub jq → exit 1, byte-identical state, no temp file left.
+- **`commit_state` refuses a detached HEAD.** On a detached HEAD
+  `rev-parse --abbrev-ref HEAD` prints the literal `HEAD`, so the push refspec
+  would create `refs/heads/HEAD` on the remote. The check runs before staging
+  or committing: `die "not on a branch; ob-gate must run on the epic's design
+  branch" 1` — nothing committed, nothing pushed.
+- **Empty-array expansions now match house style**
+  `"${arr[@]+"${arr[@]}"}"` (`ob-implement:127`): the two
+  `for k in "${kept[@]}"` loops in `record_backlog` and the
+  `printf '%s\n' "${mapped[@]}"` coverage check in `verify_backlog_slug`.
+- **The reviewer's "not a finding" stands:** `record backlog` leaving `stage`
+  untouched and appending to `slugs[]` is correct and load-bearing; untouched.
+
+### Verified
+
+- Round-2 scratch runner, 39 checks, all PASS against the final tree: story-01
+  core (help line, exit-2 paths, init fields, notes survival, idempotent
+  stage), story-02 core (prd/rfc/backlog record blobs + trailers, files map
+  without worklog.md, stage untouched by backlog, verify 0/3/4, refusals 1/2)
+  and the new criteria: stub `jq` → exit 1 + byte-identical state +
+  `git diff --quiet HEAD --` + no temp file; detached HEAD → exit 1 + refusal
+  message + no `refs/heads/HEAD` on origin + no local commit.
+- `shellcheck -x -S warning local/bin/ob-gate` → 0; `make lint` → 0.
+- Live epic, read-only: `ob-gate verify plan-workflow --all` exits 3 on the
+  work branch — `prd intact ba6725f3…`, `rfc intact e69f7c14…`, all six
+  backlog slugs VOID ("missing since approval") because the plan cards do not
+  exist in the work-branch working tree; `ob-gate show plan-workflow` prints
+  the live state. state.json blob identical before/after (`15886a02e…`);
+  nothing written. The epics were materialized from the plan branch
+  (`git archive`) and removed afterwards; tree clean.
