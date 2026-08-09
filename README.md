@@ -3,12 +3,13 @@
 A control plane for autonomous coding that splits the job across two machines and uses GitHub as the
 message bus. Your laptop runs a strong, expensive model (Claude Opus 5 via `omp`) to do the two things
 humans are bad at delegating — deciding *what* to build and judging whether the result is acceptable.
-A small always-on arm64 EC2 instance runs a cheap, fast model (DeepSeek V4 Flash via OpenRouter) to do the
-typing: it picks up plan branches, implements the stories, opens a pull request, and answers review
-rounds until the reviewer approves. There is no webhook, no queue, no inbound port and no SSH — the instance
-polls GitHub every 60 seconds, and stops itself when there is nothing to do. Every artifact of every
-step is a branch, a commit, a PR comment or a label, so the whole system is auditable with `git log`
-and `gh`.
+A small arm64 EC2 instance — off by default — runs a cheap, fast model (DeepSeek V4 Flash via OpenRouter)
+to do the typing: it picks up plan branches, implements the stories, opens a pull request, and answers
+review rounds until the reviewer approves. There is no webhook, no queue, no inbound port and no SSH —
+the instance polls GitHub every 60 seconds and stops itself when there is nothing to do, and a scheduled
+Lambda (the waker) starts it again when GitHub grows work. The backlog is the trigger: nothing has to be
+running, and nobody has to open a terminal, for the loop to advance. Every artifact of every step is a
+branch, a commit, a PR comment or a label, so the whole system is auditable with `git log` and `gh`.
 
 ## How it flows
 
@@ -26,6 +27,9 @@ flowchart TD
     G -->|looks good| J["Laptop: openbuilder approve<br/>label openbuilder:approved"]
     J --> K["Human: gh pr merge --squash"]
     F -.->|nothing to do for 30 min| L["Instance: ob-idle-stop<br/>instance stops itself"]
+    L -.-> M["Waker Lambda: every 5 min<br/>ob-poll's rule table, evaluated from outside"]
+    M -.->|actionable and stopped| N["ec2:StartInstances<br/>~30-45 s to a live poll timer"]
+    N -.-> D
 ```
 
 Three roles, three different cost profiles:
@@ -36,10 +40,51 @@ Three roles, three different cost profiles:
 | implementer | EC2 `t4g.medium` | `openrouter/deepseek/deepseek-v4-flash-0731` | implement stories, open a PR, answer review rounds |
 | reviewer | laptop | `amazon-bedrock/us.anthropic.claude-opus-5` | review the PR, post comments, gate the merge |
 
-The instance **auto-stops when idle** (no lock held, no actionable work, nothing touched for
-`OPENBUILDER_IDLE_STOP_MINUTES`, default 30). That is safe because the laptop CLI **starts the instance
-before it creates work** — `openbuilder dispatch` and `openbuilder review` both call
-`aws ec2 start-instances` and wait for the instance to come up. A stopped instance is never a missed trigger.
+### Power: who turns it on, who turns it off
+
+The instance is **off by default**, and neither half of the power decision needs a human in it:
+
+| Direction | Who decides | Condition |
+|---|---|---|
+| off | `ob-idle-stop`, on the instance, every 5 min | no lock held, `ob-poll --dry-run` finds nothing actionable, and nothing written under `log/` or `state/` for `OPENBUILDER_IDLE_STOP_MINUTES` (default 30) |
+| on | `openbuilder-waker`, a Lambda invoked by EventBridge every `waker_interval_minutes` (default 5) | GitHub has actionable work **and** the instance state is exactly `stopped` |
+
+Only the instance may power off, because it is the only party that knows whether a job is mid-flight.
+Only the waker can power on, because a stopped instance cannot poll. The waker never stops anything.
+
+**Actionable** is the same rule table `ob-poll` evaluates on the instance, read from outside with the
+GitHub App token: a `openbuilder/plan/<slug>` branch with no PR whose head is `openbuilder/work/<slug>`
+(rule 5), or such a PR labelled `openbuilder:changes-requested` (rule 6). Not actionable:
+`openbuilder:approved` (rule 2, and it wins over `changes-requested`), `openbuilder:blocked` (rule 3),
+no relevant label at all (rule 7 — the ball is with the reviewer), and, when there is no PR yet, an open
+issue titled `openbuilder blocked: <slug>` carrying `openbuilder:blocked` (rule 4's no-PR form). Rules 1
+(a lock is held) and 4 (the attempt budget) are instance-local state the Lambda cannot see; rule 4 is
+covered anyway, because exhausting the budget is precisely what makes the instance apply
+`openbuilder:blocked`. Without that check one permanently failing slug would wake the instance every
+five minutes forever.
+
+A **flap guard** stops the waker fighting the instance: it refuses to start an instance whose
+`LaunchTime` is younger than `waker_flap_guard_minutes` (default 20) when that instance is already
+`stopped` again. `ob-idle-stop` needs 30 minutes of quiet before it stops, so a legitimate cycle can
+never be that short — a shorter one means the instance and the waker disagree about whether there is
+work, which is a bug to investigate, not a reason to pay for a start every five minutes. The refusal is
+logged in full.
+
+Every pass ends in exactly one `outcome`, which is the whole of the waker's observable behaviour:
+
+| `outcome` | Meaning |
+|---|---|
+| `nothing-to-do` | no plan branch in any repo is actionable |
+| `instance-running`, `instance-pending`, `instance-stopping` | work exists, but the instance is not `stopped`: it already owns the work, or it is mid-shutdown and the next tick will pick it up |
+| `flap-guard` | work exists and the instance is stopped, but it stopped again too soon after launching — see above |
+| `started` | `ec2:StartInstances` accepted; the poll timer is live in ~30-45 s |
+| `start-refused` | EC2 declined transiently (`InsufficientInstanceCapacity`, `Unsupported`, `RequestLimitExceeded`) — the work stays queued in GitHub and the next tick retries, so this is logged plainly rather than raised. Any other error still raises, which keeps the function's error metric meaningful |
+
+The laptop CLI is unchanged: `dispatch`, `review`, `request-changes`, `shell`, `doctor` and `cost` still
+call `aws ec2 start-instances` and wait, so an interactive command never talks to a stopped instance. It
+is simply no longer *required*. Label a PR `openbuilder:changes-requested` from the GitHub web UI on a
+phone and the instance is up within `waker_interval_minutes` and has pushed its answer before you are
+back at a keyboard.
 
 ## Quickstart: zero to first merged PR
 
@@ -185,6 +230,19 @@ budget_alert_email = "you@example.com"
 App installation token is scoped to them. Everything else has a sane default (`t4g.medium`, 40 GiB gp3,
 `/openbuilder` SSM prefix, 45m max runtime, 6 max attempts, 30 min idle stop, `monthly_budget_usd = 20`).
 
+The waker's four knobs are defaulted too, and documented in `infra/variables.tf`. Override them in
+`terraform.tfvars` only when the defaults do not fit:
+
+```hcl
+# waker_enabled            = true   # false disables the schedule and hands power-on back to the laptop
+#                                   # CLI; the Lambda stays deployed and manually invokable
+# waker_interval_minutes   = 5      # 1-60; the worst-case delay between a label landing on GitHub and
+#                                   # the instance booting
+# waker_flap_guard_minutes = 20     # refuse to start an instance that stopped again this recently; must
+#                                   # stay below idle_stop_minutes or it would block legitimate wakes
+# waker_log_retention_days = 14     # it logs a few lines every interval, forever
+```
+
 The budget that `budget_alert_email` arms covers **AWS spend only** — OpenRouter bills the model
 separately and the AWS budget can never see it. Set a hard spend limit on the OpenRouter key too.
 
@@ -192,7 +250,9 @@ separately and the AWS budget can never see it. Set a hard spend limit on the Op
 
 ```sh
 make plan-tf     # read the plan; expect a VPC, one public subnet, an IGW, an SG with zero ingress,
-                 # an IAM role, four SSM parameters and one EC2 instance
+                 # an IAM role, four SSM parameters, one EC2 instance, and the waker's seven resources:
+                 # the Lambda, its role and inline policy, its log group, the EventBridge rule, that
+                 # rule's target, and the invoke permission
 make apply
 ```
 
@@ -249,7 +309,7 @@ on your `PATH`:
 export PATH="$PWD/local/bin:$PATH"
 ```
 
-### 8. Verify the instance
+### 8. Verify the instance, then the waker
 
 ```sh
 make doctor
@@ -259,6 +319,18 @@ make doctor
 parsed, every SSM parameter readable, App token mints and `gh api user` works, every repo in
 `OPENBUILDER_REPOS` reachable and writable, `OPENROUTER_API_KEY` valid via a one-token `omp` call, both
 systemd timers active, disk free. **Do not continue until every row is PASS.**
+
+`ob-doctor` runs on the instance, so it cannot see the waker. Check that one by hand, once:
+
+```sh
+eval "$(cd infra && terraform output -json waker | jq -r .invoke)"
+```
+
+At this point the backlog is empty, so it prints
+`{"actionable": 0, "slugs": [], "started": false, "outcome": "nothing-to-do"}` and starts nothing. This
+is not a dry run — invoked later, with a plan branch waiting and the instance stopped, it will do its job
+and start the instance. The same Terraform output carries the matching `aws logs tail` command under
+`.logs`; every pass prints one `DECISION` line per plan branch, in the shape `ob-poll` logs its own.
 
 ### 9. Plan a change
 
@@ -324,7 +396,8 @@ gh pr merge 42 --repo you/your-repo --squash --delete-branch
 **Only a human merges.** The remote agent is blocked from merging, force-pushing and pushing to a
 default branch by the guardrails hook, and never has a reason to try.
 
-Thirty minutes later `ob-idle-stop` powers the instance down and your spend drops to the EBS volume.
+Thirty minutes later `ob-idle-stop` powers the instance down and your spend drops to the EBS volume. It
+comes back up on its own the next time GitHub has work for it.
 
 ## The daily loop
 
@@ -336,6 +409,10 @@ openbuilder dispatch you/your-repo add-rate-limit   # starts the instance, pushe
 openbuilder review   you/your-repo 43               # Opus 5 reviews; you read its verdict
 openbuilder approve  you/your-repo 43               # then gh pr merge
 ```
+
+`plan` and `review` are the two that genuinely need your laptop — that is where Opus 5 runs. `dispatch`
+pushes a branch and `approve` moves a label, and doing either from the GitHub web UI works identically,
+because the waker watches the same branches and labels the CLI would have touched.
 
 Everything else is observation:
 
@@ -364,14 +441,22 @@ against AWS's published EU (Frankfurt) pricing; the gp3 rate is **approximate an
 | Public IPv4 address | ~$0.005/h while running, 240 h | ~$1.20 |
 | EBS 40 GiB gp3 | ~$0.095/GB-month (approximate), billed 24/7 while stopped | ~$3.80 |
 | DeepSeek V4 Flash tokens | 20 stories @ 350k in / 45k out | ~$0.79 |
-| SSM Session Manager, Parameter Store (standard), KMS, CloudWatch metrics | — | ~$0.00 |
+| EventBridge `rate(5 minutes)` + `openbuilder-waker` Lambda + its log group | free tier | ~$0.00 |
+| SSM Session Manager, Parameter Store (standard), KMS, Budgets, CloudWatch metrics | — | ~$0.00 |
 | **Total with idle auto-stop** (8 h/day awake, assumed) | 240 h | **~$15.01/mo** |
 | **Total always-on** (730 h) | 730 h | **~$36.27/mo** |
 
-The model is not the expensive part. The instance is — which is why idle auto-stop exists, and why
-there is no NAT gateway (~$32/mo) or interface endpoint pair (~$22/mo) in the design. The gp3 volume is
-the one line auto-stop cannot touch: $3.80/month whether the instance runs or not, which is the whole bill of
-a stopped month.
+The model is not the expensive part. The instance is — which is why `ob-idle-stop` exists on one side and
+the waker on the other, and why there is no NAT gateway (~$32/mo) or interface endpoint pair (~$22/mo) in
+the design. Auto-stop does not reduce what the waker costs, and does not need to: it runs while the box
+is stopped, which is the point, and a scheduled EventBridge rule plus ~8.6k invocations a month at 256 MB
+sits far inside the perpetual free tier either way. The 240 h row is 8 h/day × 30 days, an
+assumption rather than a measurement — awake hours track the backlog, not your working day.
+
+The gp3 volume is the one line auto-stop cannot touch: $3.80/month whether the instance runs or not, which
+is the floor for a month with no work in it. Getting to $0 would mean terminating the instance rather than
+stopping it, and that throws away the warm clones and `node_modules` that make a wake 30-45 seconds
+instead of a 2-4 minute cold build. Not worth $3.80.
 
 The default `monthly_budget_usd = 20` is enough for an auto-stopping instance (~$14.22 of AWS spend, 71% of
 budget, so the 80% alert at $16 never fires) and **not** enough always-on (~$35.48 of AWS spend). Either
@@ -387,10 +472,12 @@ openbuilder/
 ├── docs/                     architecture, day-2 runbook, GitHub App setup, cost math
 ├── infra/                    Terraform: VPC, public subnet, IAM, SSM params, instance, budget
 ├── infra/templates/          cloud-init template that renders openbuilder.env and calls bootstrap.sh
+├── infra/waker.tf            the power-on half: EventBridge rule, Lambda, its IAM role and log group
 ├── runner/                   everything that runs ON the instance
 ├── runner/bin/               ob-common.sh, ob-token, ob-poll, ob-implement, ob-respond, ob-idle-stop, ob-doctor, ob-selfupdate
 ├── runner/systemd/           the poll timer (60s) and the idle timer (5m) and their oneshot services
 ├── runner/prompts/           implement.md / respond.md templates fed to omp with {{PLACEHOLDER}} markers
+├── waker/                    the waker Lambda, stdlib only: rs256.py (RSA-SHA256 signing), github.py (the actionable predicate), handler.py
 ├── agent/remote/             omp config + implementer agent installed to /opt/openbuilder/.omp
 ├── agent/local/              omp planner + reviewer agents and their skills, for your laptop
 ├── agent/hooks/              pre-tool-call guardrails hook: no merge, no force-push, no push to main
@@ -405,12 +492,14 @@ Full playbook in [docs/runbook.md](docs/runbook.md). The fast table:
 | Symptom | Likely cause | Command to run |
 |---|---|---|
 | `openbuilder dispatch` pushed but no PR after 5 min | instance stopped, or poll timer not firing | `openbuilder status` then `openbuilder start`, then `openbuilder shell` and `systemctl list-timers 'openbuilder-*'` |
+| A label applied in the GitHub web UI never woke the instance | waker disabled (`waker_enabled = false`), its schedule, SSM access or App credentials broken, or EC2 short of capacity in the subnet's AZ (`outcome: start-refused`, retried every tick) | `eval "$(cd infra && terraform output -json waker \| jq -r .invoke)"`, then the `.logs` command from the same output |
+| Waker logs `REFUSING to start` | flap guard: the instance was `stopped` again within `waker_flap_guard_minutes` of launching, so it and the waker disagree about whether there is work | `openbuilder start`, then `openbuilder shell` and `sudo -u openbuilder /opt/openbuilder/bin/ob-poll --dry-run` |
 | PR stuck on `openbuilder:in-progress` | job died mid-run, stale lock, or `OPENBUILDER_MAX_RUNTIME` hit | `openbuilder logs` then `openbuilder shell` and `ls -l /opt/openbuilder/run/` |
 | `openbuilder:blocked` appeared | max attempts reached, or a hard failure — the reason is in a PR comment, or in a `openbuilder blocked: <slug>` issue if it failed before the PR existed | `gh pr view <pr> --repo you/your-repo --comments` |
 | No commits, agent "explained" instead | story card was ambiguous; the agent is told to stop rather than guess | read `.openbuilder/backlog/<slug>/worklog.md` on the work branch, tighten the card, re-dispatch |
 | `gh` calls fail with 401 | App token expired or the App is not installed on that repo | `openbuilder shell` then `sudo -u openbuilder /opt/openbuilder/bin/ob-doctor` |
 | omp exits instantly, no tokens spent | bad or out-of-credit `OPENROUTER_API_KEY` (429 / 402) | `openbuilder doctor`, then re-put `/openbuilder/openrouter_api_key` |
-| Instance never stops, bill keeps growing | idle timer not firing, or work is genuinely queued | `openbuilder shell` then `sudo -u openbuilder /opt/openbuilder/bin/ob-poll --dry-run` |
+| Instance never stops, bill keeps growing | idle timer not firing, work is genuinely queued, or a lockfile in `run/` the service user cannot open — logged as `cannot open lockfile ... treating it as NOT held`, and repaired by `ob-selfupdate` | `openbuilder shell` then `sudo -u openbuilder /opt/openbuilder/bin/ob-poll --dry-run` and `ls -l /opt/openbuilder/run/` |
 | Disk full, git operations fail | accumulated worktrees, caches and `run.ndjson` files | `openbuilder shell` then `df -h /opt/openbuilder` |
 | Instance running old scripts after a control-repo push | instance has not self-updated | `openbuilder shell` then `sudo -u openbuilder /opt/openbuilder/bin/ob-selfupdate` |
 

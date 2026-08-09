@@ -65,6 +65,24 @@ no database — if it is not a branch, a commit, a comment or a label, it does n
 /opt/openbuilder/cache/gh-token.json             cached installation token, mode 0600
 ```
 
+### In Lambda (the waker)
+
+| Component | Path | What it is |
+|---|---|---|
+| `openbuilder-waker` | `waker/handler.py` | The power-on half of the loop. python3.13 on arm64, 256 MB, 30 s timeout, no VPC attachment, no layer. Reads `github_app_id`, `github_app_installation_id` and `github_app_private_key` from SSM, mints an installation token, evaluates the §2 rule table against every repo in `var.repos`, and calls `ec2:StartInstances` when — and only when — at least one slug is actionable **and** the instance state is exactly `stopped`. Emits one `DECISION repo=<r> slug=<s> rule=<n> actionable=<bool> reason=<...>` line per slug, deliberately shaped like `ob-poll`'s, then the JSON result. |
+| the predicate | `waker/github.py` | GitHub App auth plus `decide()`, the "is there work?" rule evaluation. Standard library only, and it imports no AWS SDK, so the whole decision path can be exercised off-Lambda against live GitHub with a local PEM. |
+| RS256 | `waker/rs256.py` | RSASSA-PKCS1-v1_5 over SHA-256 with nothing but the standard library: PEM/DER parse to `(n, d)` accepting PKCS#1 and PKCS#8, the RFC 8017 §9.2 pad, one `pow()`. Signing only. The instance-side equivalent is `openssl dgst -sha256 -sign` inside `ob-token`. |
+| schedule and IAM | `infra/waker.tf` | EventBridge rule `rate(<waker_interval_minutes> minutes)` — 5 by default — `ENABLED`/`DISABLED` from `waker_enabled`, its Lambda target and invoke permission, the function's role and inline policy, and the log group `/aws/lambda/openbuilder-waker` at `waker_log_retention_days` (14). The deployment zip is built by `hashicorp/archive`'s `archive_file` at plan time, so there is no build step. |
+
+The waker's inputs are three SSM parameters and `var.repos`. Its single side effect is `ec2:StartInstances`.
+**It never stops the instance.** Power-off stays with `ob-idle-stop`, which is the only party that can see
+whether a lock is held or a job is mid-flight; the waker sees GitHub and an instance state, and nothing
+else. That asymmetry is what keeps the two halves of the loop from fighting over the power button.
+
+`ob_ensure_running` in the laptop CLI is unchanged and still starts the instance for interactive commands.
+The waker makes the laptop unnecessary for the loop to close, not redundant: before it, a review submitted
+from the GitHub web UI stalled until somebody opened a terminal.
+
 ### On AWS
 
 One VPC, one internet gateway, **one public subnet** with `map_public_ip_on_launch = true`, one route
@@ -74,6 +92,12 @@ profile with `AmazonSSMManagedInstanceCore` plus an inline policy for the four S
 read-only `ec2:DescribeInstances`/`ec2:DescribeTags`, and `cloudwatch:PutMetricData` scoped to the
 `OpenBuilder` namespace. Four SSM parameters under `/openbuilder`. One `t4g.medium` instance with
 `http_tokens = "required"` and an encrypted 40 GB gp3 root volume. One optional monthly cost budget.
+
+Outside the VPC: one Lambda function, its role and inline policy, its log group, one EventBridge scheduled
+rule, that rule's target, and the `lambda:InvokeFunction` permission — seven resources, no NAT, no
+interface endpoint, no API Gateway. The function is deliberately not attached to the VPC, because
+everything it talks to (SSM, KMS, EC2, `api.github.com`) is a public endpoint and a VPC-attached Lambda
+would need exactly the paid plumbing the instance's public subnet already refuses to buy.
 
 Every resource is tagged `openbuilder:managed = "true"`, `Project = "openbuilder"`,
 `Name = "<name_prefix>-<resource>"`.
@@ -94,6 +118,14 @@ AWS_REGION, PI_CODING_AGENT_DIR
 No secret is ever written to it. `ob-common.sh` fetches secrets with
 `aws ssm get-parameter --with-decryption` at job start and exports them into the omp child process only.
 
+The waker has a separate contract and never reads `openbuilder.env`, because it does not run on the
+instance. Terraform renders its Lambda environment instead: `OPENBUILDER_SSM_PREFIX`, `OPENBUILDER_REPOS`,
+`OPENBUILDER_INSTANCE_ID`, `OPENBUILDER_BRANCH_PREFIX`, `OPENBUILDER_LABEL_PREFIX` and
+`OPENBUILDER_FLAP_GUARD_MINUTES`. It receives no secret either — it reads the three GitHub App parameters
+itself, with `WithDecryption`, on every invocation. The branch and label prefixes are the literal
+`openbuilder` in both places (cloud-init and `waker.tf`) and they must agree: those two strings are the
+wire format of the message bus.
+
 ## 2. The state machine
 
 `ob-poll` fires every 60 seconds. For each `owner/repo` in `OPENBUILDER_REPOS`, for each remote branch
@@ -113,6 +145,61 @@ wins, one action per poll pass**:
 The ordering is the whole design. Rules 1–4 are refusals and they come first, so no amount of label
 weirdness or leftover state can make the instance act on a slug a human has closed out. Rule 7 is the resting
 state: the common case for a live PR is "do nothing, the reviewer has it".
+
+### Parity contract — `ob-poll` and `waker/github.py`
+
+The instance is off most of the time, so something outside it has to evaluate this same table to know
+whether powering it on is worth $0.0384/h. That something is the waker, and it therefore implements the
+table a second time, in Python (`waker/github.py:decide`), against the same GitHub state:
+
+| # | `ob-poll`, on the instance | `waker/github.py`, in Lambda |
+|---|---|---|
+| 1 | lock held → skip | **invisible** — the lockfile is instance-local |
+| 2 | `openbuilder:approved` → skip forever | same verdict: not actionable |
+| 3 | `openbuilder:blocked` on the PR → skip forever | same verdict: not actionable |
+| 4 | attempts ≥ `MAX_ATTEMPTS` → label `blocked`, comment, skip | **invisible** — the counter lives in `state/`; covered by its side effect |
+| 5 | no PR with head `openbuilder/work/<slug>` → implement | same verdict: actionable |
+| 6 | `openbuilder:changes-requested` → respond | same verdict: actionable |
+| 7 | otherwise → skip | same verdict: not actionable — the resting state |
+
+Rules 1 and 4 read instance-local state — a lockfile under `run/`, an attempts counter under `state/` — and
+no amount of GitHub reading recovers them. Rule 1 does not matter: if a lock is held the instance is
+running, and the waker only ever starts a `stopped` one. Rule 4 matters enormously, and it is covered by
+its *observable side effect* instead of its state.
+
+**This is what makes `openbuilder:blocked` load-bearing.** When the attempt budget is exhausted the
+instance labels the PR `openbuilder:blocked` — and when there is no PR, because an implement round that
+failed `MAX_ATTEMPTS` times never opened one, it opens a tracking issue titled `openbuilder blocked: <slug>`
+and labels that instead. The waker checks both forms: `work_pr` for the label, `blocked_slugs` for the open
+issue. Without the no-PR form, a slug that can never produce a PR would match rule 5 on every tick — no PR
+implies actionable — and wake the instance every five minutes, forever, for a job guaranteed to fail again.
+The label and the tracking issue are not bookkeeping; they are the termination condition of the outer loop.
+
+**Changing the rules obliges two edits.** Add, reorder or retire a rule in `ob-poll` and you must make the
+matching change in `waker/github.py:decide` in the same commit. Forgetting produces no error: the instance
+boots for work it then refuses to do (waker too permissive) or a labelled PR sits untouched until somebody
+opens a terminal (waker too strict). Both are silent, which is why the `rule` number is on every verdict —
+`ob-poll` logs `DECISION ... rule=<n> action=<...>`, the waker logs `DECISION ... rule=<n> actionable=<...>`,
+and for the same slug the two rule numbers must agree.
+
+### The flap guard — second line of defence
+
+The blocked label is the first line of defence against a wake loop, and it depends on the instance
+behaving correctly. The flap guard does not. Before starting anything, the waker reads the instance's
+`LaunchTime` and **refuses** to start an instance that was launched less than `waker_flap_guard_minutes`
+(20) ago and is already `stopped` again. It logs the refusal loudly, returns `outcome: flap-guard`, and
+takes no action at all.
+
+That is a bound, not a heuristic. `ob-idle-stop` requires `idle_stop_minutes` (30) of no held lock, no
+actionable work and no filesystem activity before it stops, so the shortest *legitimate* on→off cycle is 30
+minutes. Anything shorter means the instance concluded there was nothing to do while the waker concluded
+the opposite — the two evaluations of the table above disagree. That is a bug to go and read
+`ob-poll --dry-run` about, not a reason to bill an instance start every five minutes.
+
+`waker_flap_guard_minutes` must therefore stay strictly below `idle_stop_minutes`. At or above it the guard
+would fire on legitimate cycles and refuse real work, silently, which is the failure mode it exists to
+prevent. At 20 against 30 it keeps a 10-minute margin for the 5-minute granularity of
+`openbuilder-idle.timer` and for boot time.
 
 ### Label transitions performed by the instance
 
@@ -161,6 +248,7 @@ sequenceDiagram
     participant A as AWS API
     participant G as GitHub
     participant B as Instance / ob-poll
+    participant W as Waker Lambda / EventBridge 5m
     participant M as OpenRouter / DeepSeek V4 Flash
 
     U->>L: openbuilder plan you/repo healthz-endpoint
@@ -177,10 +265,18 @@ sequenceDiagram
     B->>B: require >=1 new commit, append worklog.md, commit
     B->>G: push openbuilder/work/healthz-endpoint, gh pr create
     B->>G: add openbuilder:awaiting-review, remove openbuilder:in-progress
-    U->>L: openbuilder review you/repo 42
-    L->>G: read diff, plan and worklog, then post line-anchored comments
-    L-->>U: verdict: changes-requested
-    U->>G: openbuilder request-changes -> label openbuilder:changes-requested
+    B->>A: ob-idle-stop: rule 7 for 30 min -> ec2 stop-instances
+    alt reviewed from a laptop
+        U->>L: openbuilder review you/repo 42
+        U->>A: the CLI's ob_ensure_running -> ec2 start-instances + wait
+        L->>G: read diff, plan and worklog, then post line-anchored comments
+        L-->>U: verdict: changes-requested
+        U->>G: openbuilder request-changes -> label openbuilder:changes-requested
+    else labelled from the GitHub web UI, no terminal open
+        U->>G: add openbuilder:changes-requested
+        W->>G: waker tick: same rule table, rule 6 matches
+        W->>A: state=stopped, launched >20 min ago -> ec2 start-instances
+    end
     B->>G: poll: rule 6 matches
     B->>G: add openbuilder:in-progress, remove openbuilder:changes-requested
     B->>G: gh api --paginate: PR body, review comments, review threads
@@ -196,6 +292,13 @@ sequenceDiagram
     B->>A: ob-idle-stop: nothing to do for 30 min -> ec2 stop-instances
 ```
 
+Instance power moves on three arrows with three different owners: the laptop CLI starts it for interactive
+commands (`dispatch`, `review`, `request-changes`, `shell`, `doctor`, `cost`), the waker starts it when
+GitHub has work and nobody has a terminal open, and `ob-idle-stop` stops it — twice here, once while the
+reviewer has the PR and once after the merge. Nothing but the instance ever stops the instance. Every arrow
+leaving `U` is a human decision — plan, tighten the cards, review, merge — and the whole right-hand branch
+of that `alt` runs whether or not a laptop is open.
+
 ## 4. Design decisions
 
 Each of these was a real fork in the road. The tradeoff is named, not hidden.
@@ -210,10 +313,35 @@ more resources, one more secret and an internet-reachable endpoint — to save a
 latency on a job that takes minutes. Polling needs nothing inbound at all: the instance makes outbound HTTPS
 calls to `api.github.com` and that is the entire network surface.
 
+The waker is the same argument applied to power-on: a scheduled pull, not a pushed event. EventBridge
+invokes it on a timer, it makes outbound calls to SSM, KMS, EC2 and `api.github.com`, and there is still no
+inbound path to anything in this design. A webhook would have had to terminate somewhere reachable from
+the internet; `rate(5 minutes)` terminates nowhere.
+
 **Tradeoff:** up to 60 seconds of latency before a plan branch is noticed, and a steady trickle of `gh`
 API calls even when idle. Both are irrelevant at this scale; the API calls stay far inside the
 authenticated rate limit, and the idle poll is exactly what lets `ob-idle-stop` be confident there is no
 work pending.
+
+### A scheduled Lambda for power-on instead of the laptop or an always-on instance
+
+`ob-idle-stop` gave the instance an off switch long before anything could turn it back on. The only
+power-on path was `ob_ensure_running` in the laptop CLI, which made the loop's autonomy conditional on a
+human having a terminal open: label a PR `openbuilder:changes-requested` from the GitHub web UI and
+nothing at all happened until you got back to a laptop.
+
+The alternatives were to leave the instance running (~$35.48/month for a machine that is idle most of the
+day, against a $3.80/month floor while stopped), to make the laptop a scheduled participant (a cron job on
+a machine that is closed, asleep, or on a different network), or to accept a webhook and the inbound
+surface it needs. A 256 MB function on an EventBridge timer is none of those: a scheduled rule is free and
+~8.6k invocations a month at 256 MB sits far inside the perpetual Lambda free tier, so the power-on half of
+the loop costs $0.
+
+**Tradeoff:** the §2 rule table now exists twice, once in Bash on the instance and once in Python in
+Lambda, and the two can drift. That is a genuine maintenance cost, and it is why the parity contract is
+written down next to the table rather than left to be rediscovered. The second cost is latency: up to
+`waker_interval_minutes` (5) between labelling a PR and the instance beginning to boot, plus the ~30–45 s a
+start takes. On a job measured in minutes, that is noise.
 
 ### Public subnet instead of a NAT gateway or interface endpoints
 
@@ -246,6 +374,35 @@ were machine-authored, and you can revoke the whole thing by uninstalling one Ap
 signing (`ob-token`, ~60 lines of `openssl` and `jq`) instead of pasting one token into SSM. That
 complexity is paid once, at setup, by you — not repeatedly, at runtime, by your threat model.
 
+### Zero dependencies in the waker instead of a layer or a container image
+
+`waker/rs256.py` implements RSASSA-PKCS1-v1_5 over SHA-256 with the standard library, and the whole
+function is three `.py` files.
+
+The Lambda runtime ships boto3 and nothing else that helps: no `cryptography`, no `PyJWT`. Signing an App
+JWT therefore needed either a dependency — which in Lambda means a layer to build, version and attach, or
+a container image to build, push to ECR and keep patched — or the primitive itself. The primitive turned
+out to be smaller than its packaging: strip the PEM armour, parse the DER to `(n, d)` (accepting both
+PKCS#1 `BEGIN RSA PRIVATE KEY` and PKCS#8 `BEGIN PRIVATE KEY`, because anything round-tripped through
+OpenSSL 3 comes back as the latter), prepend the constant SHA-256 `DigestInfo` prefix, pad per RFC 8017
+§9.2, and call `pow()` once. The payoff is that there is no build step anywhere in the deploy path —
+`archive_file` zips a directory — and nothing to rebuild when a base image moves. The instance side has the
+same shape for the same reason: `ob-token` is `openssl dgst` and `jq`.
+
+The split matters as much as the crypto. `waker/github.py` imports no AWS SDK and `handler.py` holds every
+boto3 call, so token minting, the GitHub reads and `decide()` run on a laptop against live GitHub with a
+local PEM. That is how the predicate was actually verified — rule 5 with a plan branch and no PR, rule 7
+with an unlabelled PR, rule 6 with `changes-requested`, rule 2 beating rule 6, and rule 4's no-PR form with
+an open `openbuilder blocked: <slug>` issue. A predicate you can only exercise by deploying is a predicate
+you will not exercise.
+
+**Tradeoff:** hand-written crypto, which is normally the wrong answer. It is defensible here on three
+counts. Only *signing* is implemented — verification, where a bug becomes a vulnerability, stays GitHub's
+problem. The output is checkable against a reference implementation, and was: `rs256.sign` verified with
+`openssl dgst -sha256 -verify`, and the PKCS#1 and PKCS#8 encodings of one key parsing to identical
+`(n, d)`. And the failure mode is immediate and total rather than subtle — a bad signature means GitHub
+rejects the JWT and nothing ever wakes.
+
 ### Fresh session plus a worklog instead of resuming the omp session
 
 Every round — the initial implement and each response to review — is a brand-new omp process with
@@ -273,6 +430,12 @@ An ephemeral instance starts from zero every time: full `apt-get`, a Node instal
 a `t4g.medium` that is minutes of paid setup per job, repeated. The persistent instance keeps
 `/opt/openbuilder/src/<owner>__<repo>/` as a warm clone that only needs a `git fetch`, keeps the package
 manager cache, and keeps `git worktree` directories around so a review round starts instantly.
+
+With the waker in front of it, `stopped` is the resting state rather than a state only a human can leave:
+the instance is off unless GitHub has work. The floor is not zero, though. The 40 GiB gp3 root volume bills
+whether the instance runs or not (~$3.80/month), and getting to $0 would mean terminating the instance and
+throwing away the warm clone and its dependency caches in exchange for a 2–4 minute cold start on the next
+job.
 
 **Tradeoff:** state accumulates, and state rots. Stale worktrees, a growing `state/` directory and a
 disk that can fill are real failure modes — see the runbook. In exchange, `ob-idle-stop` gets you most
@@ -316,6 +479,17 @@ vague PR, and this is the design's real dependency on human effort.
   stop instances **only where `ec2:ResourceTag/openbuilder:managed = "true"`**. The self-stop permission
   is tag-scoped rather than ARN-scoped, so it survives instance replacement without ever letting the instance
   stop something it does not own. It has no `ec2:TerminateInstances`, no `iam:*`, no `s3:*`.
+- **The waker role is the mirror image.** The same `<ssm_prefix>/*` read and the same
+  `kms:ViaService`-conditioned `kms:Decrypt`, `ec2:DescribeInstances` for state and `LaunchTime`, and
+  `logs:CreateLogStream`/`logs:PutLogEvents` on its own log group only — plus exactly one mutation:
+  `ec2:StartInstances`, conditioned on the same `ec2:ResourceTag/openbuilder:managed = "true"`. The
+  instance may stop and not start; the waker may start and not stop. **Neither may terminate.**
+  `ec2:TerminateInstances` is granted to no principal in this design, and the guardrails hook additionally
+  blocks `aws ec2 terminate-instances` as a command shape on the instance. The waker has no VPC
+  attachment, no write access to Parameter Store, and no shell for anything to get execution in. It reads
+  three parameters and never the OpenRouter key — though its path-scoped `ssm:GetParameter*` on
+  `<ssm_prefix>/*` does cover it, which is the one place this policy is wider than the function's needs:
+  splitting the prefix to exclude a single parameter buys nothing while the instance role can read it all.
 - **Short-lived, narrowly-scoped GitHub credentials.** Installation tokens expire in an hour and only
   cover the repositories the App is installed on. The token cache is mode 0600 and is never logged.
 - **The agent cannot merge or force-push.** By convention (the prompt says so) *and* by enforcement:
@@ -346,6 +520,11 @@ Inside that qualification, the honest statement of exposure is:
    Anything that gets code execution as `openbuilder` on that instance can push branches, open PRs and
    comment on any repo in `OPENBUILDER_REPOS` for as long as it has that access. **Keep `repos` as small
    as the work requires.** This is the single most important knob in `terraform.tfvars`.
+   The waker role can decrypt the same PEM, because minting a token is its entire job, so the credential
+   now has two readers. The Lambda is by far the smaller of the two — three files from this repo, no
+   model, no shell, no inbound event source but a timer — but it does mean anyone who can change that
+   function's code can read the credential, so account-level access control is part of the GitHub blast
+   radius now, not just instance-level.
 2. **The agent runs with `--approval-mode yolo --auto-approve`.** That is unavoidable for headless
    operation — there is no human at a prompt to approve tool calls — and it means the model executes
    arbitrary shell as the `openbuilder` user inside that blast radius. The mitigations are containment,

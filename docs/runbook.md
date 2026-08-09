@@ -16,8 +16,17 @@ openbuilder logs                     # tail /opt/openbuilder/log/openbuilder.log
 openbuilder doctor                   # ob-doctor PASS/FAIL table on the instance
 ```
 
-If `status` shows nothing and `logs` returns nothing, the instance is probably stopped — jump to
-[§5](#5-instance-is-stopped-and-not-picking-up-work).
+If `status` shows nothing and `logs` returns nothing, the instance is probably stopped — which is its
+normal resting state, not an incident. The question is then whether anything tried to wake it, and that
+half of the loop runs in AWS rather than on the instance:
+
+```sh
+aws logs tail /aws/lambda/openbuilder-waker --region eu-central-1 --profile openbuilder-deploy --since 1h
+```
+
+Expect one tick every `waker_interval_minutes` (default 5), each ending in a JSON line whose `outcome`
+field says what it decided. No ticks at all, or an `outcome` you did not expect, means the loop is stalled
+on power-on — jump to [§5](#5-instance-is-stopped-and-not-picking-up-work).
 
 To get a shell for anything below:
 
@@ -212,9 +221,15 @@ To raise the ceiling durably, set `max_attempts` in `infra/terraform.tfvars` and
 Expected: `ob-idle-stop` stops the instance after `OPENBUILDER_IDLE_STOP_MINUTES` (default 30) of no lock
 held, no actionable work from `ob-poll --dry-run`, and no mtime change under `state/` or the log.
 
-The laptop CLI starts it for you — `openbuilder dispatch` and `openbuilder review` both call
-`aws ec2 start-instances` and wait. So a stopped instance is only a problem if you pushed a plan branch by
-hand.
+Two things power it back on. The laptop CLI starts it for any interactive command — `openbuilder dispatch`
+and `openbuilder review` both call `aws ec2 start-instances` and wait. The waker starts it when nobody is
+at a laptop: an EventBridge rule invokes the `openbuilder-waker` Lambda every `waker_interval_minutes`
+(default 5), it evaluates the same rule table as `ob-poll` against GitHub, and calls `ec2:StartInstances`
+only when a slug is actionable **and** the instance state is exactly `stopped`. It never stops the
+instance — that stays with `ob-idle-stop`, the only party that knows whether a job is mid-flight. So a
+label added from the GitHub web UI boots the instance on its own, within `waker_interval_minutes`.
+
+**a. Get it running now.**
 
 ```sh
 openbuilder start                    # ec2 start-instances + wait
@@ -240,6 +255,130 @@ To stop it deliberately:
 ```sh
 openbuilder stop
 ```
+
+**b. Ask the waker what it sees.** This is the same code path the schedule runs, side effect included: if
+the answer is yes and the instance is stopped, this call starts it.
+
+```sh
+aws lambda invoke --region eu-central-1 --profile openbuilder-deploy \
+  --function-name openbuilder-waker --payload '{}' --cli-binary-format raw-in-base64-out /dev/stdout
+```
+
+The function's verdict lands on stdout first, then the CLI's own `{"StatusCode": 200, ...}`. An idle,
+healthy loop answers `{"actionable": 0, "slugs": [], "started": false, "outcome": "nothing-to-do"}`. Read
+`outcome` first:
+
+| `outcome` | What it means | What to do |
+|---|---|---|
+| `nothing-to-do` | no plan branch is actionable — every slug matched rule 2, 3, 4 or 7 | nothing. Read the `DECISION` lines (**c**) to confirm which rule, then [§9](#9-poll-timer-not-firing) if you disagree |
+| `instance-running` / `instance-pending` | work is waiting, but the instance is already on and its own poll timer owns it | nothing. If it stays that way for more than a minute or two, [§9](#9-poll-timer-not-firing) |
+| `instance-stopping` | it caught `ob-idle-stop` mid-shutdown; starting now would race the stop | nothing. The next tick starts it |
+| `flap-guard` | it refused to start: the instance stopped again too fast, so the waker and the instance disagree | **e** below. Do not start it in a loop |
+| `start-refused` | EC2 refused the start with a transient error (`error` names the code) | nothing. The work stays queued and the next tick retries; **f** below |
+| `started` | `ec2:StartInstances` was called; `slugs` names what triggered it | expect `openbuilder status` to show movement within a minute or two |
+
+Any other `outcome`, or a reply carrying `"FunctionError": "Unhandled"` instead of an `outcome`, is a bug or
+a broken credential — the function deliberately raises on everything it cannot classify, so its error metric
+stays meaningful. Read the traceback in the log (**c**) and treat it as
+[§6](#6-app-token-expired-or-401) until proven otherwise.
+
+**c. Read the scheduled ticks.** Every invocation, scheduled or manual, logs to
+`/aws/lambda/openbuilder-waker` (retention `waker_log_retention_days`, default 14):
+
+```sh
+aws logs tail /aws/lambda/openbuilder-waker --region eu-central-1 --profile openbuilder-deploy --since 1h
+aws logs tail /aws/lambda/openbuilder-waker --region eu-central-1 --profile openbuilder-deploy --follow
+aws logs tail /aws/lambda/openbuilder-waker --region eu-central-1 --profile openbuilder-deploy \
+  --since 6h --filter-pattern DECISION
+```
+
+Its per-slug lines have the same shape as `ob-poll`'s on purpose, so the two logs read alike:
+
+```
+DECISION repo=you/your-repo slug=healthz-endpoint rule=5 actionable=True reason=no-pr
+```
+
+That `rule=` number maps onto the same state-machine table in
+[architecture.md](architecture.md#2-the-state-machine) as the instance's own decisions, so a waker line and
+an `ob-poll --dry-run` line about the same slug are directly comparable.
+
+Two rules never appear here, because they are instance-local state the Lambda cannot see: rule 1 (a lock is
+held, so the instance is already busy) and rule 4 (the attempt budget). Rule 4 needs no separate coverage —
+a slug that exhausts its budget gets `openbuilder:blocked` on the PR, or on a `openbuilder blocked: <slug>`
+tracking issue when there is no PR, and the waker refuses on both (rule 3 and rule 4's no-PR form).
+
+**d. Turn it off, or change its cadence.** In `infra/terraform.tfvars`:
+
+```hcl
+waker_enabled            = false   # stop the schedule; the Lambda stays deployed
+waker_interval_minutes   = 5       # worst-case delay between labelling a PR and the instance booting
+waker_flap_guard_minutes = 20      # keep this below idle_stop_minutes
+```
+
+Then `make apply`. `waker_enabled = false` sets the EventBridge rule to `DISABLED` and changes nothing
+else: the Lambda, its role and its log group stay, and the manual invoke in **b** keeps working — so you
+can still ask "is there work?" without a schedule. Power-on falls back to the laptop CLI.
+`waker_interval_minutes` is the whole latency budget of the loop's power-on half; 1 to 60 minutes is
+accepted, and a 5-minute cadence is ~8.6k invocations a month, well inside the perpetual Lambda free tier.
+
+Confirm what is actually deployed:
+
+```sh
+terraform -chdir=infra output waker
+```
+
+That prints the live `function_name`, `schedule` (`rate(5 minutes)`), `enabled`, and the two commands above
+with your own region and profile already filled in.
+
+**e. `outcome: flap-guard`.** The waker refuses to start an instance whose `LaunchTime` is younger than
+`waker_flap_guard_minutes` (default 20) when that instance is already `stopped` again, and says so in the
+log:
+
+```
+REFUSING to start i-0123456789abcdef0: it was launched 3.4 min ago and is already stopped again, but
+['you/your-repo#healthz-endpoint'] still looks actionable. The instance and the waker disagree — check
+`ob-poll --dry-run` on the instance instead of starting it in a loop.
+```
+
+`ob-idle-stop` needs 30 minutes of quiet before it stops, so no legitimate cycle is shorter than that. A
+shorter one means the instance concluded there was nothing to do while the waker concluded the opposite.
+That disagreement is the bug; starting the instance every five minutes only bills it. So do **not** loop
+`openbuilder start`. Start it once, and put the two verdicts side by side:
+
+```sh
+openbuilder start
+openbuilder shell
+sudo -u openbuilder /opt/openbuilder/bin/ob-poll --dry-run
+```
+
+Compare per slug. Both sides print `DECISION ... rule=<n>`, so line them up:
+
+- **Both sides call the same slug actionable** — then condition 2 (`ob-poll --dry-run` reporting
+  `ACTIONABLE=0`) cannot have held when it stopped. Either the work appeared *after* the stop, which is
+  legitimate and the next tick handles, or something else powered it down: look for a hand-run
+  `openbuilder stop` and read `sudo journalctl -u openbuilder-idle.service --since '1 hour ago' --no-pager`
+  for the `stopping` line it actually printed.
+- **Instance says `rule=1`** — a lock was held during its pass. The waker cannot see locks, so this
+  asymmetry is expected and harmless; the instance would have picked the work up itself.
+- **Instance says `rule=4`, waker says `rule=5` or `6`** — the attempt budget is exhausted but the
+  `openbuilder:blocked` label never reached GitHub, so the waker keeps thinking there is work. Apply the
+  label by hand and fix the reporting path per [§4](#4-attempts-hit-openbuilder_max_attempts).
+- **Different rules on the same slug for no other reason** — the two read GitHub seconds apart and a label
+  or PR changed in between. It resolves itself on the next tick.
+
+**f. `outcome: start-refused`.** EC2 declined the start with `InsufficientInstanceCapacity`,
+`Unsupported` or `RequestLimitExceeded`. The waker treats all three as transient, does not raise, and says
+so in plain language:
+
+```
+could not start i-0123456789abcdef0: InsufficientInstanceCapacity. ['you/your-repo#healthz-endpoint'] stays queued; retrying on the next tick. Capacity in the instance's availability zone is the usual cause and it clears on its own.
+```
+
+There is nothing to do and nothing to reset: the work lives in GitHub, not in the waker, so every tick
+re-derives it and tries again. `waker_interval_minutes` is therefore also the retry interval, and retrying
+is the whole strategy — the instance is pinned to one subnet because its EBS root volume is AZ-bound, so a
+capacity refusal in that AZ can only be waited out. Confirm the reason from the EC2 side with the
+`describe-instances` call in **a**; `openbuilder start` will fail the same way while capacity is short.
 
 ## 6. App token expired or 401
 
@@ -712,7 +851,75 @@ sudo /opt/openbuilder/repo/runner/bootstrap.sh
 omp --version
 ```
 
-## 16. Quick reference
+## 16. Instance never powers off
+
+Symptom: the instance stays `running` for hours, nothing new appears in
+`/opt/openbuilder/log/openbuilder.log`, and the idle service repeats one line every five minutes:
+
+```
+2026-08-09T11:05:03Z INFO  ob-idle-stop: staying up: condition 1 failed — locks held: selfupdate
+```
+
+```sh
+openbuilder shell
+sudo journalctl -u openbuilder-idle.service -n 100 --no-pager | grep 'staying up'
+pgrep -a -u openbuilder omp                # empty: nothing is actually running
+ls -l /opt/openbuilder/run/
+```
+
+Condition 1 is "no lock is held". `pgrep` empty while condition 1 keeps failing is **not** a stale
+lockfile — `ob_lock` uses `flock`, so a lock dies with the process that held it
+([§2](#2-pr-stuck-in-openbuilderin-progress)). It means the probe cannot open the lockfile at all, which is
+a permissions bug, and the most expensive one found so far: a root-owned
+`/opt/openbuilder/run/selfupdate.lock`, left behind by an `ob-selfupdate` run as root, kept an instance
+awake for seven hours instead of thirty minutes.
+
+Check ownership. Every lock must read `openbuilder openbuilder 664`:
+
+```sh
+openbuilder shell
+stat -c "%U %G %a %n" /opt/openbuilder/run/*.lock
+# expect: openbuilder openbuilder 664 /opt/openbuilder/run/selfupdate.lock
+```
+
+The fix is a self-update **as root** — the repair is a `chown`, so it needs to be:
+
+```sh
+sudo /opt/openbuilder/bin/ob-selfupdate
+```
+
+`bootstrap.sh` re-creates `run/` as `2775` — setgid and group-writable, so a lockfile created by root stays
+usable by the service user — then chowns and chmods every existing `*.lock` and logs
+`normalised ownership of /opt/openbuilder/run/*.lock`. Re-run the `stat` above, then watch it actually go
+down:
+
+```sh
+sudo journalctl -u openbuilder-idle.service -f
+# expect, within OPENBUILDER_IDLE_STOP_MINUTES:
+# ob-idle-stop: idle for more than 30m with no locks and no actionable work; stopping i-0123456789abcdef0
+```
+
+A fresh occurrence of this class of bug is loud rather than silent. `ob_lock_held` opens the lockfile
+read-only and takes a *shared* lock — an exclusive holder still makes `flock -ns` fail, so detection is
+unchanged — and a file it cannot open at all is a distinct error, treated as NOT held:
+
+```
+2026-08-09T11:05:03Z ERROR ob-idle-stop: cannot open lockfile /opt/openbuilder/run/selfupdate.lock as openbuilder; treating it as NOT held — fix its ownership (expected openbuilder:openbuilder, mode 0664)
+```
+
+That line goes to both the journal and the operational log, so it is findable after the fact:
+
+```sh
+grep -F 'cannot open lockfile' /opt/openbuilder/log/openbuilder.log
+```
+
+An ownership mistake is a configuration bug to fix, never a reason to keep the instance running — and
+billing — forever. Prevention is the rule from the top of this file: everything on the instance runs as
+`openbuilder`, so use `sudo -u openbuilder` for the routine self-update in
+[§15](#15-update-the-instance) and keep the root form for this repair. Running it as root is safe now:
+`ob_lock` creates every lockfile `0664` and chowns it to `openbuilder` whenever root is the one creating it.
+
+## 17. Quick reference
 
 | Want | Command |
 |---|---|
@@ -732,3 +939,7 @@ omp --version
 | Reset attempts | `printf '0\n' \| sudo -u openbuilder tee /opt/openbuilder/state/<key>/attempts` then `rm -f .../blocked-reported` |
 | Read the newest round's report | `cat /opt/openbuilder/state/<key>/rounds/*/final.md \| tail -40` |
 | Why did the poller skip my slug? | `sudo journalctl -u openbuilder-poll.service --since today \| grep DECISION` |
+| Did the waker see work? | `aws lambda invoke --region eu-central-1 --profile openbuilder-deploy --function-name openbuilder-waker --payload '{}' --cli-binary-format raw-in-base64-out /dev/stdout` |
+| What the waker decided | `aws logs tail /aws/lambda/openbuilder-waker --region eu-central-1 --profile openbuilder-deploy --since 1h` |
+| Is the waker scheduled at all? | `terraform -chdir=infra output waker` |
+| Lock ownership (must be `openbuilder openbuilder 664`) | `stat -c "%U %G %a %n" /opt/openbuilder/run/*.lock` |
