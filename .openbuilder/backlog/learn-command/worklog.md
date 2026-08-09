@@ -79,3 +79,49 @@ Candidates only. They reach `LEARNINGS.md` in the control repo when the reviewer
   ("candidate repeats the **...** label") instead of silently skipped.
 - `LEARNINGS.md` unmodified in the final commit; restored via `git checkout` after each real
   insertion test.
+
+## Round 3 — 2026-08-09T06:51:26Z
+
+Review-response round by `ob-respond` (attempt 3 of 6).
+
+- action: respond to review
+- pull request: #1
+- model: `openrouter/deepseek/deepseek-v4-flash-0731`
+- new commits: 5
+- cost: 0.03352753152 USD
+
+### Agent summary
+
+The LEARNINGS.md diff vs main is **pre-existing drift**, not mine: `git log origin/main..HEAD -- LEARNINGS.md` is empty — no commit on this branch touched it, and the worktree is clean. Main gained a 12th entry and rewrote rules-item 5 after this branch diverged; ob-learn numbers dynamically (`highest + 1`), so nothing to change, and the review explicitly forbids touching LEARNINGS.md. Noting it for the reviewer.
+
+All work complete and pushed (`240cf87..aa55f01`).
+
+## Summary
+Fixed all three review items on `local/bin/ob-learn`, one commit each: guarded every `while IFS= read -r` loop with `|| [[ -n "$line" ]]` so a candidate whose last line lacks a trailing newline is no longer silently dropped (the exact `printf` repro now validates cleanly); added `.ob-learn.tmp.*` to `.gitignore` next to the operator-local entries; and declared `local line` in `main` while making `--dry-run` print the section via `section_display_name`, matching the write path. Also took the reviewer's optional item — repeated label lines are now rejected instead of silently accepted. `LEARNINGS.md` is unmodified in the final commit.
+
+## Feedback
+- `local/bin/ob-learn` `read_candidate`/`next_number`/`write_learnings`: fixed — all four read loops guard the final unterminated line; repro `printf '### r\n**Symptom** a\n**Cause** b\n**Rule** c\n**Proven** d' | ob-learn --section implementer --dry-run` now prints the entry and exits 0.
+- `.gitignore`: fixed — `.ob-learn.tmp.*` added with a comment; `git check-ignore .ob-learn.tmp.ABC123` now confirms ignored.
+- `main` `line` global: fixed — `local line` declared; `--dry-run` prints `section: Rules the implementer must follow` / `section: Environment truths`, consistent with the insert path.
+- Duplicate labels (optional item): fixed — `**Symptom**` twice is now rejected with `candidate repeats the **Symptom** label`; it was ~5 lines, so I took it.
+
+## Verification
+- `make lint` (with shellcheck 0.10.0 on PATH; repo command skips when absent) -> exit 0, all 4 shell scripts-paths clean; `shellcheck -x -S warning local/bin/ob-learn` -> exit 0
+- reviewer's no-newline repro -> entry accepted, exit 0; `--dry-run` both sections -> LEARNINGS.md byte-identical; missing `**Proven**`, bad heading, out-of-order labels -> exit 1 with the naming message; duplicate `**Symptom**` -> exit 1 naming the label
+- real `--section implementer` insert -> `### 12.` as last entry before `## Environment truths`; `--section environment` -> `### 12.` at file end, single trailing newline; both restored with `git checkout`
+- deny list (via `OPENBUILDER_SCRUB_DENY`) -> exit 1, stdout 0 bytes, count-only stderr, LEARNINGS.md byte-identical; non-matching list proceeds
+- `--help` with blocking stdin -> usage on stdout, exit 0; `-f` file without trailing newline and candidate with trailing blanks -> handled; `git status` clean, `LEARNINGS.md` unmodified vs branch tip
+
+## Still open
+- none from the review. (Note: the branch's `LEARNINGS.md` predates two newer commits on `main` — the 12th learning and a rewrite of editing-rule 5; `ob-learn` numbers dynamically so this needs no change here, but expect a merge-time file resolution. One candidate learning appended to `learnings-proposed.md`.)
+
+### Learnings proposed this round
+
+Candidates only. They reach `LEARNINGS.md` in the control repo when the reviewer commits them there.
+
+### N. `while IFS= read -r` silently drops a final line without a trailing newline
+**Symptom** `ob-learn` rejected a perfectly valid candidate with `candidate is missing the **Proven** line` although the `**Proven** d` line was right there — the input had been produced by `printf` without a final `\n`.
+**Cause** `while IFS= read -r line` runs its body only while `read` returns success, and `read` returns failure on end-of-input, discarding a final unterminated line instead of yielding it and failing after.
+**Rule** When the input's final newline is not guaranteed, guard the loop with `|| [[ -n "$line" ]]` so an unterminated last line is still processed. A diagnostic that blames the data for the reader's own handling is worse than one that says it does not know.
+**Proven** 2026-08-09, review round 3 of the learn-command story: the guard was added to all three `read` loops in `local/bin/ob-learn` and the exact repro (`printf '### r\n…\n**Proven** d'` without `\n`) then validated and dry-ran cleanly.
+
