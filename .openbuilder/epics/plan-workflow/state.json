@@ -9,7 +9,8 @@
     "plan-workflow-02-rule",
     "plan-workflow-03-context",
     "plan-workflow-04-agents",
-    "plan-workflow-05-cli"
+    "plan-workflow-05-cli",
+    "plan-workflow-06-automerge"
   ],
   "approvals": {
     "prd": {
