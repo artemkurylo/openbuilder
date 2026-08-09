@@ -117,11 +117,11 @@ read_candidate() {
   local line
   if [[ -n "$INPUT" ]]; then
     [[ -r "$INPUT" ]] || die "cannot read candidate file: ${INPUT}" 2
-    while IFS= read -r line; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
       CANDIDATE+=("$line")
     done <"$INPUT"
   else
-    while IFS= read -r line; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
       CANDIDATE+=("$line")
     done
   fi
@@ -181,7 +181,7 @@ check_deny() {
 
 next_number() {
   local highest=0 line n
-  while IFS= read -r line; do
+  while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$line" =~ ^###[[:space:]]+([0-9]+)[.] ]]; then
       n="${BASH_REMATCH[1]}"
       if ((n > highest)); then
@@ -217,7 +217,7 @@ write_learnings() {
   # an interrupted run cannot leave the store truncated.
   local -a lines=() out=()
   local line i=0 idx=-1 end
-  while IFS= read -r line; do
+  while IFS= read -r line || [[ -n "$line" ]]; do
     lines+=("$line")
   done <"$LEARNINGS"
 
