@@ -75,6 +75,11 @@
           "story-04-land-teardown.md": "a96ed52ddff69f0dea1f66b40d64caf710e6ef15"
         }
       }
+    },
+    "automerge": {
+      "at": "2026-08-09T21:35:21Z",
+      "by": "artemkurylo",
+      "note": "Authorised in session 2026-08-09. Recorded by hand: ob-gate record <epic> automerge is what plan-workflow-06-automerge builds."
     }
   },
   "notes": "Recorded by hand: local/bin/ob-gate, which will own this file, is what this epic builds. Provisional layout ratified by rfc.md."
