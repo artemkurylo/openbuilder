@@ -1,14 +1,26 @@
 {
   "epic": "plan-workflow",
   "repo": "artemkurylo/openbuilder",
-  "stage": "rfc",
+  "stage": "backlog",
   "opened": "2026-08-09",
-  "slugs": [],
+  "slugs": [
+    "plan-workflow-00-host",
+    "plan-workflow-01-gate",
+    "plan-workflow-02-rule",
+    "plan-workflow-03-context",
+    "plan-workflow-04-agents",
+    "plan-workflow-05-cli"
+  ],
   "approvals": {
     "prd": {
-      "at": "2026-08-09T08:50:27Z",
-      "blob": "92074e0fa12b82b3b8a5be8880aa843d5bf814bf"
-    }
+      "at": "2026-08-09T18:11:22Z",
+      "blob": "ba6725f35e7d275b41752e51c137207373aca71f"
+    },
+    "rfc": {
+      "at": "2026-08-09T18:11:22Z",
+      "blob": "f6af7260918e938ede38864cdd28a4679709fb9d"
+    },
+    "backlog": {}
   },
   "notes": "Recorded by hand: local/bin/ob-gate, which will own this file, is what this epic builds. Provisional layout ratified by rfc.md."
 }
