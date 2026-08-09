@@ -75,6 +75,17 @@
           "story-03-review-watch.md": "61a5d35c7d84adbdf33cb7931556eb6647de3ad1",
           "story-04-land-teardown.md": "a96ed52ddff69f0dea1f66b40d64caf710e6ef15"
         }
+      },
+      "plan-workflow-06-automerge": {
+        "at": "2026-08-09T21:58:28Z",
+        "files": {
+          "plan.md": "63341e4d0c61087b9d536d790086a3de2ad15c53",
+          "story-01-gate-stage-advance-only.md": "f1dc0966e241ebcbd92a84030dad1746bcf905d7",
+          "story-02-gate-record-automerge.md": "709576ffe692220c40545ba19ad0a9915f306816",
+          "story-03-merge-check.md": "7be1dbd8e21b578e733c9db8741c976e4579bbe7",
+          "story-04-review-auto-merge.md": "2829e9f64678a7e259524ee9826646d432c7d630",
+          "story-05-reviewer-rubric-r12.md": "80fdad7864bdd2ab2cba9d6f432509f7412ba224"
+        }
       }
     },
     "automerge": {
