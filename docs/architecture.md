@@ -144,11 +144,12 @@ wins, one action per poll pass**:
 | 2 | PR exists and has label `openbuilder:approved` | skip forever |
 | 3 | PR exists and has label `openbuilder:blocked` | skip forever |
 | 4 | attempts counter ≥ `OPENBUILDER_MAX_ATTEMPTS` | label `openbuilder:blocked`, comment why, skip |
+| 4b | no PR yet, and the plan branch's backlog is not approved in `state.json` | skip quietly: no attempt, no label, no comment |
 | 5 | no PR with head `openbuilder/work/<slug>` exists | `ob-implement <owner/repo> <slug>` |
 | 6 | PR exists and has label `openbuilder:changes-requested` | `ob-respond <owner/repo> <slug> <pr>` |
 | 7 | otherwise | skip (waiting on the human reviewer) |
 
-The ordering is the whole design. Rules 1–4 are refusals and they come first, so no amount of label
+The ordering is the whole design. Rules 1–4b are refusals and they come first, so no amount of label
 weirdness or leftover state can make the instance act on a slug a human has closed out. Rule 7 is the resting
 state: the common case for a live PR is "do nothing, the reviewer has it".
 
@@ -164,6 +165,7 @@ table a second time, in Python (`waker/github.py:decide`), against the same GitH
 | 2 | `openbuilder:approved` → skip forever | same verdict: not actionable |
 | 3 | `openbuilder:blocked` on the PR → skip forever | same verdict: not actionable |
 | 4 | attempts ≥ `MAX_ATTEMPTS` → label `blocked`, comment, skip | **invisible** — the counter lives in `state/`; covered by its side effect |
+| 4b | backlog not approved on the plan branch → skip | same verdict: not actionable |
 | 5 | no PR with head `openbuilder/work/<slug>` → implement | same verdict: actionable |
 | 6 | `openbuilder:changes-requested` → respond | same verdict: actionable |
 | 7 | otherwise → skip | same verdict: not actionable — the resting state |
@@ -187,6 +189,55 @@ boots for work it then refuses to do (waker too permissive) or a labelled PR sit
 opens a terminal (waker too strict). Both are silent, which is why the `rule` number is on every verdict —
 `ob-poll` logs `DECISION ... rule=<n> action=<...>`, the waker logs `DECISION ... rule=<n> actionable=<...>`,
 and for the same slug the two rule numbers must agree.
+
+### Rule 4b — the backlog approval gate
+
+Rule 4b sits between rules 4 and 5 and applies only to a slug that has no pull request: the plan branch
+must carry proof that its backlog is approved, or `ob-poll` declines the slug quietly and the waker finds
+nothing actionable. A branch pushed by hand, by a script or by a mistake therefore never reaches
+`ob-implement` and never wakes the instance.
+
+**What it reads** — three reads, all from the plan branch `openbuilder/plan/<slug>`:
+
+- the contents of a file at a ref (`GET repos/<repo>/contents/<path>?ref=<ref>`) for
+  `.openbuilder/backlog/<slug>/plan.md` — its `- epic:` line names the epic;
+- the same endpoint for `.openbuilder/epics/<epic>/state.json` — the approval record;
+- the contents of a directory at a ref for `.openbuilder/backlog/<slug>/` — the file listing.
+
+A listing entry's `sha` **is** the git blob sha — the value `git rev-parse <ref>:<path>` prints — so the
+file-set check needs no card content. The three calls happen only for a slug that has no pull request, so
+the steady-state cost is zero.
+
+**What it requires to pass**: `stage: dispatched` in `state.json`, and an
+`approvals.backlog[<slug>].files` map whose entries match the committed blob shas exactly, with no missing
+and no extra `story-*.md`.
+
+**The five reason strings**, emitted byte-identically by both implementations (`runner/bin/ob-poll` and
+`waker/github.py`). A read failure of any kind is reported as the same reason as an absent file, because a
+decline has no side effect and the next pass is 60 seconds later:
+
+| Cause | `reason=` |
+|---|---|
+| `plan.md` unreadable, no `- epic:` line, or an invalid epic name | `backlog-unapproved:no-epic-line` |
+| `state.json` unreadable or not parseable JSON | `backlog-unapproved:no-state` |
+| `stage` is not `dispatched` | `backlog-unapproved:stage=<stage>` |
+| no approval record, or an empty `files` map | `backlog-unapproved:no-approval` |
+| the recorded shas and the listing disagree | `backlog-unapproved:files-differ(<name>)` |
+
+**Why the decline is quiet**: `action=skip` and nothing else — no attempt consumed, no label, no comment,
+no `ACTIONABLE` increment, so no wake-up. A loud refusal would label the slug `openbuilder:blocked`, which
+rule 3 treats as terminal, so one human mistake would need a second human to clear it. The decision goes
+to stdout only, because an uneventful pass must not touch `log/openbuilder.log`, whose mtime `ob-idle-stop`
+reads as "when work last happened":
+
+```
+DECISION repo=owner/x slug=y rule=4b action=skip reason=backlog-unapproved:no-approval
+```
+
+**How the two implementations were proven to agree**: seven live fixture branches in a sandbox repository
+the instance does not poll — one per decline cause plus the pass case — with `ob-poll --dry-run` and
+`waker/github.py:decide` run against the same branches and the extracted `slug`/`reason` pairs diffed. A
+side-by-side read of the two files is not accepted as evidence for this rule.
 
 ### The flap guard — second line of defence
 
