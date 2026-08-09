@@ -1,0 +1,9 @@
+{
+  "epic": "plan-workflow",
+  "repo": "artemkurylo/openbuilder",
+  "stage": "intake",
+  "opened": "2026-08-09",
+  "slugs": [],
+  "approvals": {},
+  "notes": "Provisional layout: this epic defines .openbuilder/epics/<epic>/ and this state file. Both are ratified or replaced by its own RFC."
+}

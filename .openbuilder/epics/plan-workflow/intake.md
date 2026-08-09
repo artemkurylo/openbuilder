@@ -1,0 +1,174 @@
+# Intake — `plan-workflow`
+
+The grill, question by question. Written **during** the interrogation, one block per question, not
+summarised afterwards: an omp session is not durable, this branch is. Re-running
+`/openbuilder-plan plan-workflow` reads `state.json`, sees `stage: intake`, and resumes at the
+first unanswered question instead of re-interrogating.
+
+- epic: `plan-workflow`
+- repo: `artemkurylo/openbuilder`
+- opened: 2026-08-09
+- stage: `intake`
+
+## Problem statement (as given, 2026-08-09)
+
+> I want a persistent, harness-driven workflow. When I plan to work on something I want a
+> pre-defined path: slash command `openbuilder-plan`. I describe the problem, Opus 5 grills me,
+> and once the plan is agreed and every question is exercised we branch. Then a PRD, which I
+> approve. Then a technical approach — an RFC — which I approve. Then a backlog of stories. Then
+> the openbuilder worker takes them one by one with access to the PRD, the RFC and the cards, and
+> opens a PR (or several, if that makes sense). Then I kick off a review agent on my laptop; the
+> two of you talk through GitHub comments until it approves. Then I review, I merge, the branch is
+> deleted.
+
+Four human gates: PRD, RFC, backlog, merge. Between any two gates there is exactly one actor with
+one model. Nothing crosses a gate without a durable record that a human said yes.
+
+This epic is itself the first thing to go through the workflow it defines, which is why this file
+exists on a branch before the tooling does.
+
+## What the repository already does (verified against `main` @ `e0d231b`)
+
+Read before asking anything, because most of the workflow is already built and the questions
+below are only about the parts that are not.
+
+| Already there | Where | Fits the new flow? |
+|---|---|---|
+| `openbuilder plan <repo> <slug>` scaffolds `plan.md` and launches an Opus 5 session in a managed clone | `local/bin/openbuilder:564` | becomes the workflow launcher; the scaffold is replaced by stages |
+| `planner` agent writes cards from a conversation | `agent/local/agents/planner.md` | must read `prd.md`/`rfc.md` instead of interviewing |
+| card contract | `backlog/SCHEMA.md`, `write-backlog` skill | unchanged |
+| `dispatch` commits and pushes `openbuilder/plan/<slug>` | `local/bin/openbuilder:666` | becomes the dispatch gate |
+| the poller's trigger is the ref `refs/heads/openbuilder/plan/*` | `runner/bin/ob-poll:49,132` | **this is the spend switch** — see Q4 |
+| one work branch and one PR per slug, all cards in one omp run | `runner/bin/ob-implement:113-146,266` | see Q1 |
+| work branch cut from `merge-base(plan, default)`; PR base is the default branch | `runner/bin/ob-implement:83,271` | why the backlog stays out of the review diff — keep |
+| implementer reads only `plan.md` + `story-*.md` off the plan branch | `runner/bin/ob-implement:113-146` | needs two more blocks: PRD, RFC |
+| six `openbuilder:*` labels; `ob-respond` re-labels `awaiting-review` after each round | `ob-common.sh:278`, `ob-respond:344` | the review loop's trigger already exists |
+| `reviewer` agent posts one verdict and one label | `agent/local/agents/reviewer.md` | gains the RFC as a contract to check against |
+| attempt budget of 6, then `blocked` and terminal | `ob-poll:124`, `ob-common.sh:426` | bounds the review loop for free |
+| slash commands load from `<cwd>/.omp/commands/*.md` | omp `slash-command-internals.md` §2 | `ob_install_local_assets` mirrors `agent/local/agents` into the clone but **not** commands — one-line gap |
+| headless omp, proven | `ob-common.sh:682` | the review loop can run unattended on the laptop |
+
+Two gaps that are not questions, just missing work:
+
+- **Nothing tears down.** `origin` still carries `openbuilder/plan/learn-command` and
+  `openbuilder/plan/scrub-hook` for two finished, merged slugs. Their PRs are approved so rule 2
+  skips them forever, but the poller and the waker evaluate them on every pass, and the instance
+  keeps a worktree and a state directory per slug. `land` has to exist.
+- **The review loop is hand-cranked.** Each round needs `openbuilder review`, then
+  `openbuilder request-changes`, then `openbuilder review` again. "You talk through GitHub
+  comments until it approves" is a `--watch` flag over labels that already change correctly.
+
+## Open questions
+
+### Q1 — One pull request per slug, or one per story?
+
+**Asked because** `ob-implement` hands every card in a slug to a single omp run on a single work
+branch and opens one PR (`ob-implement:113-146,266`). Your "or multiple PRs, if it makes sense"
+has two readings and they cost very differently.
+
+- **A. PR = slug (recommended).** The backlog stage decides how many PRs by emitting several
+  slugs — `plan-workflow-01`, `-02` — each with 1–3 cards. Zero changes to the state machine, the
+  label protocol, the waker parity contract or the attempt budget. You dispatch them one at a
+  time.
+- **B. PR = story.** Per-story work branches, per-story attempt counters, a gate that holds story
+  02 until 01 merges, and either stacked branches (which collide with "the bot never force-pushes")
+  or serialisation on your merge latency. A new state machine, not an increment — and it buys
+  smaller diffs, which A already buys.
+
+**Answered** _pending_
+
+### Q2 — Where do the PRD and the RFC live after the branches are deleted?
+
+**Asked because** the epic docs only exist on `openbuilder/design/*` and `openbuilder/plan/*`,
+and the work branch is deliberately cut from the merge-base so they never enter the PR diff
+(`ob-implement:83`). Step "the branch is deleted" therefore destroys the reasoning.
+
+- **A. They ride the work branch into `main` (recommended).** `ob-implement` copies
+  `.openbuilder/epics/<epic>/` onto the work branch as its first commit, idempotently. Cost: two
+  documents in the review diff that the reviewer wants to read anyway. Benefit: merged `main` is
+  self-documenting and survives every branch deletion.
+- **B. Archive as a tag** — `git tag openbuilder/epic/<epic>` before deleting. Permanent, out of
+  the way, and unreadable as documentation.
+- **C. Let them die.** The PR body already embeds the plan.
+
+**Answered** _pending_
+
+### Q3 — How do you approve a PRD or an RFC?
+
+**Asked because** the approval has to be durable and tamper-evident, otherwise "approved PRD"
+becomes a ceremony an eager agent can edit out from under you. My mechanism either way: record
+the artifact's git blob sha in `state.json`, so if the file changes the approval is void and the
+workflow refuses to advance. The question is only the surface.
+
+- **A. In the session (recommended for speed).** You say approve; I commit `state.json` with an
+  `Approves-prd: <blob>` trailer. Zero friction, no round trip.
+- **B. A pull request from the design branch.** You get inline comments, review-from-phone, and a
+  GitHub-native audit trail; the cost is an extra PR per epic that is never merged (or is merged
+  into `main` — which incidentally answers Q2 as well).
+
+**Answered** _pending_
+
+### Q4 — Should the dispatch gate be enforced by the state machine, or by convention?
+
+**Asked because** the trigger is a ref name: `ob-poll` matches `refs/heads/openbuilder/plan/*`
+and rule 5 fires as soon as such a branch exists with no PR (`ob-poll:49,132`). A design branch
+named `openbuilder/design/<epic>` is invisible to it, so simply not creating the plan branch until
+you approve the backlog is a complete gate — enforced by the CLI, i.e. by convention.
+
+- **A. Convention (recommended).** No runner change at all. The one hole is a human pushing
+  `openbuilder/plan/*` by hand with an unapproved or empty backlog; today that fails loudly and
+  terminally (`read_backlog` dies, slug gets `blocked`), not dangerously.
+- **B. Invariant.** Rule 5 additionally requires `state.json` on the plan branch to carry an
+  `approvals.backlog` blob matching the committed cards. Because `ob-poll` and `waker/github.py`
+  implement the same table by contract (architecture §2 parity), this is the same change in bash
+  and Python plus its parity test, and one extra API call per rule-5 candidate.
+
+**Answered** _pending_
+
+### Q5 — Is "backlog written" a gate, or does the worker start immediately?
+
+**Asked because** you named approvals for the PRD and the RFC but described the worker starting
+once the backlog exists. Dispatch is the first moment money is spent and the last free moment to
+veto a bad slice — and the planner is already instructed to surface the decisions it made on the
+implementer's behalf "so the human can veto them now rather than at review time"
+(`planner.md:139-144`). I want one keystroke there. Say so if you'd rather it were automatic.
+
+**Answered** _pending_
+
+### Q6 — Which clone does the workflow run in?
+
+**Asked because** `openbuilder plan` clones the target into a CLI-managed workspace and mirrors
+the agents into `<clone>/.omp/agents` with `/.omp/` added to the clone's local excludes
+(`local/bin/openbuilder:503`). That is not the checkout you are sitting in right now.
+
+- **A. The managed clone (recommended).** The CLI owns branch discipline and asset installation;
+  your own working tree is never touched.
+- **B. Your current checkout, whatever it is.** Convenient, but the workflow then has to cope with
+  your uncommitted work, your branch, and installing `.omp/` assets into a tree you also use.
+
+**Answered** _pending_
+
+### Q7 — When does the grill stop?
+
+**Asked because** an interrogation with no stopping rule is a way to never reach a PRD. My
+proposed rule: I keep asking only while an unanswered question would change an artifact — a PRD
+requirement, an RFC decision, or a story card's acceptance list. Anything the repository can
+answer, I answer myself instead of asking. You can say "enough" at any point and I record every
+still-open question as a stated assumption in the PRD rather than silently guessing.
+
+**Answered** _pending_
+
+### Q8 — Bootstrap: who builds this workflow?
+
+**Asked because** the workflow's own tooling lives in the file that dispatches the workflow —
+`local/bin/openbuilder`, 1189 lines — and handing that to DeepSeek V4 Flash is a chicken-and-egg
+risk: a broken `dispatch` cannot be fixed by dispatching.
+
+- **A. Split (recommended).** I build the stage machinery locally (the command, the skill, the
+  `architect` agent, the prompt and agent changes). The remote implementer builds the two
+  self-contained additions — `openbuilder land` and `openbuilder review --watch` — through the
+  normal loop, which also proves the new flow end to end on real work.
+- **B. All remote.** Maximum dogfooding, and the failure mode is that the tool breaks the tool.
+- **C. All local.** Safest and least interesting; the remote instance sits idle.
+
+**Answered** _pending_
