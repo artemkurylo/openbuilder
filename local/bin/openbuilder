@@ -614,6 +614,7 @@ usage: openbuilder <command> [args]
   review [--watch] <owner/repo> <pr>  review a pull request with Opus 5; --watch runs every round
   approve <owner/repo> <pr>         label a pull request approved
   request-changes <owner/repo> <pr> ask the instance for another round
+  land <owner/repo> <pr>            merge an approved pull request and delete every branch it used
   status [owner/repo]               slugs, branches, pull requests, labels
   logs [-f] [-n lines]              tail the instance's operational log over SSM
   shell                             interactive SSM session on the instance
@@ -1144,6 +1145,173 @@ cmd_request_changes() {
 }
 
 # ---------------------------------------------------------------------------
+# land
+# ---------------------------------------------------------------------------
+
+# cmd_land <owner/repo> <pr> — the only merge path, and the only teardown
+# (RFC §3.7). Refuses every unsafe state before any destructive call, merges
+# with `--squash --delete-branch`, deletes the plan branch, deletes the design
+# branch only when no other slug of the epic is unlanded, and prunes the
+# instance over SSM. Never re-runnable past the merge, so everything that can
+# refuse refuses before it. Exit codes: 0 landed, 1 refusal, 4 blocked,
+# 6 instance prune failed.
+cmd_land() {
+    local usage="usage: $OB_PROG land <owner/repo> <pr>"
+    [[ $# -eq 2 ]] || ob_die "$usage"
+    local repo=$1 pr=$2
+    ob_validate_repo "$repo"
+    ob_validate_pr "$pr"
+    ob_need gh aws jq
+
+    local view state head slug plan_branch epic design_branch
+    view=$(ob_gh pr view "$pr" --repo "$repo" --json headRefName,labels,state,title,baseRefName) ||
+        ob_die "cannot read pull request #$pr in $repo"
+
+    if ! jq -e --arg l "$OB_LABEL_PREFIX:approved" \
+        '.labels | map(.name) | index($l)' <<<"$view" >/dev/null 2>&1; then
+        ob_die "$repo#$pr is not labelled $OB_LABEL_PREFIX:approved; land never merges an unapproved pull request.
+  Review it first:  $OB_PROG review --watch $repo $pr"
+    fi
+
+    state=$(jq -r '.state' <<<"$view")
+    [[ $state == OPEN ]] ||
+        ob_die "$repo#$pr is $state, not OPEN; there is nothing to land"
+
+    head=$(jq -r '.headRefName' <<<"$view")
+    [[ $head == "$OB_BRANCH_PREFIX/work/"* ]] ||
+        ob_die "the head branch of $repo#$pr is '$head', not under $OB_BRANCH_PREFIX/work/; land only handles openbuilder pull requests"
+    slug=${head#"$OB_BRANCH_PREFIX/work/"}
+    ob_validate_slug "$slug"
+    plan_branch=$(ob_plan_branch "$slug")
+
+    # land makes no local git call: plan.md and state.json are read over the
+    # contents API with the raw-content header.
+    local plan_md
+    plan_md=$(ob_gh api "repos/$repo/contents/.openbuilder/backlog/$slug/plan.md?ref=$plan_branch" \
+        -H 'Accept: application/vnd.github.raw' 2>/dev/null) ||
+        ob_die "cannot read .openbuilder/backlog/$slug/plan.md on $plan_branch; land cannot tell which epic to clean up"
+    epic=$(printf '%s\n' "$plan_md" | ob_epic_of_plan)
+    [[ -n $epic ]] ||
+        ob_die ".openbuilder/backlog/$slug/plan.md on $plan_branch has no '- epic:' line; land cannot tell which epic to clean up"
+    ob_validate_slug "$epic"
+    design_branch=$(ob_design_branch "$epic")
+
+    local state_json
+    state_json=$(ob_gh api "repos/$repo/contents/.openbuilder/epics/$epic/state.json?ref=$design_branch" \
+        -H 'Accept: application/vnd.github.raw' 2>/dev/null) ||
+        ob_die "cannot read .openbuilder/epics/$epic/state.json on $design_branch; land will not delete branches it cannot account for"
+    if ! jq -e '.slugs | type == "array"' <<<"$state_json" >/dev/null 2>&1; then
+        ob_die "cannot read .openbuilder/epics/$epic/state.json on $design_branch; land will not delete branches it cannot account for"
+    fi
+    local -a slugs=()
+    local s
+    while IFS= read -r s; do
+        [[ -n $s ]] || continue
+        slugs+=("$s")
+    done <<<"$(jq -r '.slugs[]' <<<"$state_json")"
+
+    # A slug from state.json.slugs is unlanded while its plan ref is still
+    # present; land deletes the plan branch, so absence of the ref is the
+    # landed signal. First listing feeds the confirmation display (this slug
+    # excluded — its ref still exists until step 8).
+    local plan_refs keep_design=0
+    plan_refs=$(ob_gh api "repos/$repo/git/matching-refs/heads/$OB_BRANCH_PREFIX/plan/" --jq '.[].ref' 2>/dev/null || true)
+    for s in "${slugs[@]}"; do
+        [[ $s == "$slug" ]] && continue
+        if printf '%s\n' "$plan_refs" | grep -qxF "refs/heads/$OB_BRANCH_PREFIX/plan/$s"; then
+            keep_design=1
+        fi
+    done
+
+    local title base key
+    title=$(jq -r '.title' <<<"$view")
+    base=$(jq -r '.baseRefName' <<<"$view")
+    key=$(ob_repo_key "$repo")__$slug
+
+    printf 'land %s#%s: %s\n' "$repo" "$pr" "$title"
+    printf '  head branch : %s\n' "$head"
+    printf '  base branch : %s\n' "$base"
+    printf 'will delete:\n'
+    printf '  %s\n' "$head"
+    printf '  %s\n' "$plan_branch"
+    if [[ $keep_design -eq 1 ]]; then
+        printf '  %s (kept — epic %s has other unlanded slugs)\n' "$design_branch" "$epic"
+    else
+        printf '  %s\n' "$design_branch"
+    fi
+    printf 'on the instance:\n'
+    printf '  %s/work/%s\n' "$OB_REMOTE_HOME" "$key"
+    printf '  %s/state/%s\n' "$OB_REMOTE_HOME" "$key"
+
+    local answer
+    printf 'type "land %s" to proceed: ' "$slug"
+    read -r answer || ob_die "confirmation did not match \"land $slug\"; nothing was merged and nothing was deleted"
+    [[ $answer == "land $slug" ]] ||
+        ob_die "confirmation did not match \"land $slug\"; nothing was merged and nothing was deleted"
+
+    local unlanded=0
+    ob_gh pr merge "$pr" --repo "$repo" --squash --delete-branch ||
+        ob_die "gh pr merge $pr failed; nothing was deleted"
+    ob_info "merged $repo#$pr and deleted $head"
+
+    if ! ob_gh api -X DELETE "repos/$repo/git/refs/heads/$plan_branch" >/dev/null 2>&1; then
+        ob_warn "could not delete $plan_branch (already gone?)"
+    fi
+    ob_info "deleted $plan_branch"
+
+    # Re-list after the plan-branch deletion so this slug is no longer among
+    # the survivors; any remaining ref from state.json.slugs keeps the design
+    # branch alive for the rest of the epic.
+    plan_refs=$(ob_gh api "repos/$repo/git/matching-refs/heads/$OB_BRANCH_PREFIX/plan/" --jq '.[].ref' 2>/dev/null || true)
+    unlanded=0
+    for s in "${slugs[@]}"; do
+        if printf '%s\n' "$plan_refs" | grep -qxF "refs/heads/$OB_BRANCH_PREFIX/plan/$s"; then
+            unlanded=1
+        fi
+    done
+    if [[ $unlanded -eq 1 ]]; then
+        ob_info "keeping $design_branch — epic $epic has unlanded slugs"
+    else
+        if ! ob_gh api -X DELETE "repos/$repo/git/refs/heads/$design_branch" >/dev/null 2>&1; then
+            ob_warn "could not delete $design_branch (already gone?)"
+        fi
+        ob_info "deleted $design_branch — epic $epic has no unlanded slugs"
+    fi
+
+    # Prune the instance: worktree, local work branch and per-slug state. The
+    # merge and the branch deletions already happened; the report above is
+    # printed first because a failed prune must not look like a full teardown —
+    # report it, exit 6, and never stop the instance (ob-idle-stop owns that).
+    printf 'landed %s#%s :: %s\n' "$repo" "$pr" "$slug"
+    printf 'deleted %s\n' "$head"
+    printf 'deleted %s\n' "$plan_branch"
+    if [[ $unlanded -eq 1 ]]; then
+        printf 'kept %s (unlanded slugs remain)\n' "$design_branch"
+        printf 'epic %s still has unlanded slugs. Dispatch the next one:\n' "$epic"
+        for s in "${slugs[@]}"; do
+            if printf '%s\n' "$plan_refs" | grep -qxF "refs/heads/$OB_BRANCH_PREFIX/plan/$s"; then
+                printf '  %s dispatch %s %s\n' "$OB_PROG" "$repo" "$s"
+            fi
+        done
+    else
+        printf 'deleted %s\n' "$design_branch"
+    fi
+
+    local rc=0 out
+    ob_ensure_running
+    rc=0
+    out=$(ob_ssm_exec "$(ob_land_prune_script "$repo" "$slug")") || rc=$?
+    [[ -n $out ]] && printf '%s' "$out"
+    if [[ $rc -ne 0 ]]; then
+        ob_warn "instance cleanup failed (exit $rc); prune it by hand:
+  $OB_PROG shell
+  sudo -u $OB_REMOTE_USER git -C $OB_REMOTE_HOME/src/$(ob_repo_key "$repo") worktree remove --force $OB_REMOTE_HOME/work/$key
+  sudo rm -rf $OB_REMOTE_HOME/state/$key"
+        return 6
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
 
@@ -1491,6 +1659,29 @@ done
 EOF
 }
 
+# Builds the strictly POSIX teardown payload for `cmd_land`. AWS-RunShellScript
+# runs /bin/sh (dash on Ubuntu) — no [[, no arrays, no ${var//x/y} — and every
+# git command runs as the openbuilder service user, because root git trips
+# git's "dubious ownership" refusal on an openbuilder-owned clone.
+ob_land_prune_script() {
+    local repo=$1 slug=$2
+    local src
+    src=$OB_REMOTE_HOME/src/$(ob_repo_key "$repo")
+    cat <<EOF
+key=$(ob_repo_key "$repo")__$slug
+src=$src
+wt=$OB_REMOTE_HOME/work/\$key
+st=$OB_REMOTE_HOME/state/\$key
+if [ -d "\$wt" ]; then
+  sudo -u $OB_REMOTE_USER git -C "\$src" worktree remove --force "\$wt" 2>/dev/null || rm -rf "\$wt"
+fi
+sudo -u $OB_REMOTE_USER git -C "\$src" worktree prune 2>/dev/null || true
+sudo -u $OB_REMOTE_USER git -C "\$src" branch -D $OB_BRANCH_PREFIX/work/$slug 2>/dev/null || true
+rm -rf "\$st"
+printf 'pruned %s and %s\n' "\$wt" "\$st"
+EOF
+}
+
 cmd_cost() {
     local usage="usage: $OB_PROG cost"
     [[ $# -eq 0 ]] || ob_die "$usage"
@@ -1549,6 +1740,7 @@ main() {
     review) cmd_review "$@" ;;
     approve) cmd_approve "$@" ;;
     request-changes) cmd_request_changes "$@" ;;
+    land) cmd_land "$@" ;;
     status) cmd_status "$@" ;;
     logs) cmd_logs "$@" ;;
     shell) cmd_shell "$@" ;;

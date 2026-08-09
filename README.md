@@ -15,17 +15,17 @@ branch, a commit, a PR comment or a label, so the whole system is auditable with
 
 ```mermaid
 flowchart TD
-    A["Laptop: openbuilder plan<br/>Opus 5 writes story cards"] --> B["Laptop: openbuilder dispatch<br/>starts instance, pushes openbuilder/plan/slug"]
+    A["Laptop: openbuilder plan<br/>epic workflow session: intake -> PRD -> RFC -> backlog, gated"] --> B["Laptop: openbuilder dispatch<br/>verifies approval, pushes openbuilder/plan/slug"]
     B --> C["GitHub: plan branch + label openbuilder:queued"]
     C --> D["Instance: ob-poll every 60s<br/>rule 5 matches"]
     D --> E["Instance: ob-implement<br/>DeepSeek V4 Flash writes code"]
     E --> F["GitHub: PR from openbuilder/work/slug<br/>label openbuilder:awaiting-review"]
-    F --> G["Laptop: openbuilder review<br/>Opus 5 reads the diff"]
+    F --> G["Laptop: openbuilder review --watch<br/>Opus 5 reads the diff"]
     G -->|changes needed| H["Laptop: openbuilder request-changes<br/>label openbuilder:changes-requested"]
     H --> I["Instance: ob-poll rule 6<br/>ob-respond, fresh session + worklog"]
     I --> F
     G -->|looks good| J["Laptop: openbuilder approve<br/>label openbuilder:approved"]
-    J --> K["Human: gh pr merge --squash"]
+    J --> K["Human: openbuilder land<br/>merge, delete all three branches, prune the instance"]
     F -.->|nothing to do for 30 min| L["Instance: ob-idle-stop<br/>instance stops itself"]
     L -.-> M["Waker Lambda: every 5 min<br/>ob-poll's rule table, evaluated from outside"]
     M -.->|actionable and stopped| N["ec2:StartInstances<br/>~30-45 s to a live poll timer"]
@@ -413,14 +413,19 @@ on approval, printing the `openbuilder land` command to run next; exit 4 means t
 `openbuilder:blocked` and a human is required; exit 5 means the round cap was hit without a verdict.
 The attended form above is still the path when you want to read the diff yourself.
 
-### 13. Approve and merge
+### 13. Approve and land
 
 ```sh
 openbuilder approve you/your-repo 42
-gh pr merge 42 --repo you/your-repo --squash --delete-branch
+openbuilder land you/your-repo 42
 ```
 
 `openbuilder:approved` is the instance's stop sign: rule 2 in the state machine skips that slug forever.
+`openbuilder land` is the only merge path: it refuses unless the PR carries `openbuilder:approved`,
+requires you to type `land <slug>` to confirm, merges with `--squash --delete-branch`, deletes the plan
+branch, deletes the design branch (only when no other slug of the epic is still unlanded), and prunes
+the instance's worktree and state for that slug over SSM. Nothing it deletes is restored by re-running
+it — the confirmation is the whole safety mechanism.
 **Only a human merges.** The remote agent is blocked from merging, force-pushing and pushing to a
 default branch by the guardrails hook, and never has a reason to try.
 
@@ -432,15 +437,15 @@ comes back up on its own the next time GitHub has work for it.
 Once the setup above is done, a normal day is four commands:
 
 ```sh
-openbuilder plan     you/your-repo add-rate-limit   # think, then edit the story cards
-openbuilder dispatch you/your-repo add-rate-limit   # starts the instance, pushes the plan branch
-openbuilder review   you/your-repo 43               # Opus 5 reviews; you read its verdict
-openbuilder approve  you/your-repo 43               # then gh pr merge
+openbuilder plan     you/your-repo <epic>     # epic workflow session: intake -> PRD -> RFC -> backlog
+openbuilder dispatch you/your-repo <slug>     # refuses without a recorded backlog approval; pushes the plan branch
+openbuilder review   --watch you/your-repo 43 # Opus 5 reviews every round to a verdict, unattended
+openbuilder land     you/your-repo 43         # merge, delete all three branches, prune the instance
 ```
 
-`plan` and `review` are the two that genuinely need your laptop — that is where Opus 5 runs. `dispatch`
-pushes a branch and `approve` moves a label, and doing either from the GitHub web UI works identically,
-because the waker watches the same branches and labels the CLI would have touched.
+`plan` and `review --watch` are the two that genuinely need your laptop — that is where Opus 5 runs.
+`dispatch` refuses without a recorded backlog approval, and `land` is the one merge path, deleting the
+work, plan and design branches and pruning the instance afterwards.
 
 Everything else is observation:
 
