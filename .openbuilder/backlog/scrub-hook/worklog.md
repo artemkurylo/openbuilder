@@ -103,3 +103,48 @@ Added `local/bin/ob-install-hooks` (story-01): an executable installer that reso
   repository's own git dir is run by every repo, so refuse the install and make
   the hook a no-op where the tool it invokes is absent. Candidate appended to the
   round-002 proposal file for the reviewer.
+
+## Round 2 — 2026-08-09T07:51:28Z
+
+Review-response round by `ob-respond` (attempt 2 of 6).
+
+- action: respond to review
+- pull request: #2
+- model: `openrouter/deepseek/deepseek-v4-flash-0731`
+- new commits: 4
+- cost: 0.06718643456 USD
+
+### Agent summary
+
+## Summary
+Addressed both defects plus the optional item: argument parsing now loops over `"$@"` and rejects `--force --uninstall` as a contradiction; a plain install refuses a hooks directory outside the repository's own git dir (naming `core.hooksPath` and `--force`, writing nothing); and the hook body now resolves its own repository and exits 0 quietly where `ob-scrub-check` is absent, so a forced install into a shared dir is a no-op elsewhere, not a wall. Proposed the `core.hooksPath` learning to the reviewer. Four commits, tree clean.
+
+## Feedback
+- `local/bin/ob-install-hooks` arg parsing: fixed — loops over `"$@"`; `--force --bogus` exits 2 naming the argument; `--force --uninstall` exits 2 as a contradiction.
+- `local/bin/ob-install-hooks` shared `core.hooksPath`: fixed — resolved hooks dir compared against the repository's own git dir via `git rev-parse --git-common-dir`; outside it, install exits 1 (stderr, names `core.hooksPath` and `--force`), nothing created, setting untouched. Deliberate deviation: `--git-common-dir` rather than the suggested `--absolute-git-dir`, because that flag resolves to the per-worktree dir and would falsely refuse legitimate installs from linked worktrees of the same repository (this worktree included), while the common dir is the true owner of the hooks directory. Uninstall from a forced shared install still works.
+- Hook body: fixed — `git rev-parse --show-toplevel`, exit 0 quietly when `$REPO_ROOT/local/bin/ob-scrub-check` is not executable, else `exec` it (exit status still propagates).
+- `--force` overwriting an existing `.bak`: fixed — prints "replacing the previous ... .bak" first (your optional item).
+- Learning: proposed — one candidate written to `rounds/002/learnings-proposed.md`; it passed all four tests and is not in `LEARNINGS.md`.
+
+## Verification
+- `shellcheck -x -S warning local/bin/ob-install-hooks` (v0.11.0 static, as round 1) -> exit 0; same on an installed hook copy -> exit 0; `make lint` (binary on PATH) -> exit 0 over all 15 scripts; `make scrub` -> exit 0
+- Scratch-clone runs (state: branch HEAD `19fce02`): `--help` exit 0; plain install -> absolute path printed, `-x` hook; second run -> "already installed", exit 0, byte-identical (`md5sum`); staged deny match -> `git commit` exit 1, no commit; clean commit passes; foreign hook -> exit 1 naming `--force`, file intact; `--force` -> preserved as `.bak` (and says when replacing an existing `.bak`); `--uninstall` removes ours, refuses foreign (exit 1); absent/outside-repo/unknown-arg paths exit 0/1/2 as before
+- Shared-hooks repro (`GIT_CONFIG_KEY_0=core.hooksPath …`): plain run -> exit 1, message names `core.hooksPath` and `--force`, `/tmp/shared-hooks` never created; `--force` -> installs there; that hook fired in an unrelated repo -> exit 0, no output; fired in its own repo -> refuses a staged match (exit 1); old pre-fix body reproduced verbatim failing `No such file or directory` (exit 127) to confirm the mechanism
+- Linked worktree of the clone: install allowed into the common git dir, hook fires from the worktree root, uninstall works
+- `make hooks` -> install, re-run -> "already installed", `make help` lists `hooks`; clone left hookless, scratch dirs removed
+- Commits: `f8ede33` (args), `71e6c3b` (shared-dir + hook no-op), `19fce02` (.bak), `b4dc610` (worklog); working tree clean
+
+## Still open
+- none
+
+### Learnings proposed this round
+
+Candidates only. They reach `LEARNINGS.md` in the control repo when the reviewer commits them there, and nowhere else.
+
+### N. A hook installed in one repository must be a no-op, not a wall, in every other
+
+**Symptom** `/tmp/shared-hooks/pre-commit: line 4: /tmp/other-repo/local/bin/ob-scrub-check: No such file or directory` (exit 127) — a hook installed in one repository dying in every other repository that shares the same `core.hooksPath`.
+**Cause** `git rev-parse --git-path hooks` honours `core.hooksPath`. When that setting points at a shared directory (a global `~/.githooks` is the common setup), one hook file runs in every repository, and a hook body that references `local/bin/...` relative to the working tree resolves it against whichever repository happens to be committing.
+**Rule** Treat the resolved hooks directory like any shared location: before writing to it, verify it lies inside the repository's own git directory (`git rev-parse --git-common-dir`) and refuse otherwise, naming `--force` for the deliberate case; and write the hook so it resolves its own repository (`git rev-parse --show-toplevel`) and exits 0 quietly when the command it would run is not present there.
+**Proven** 2026-08-09 on the instance while addressing the review of `ob-install-hooks` (artemkurylo/openbuilder#2): a hook body of `exec local/bin/ob-scrub-check --staged` installed under `core.hooksPath=/tmp/shared-hooks` died in an unrelated repository with exactly the quoted error; after the fix, the same hook exits 0 in a repository without the tool and still refuses a staged deny-list match in its own repository.
+
