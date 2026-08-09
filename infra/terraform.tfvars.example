@@ -9,6 +9,11 @@
 # --- Required -----------------------------------------------------------------
 
 # Target repositories the remote agent may work on, as owner/repo.
+# Every repo here must ALSO be selected in the GitHub App installation, or the
+# poller iterates it and every API call fails silently (list_plan_refs swallows
+# the error and reports "no-plan-branches"), so a misconfiguration looks like an
+# empty backlog. Check with:
+#   gh api /app/installations -> the installation id, then GET installation/repositories
 repos = [
   "artemkurylo/my-app",
   "artemkurylo/my-api",
