@@ -270,6 +270,77 @@ exactly as it is for the times you want to read the diff yourself.
 The bot never merges; `land` is human-invoked and refuses to guess a pull request. That property is
 unchanged and is checked by the reviewer's frozen-names rubric (`reviewer.md:102`).
 
+## 3.8 Auto-merge (R12)
+
+`openbuilder review --watch --auto-merge` — the flag exists on `--watch` only, because auto-merge is
+meaningless without the loop that produces the verdict.
+
+### 3.8.1 Enabling it is itself a gate
+
+`ob-gate record <epic> automerge` writes `approvals.automerge = {at, by}` and commits with an
+`Approves-automerge:` trailer. `--auto-merge` refuses unless that record exists for the epic the pull
+request belongs to, resolved from the head branch's slug and its `plan.md`. So the blast radius of a
+mistyped flag is one refusal, not a merge.
+
+### 3.8.2 The seven conditions, in the order they are cheapest to check
+
+| # | Condition | Refusal |
+|---|---|---|
+| 1 | `approvals.automerge` recorded for this epic | `automerge not authorised for <epic>; run: ob-gate record <epic> automerge` |
+| 2 | verdict `approve`, `blocking` and `important` both zero | `verdict carries <n> blocking / <n> important findings; a human should read this` |
+| 3 | no changed path matches the protected list | `diff touches <path>, which is protected; a human must read this` |
+| 4 | trial merge into the default branch succeeds textually | `trial merge conflicts with <branch>; rebase or merge by hand` |
+| 5 | `make lint` on the merge result | `lint failed on the merge result, not on the branch` |
+| 6 | `make scrub` on the merge result | `scrub failed on the merge result` |
+| 7 | the PR is still `OPEN`, still `openbuilder:approved`, and its head sha is the one reviewed | `pull request moved since review (head <a> -> <b>); re-review` |
+
+Protected paths, one list, in `local/bin/openbuilder`:
+
+```
+infra/  waker/  agent/hooks/  .github/  LEARNINGS.md  backlog/SCHEMA.md  local/bin/openbuilder
+```
+
+Each entry earns its place: infrastructure and the waker spend money and can strand the box;
+`agent/hooks/` is the guardrail denylist; `.github/` is CI, whose absence is why condition 5 exists;
+`LEARNINGS.md` is injected into every round as hard rules; `SCHEMA.md` is the card contract every
+future slug is written against; and `local/bin/openbuilder` is the CLI performing the merge — a diff
+that rewrites the merger must not be merged by it. The list is a denylist and therefore defeatable in
+principle by a diff that reaches the same effect through an unlisted path; conditions 2, 5 and 6 are
+what stand behind it, and the honest statement is that this is defence in depth, not a sandbox.
+
+### 3.8.3 Why the checks run on the merge result
+
+This repository has no `.github/workflows` — verified — so nothing runs on a pull request. The
+reviewer is the only gate, and `main` is what `ob-selfupdate` deploys onto the instance, so a bad
+merge does not just ship a bug: it can break the machine that would otherwise fix it, and recovery
+needs a human on the box.
+
+Checking the branch would miss the whole class this is aimed at: two pull requests that each pass
+alone and fail together. Both `plan-workflow-02-rule` and `plan-workflow-03-context` edit
+`docs/architecture.md`; a semantic collision between two independently-approved diffs is precisely a
+merge-result failure.
+
+Mechanism: a scratch worktree at `$OB_CACHE_DIR/automerge/<pr>`, `git merge --no-ff --no-commit` of
+the PR head into a fresh checkout of the default branch, then `make lint` and `make scrub` in that
+worktree. The worktree is removed on every exit path, success or failure. Nothing is pushed from it,
+ever.
+
+### 3.8.4 Attribution and halting
+
+The merge is performed with the **App installation token**, so GitHub records `openbuilder-bot` as
+the actor. The laptop can mint one from the App PEM without the instance — proven 2026-08-09 by
+listing the installation's repositories with `waker/rs256.py` and `waker/github.py` alone. Merging
+with the operator's own credentials would put a human's name on a decision no human made, and this
+system's whole claim is that its audit trail is true.
+
+The label protocol gains nothing: `openbuilder:approved` already means "the instance stops touching
+this". After a successful auto-merge the command performs the same teardown as `land` (§3.7) and then
+**stops**, printing the next slug's dispatch command. It does not chain to the next slug: one
+authorization, one merge.
+
+Any refusal or failure exits non-zero with the condition named, and `--watch` does not continue to
+another pull request in the same invocation.
+
 ## 4. Rule 4b — the spend gate in the state machine (R4)
 
 The load-bearing change, and the only one that lands twice.
@@ -496,7 +567,7 @@ fail for a reason unrelated to the code (PRD §10).
 
 ## 9. Proposed slicing
 
-Six slugs, six pull requests, dispatched one at a time (R10). Sized against
+Seven slugs, seven pull requests, dispatched one at a time (R10). Sized against
 `backlog/SCHEMA.md`. The planner stage produces the cards; this is the shape I intend and the
 reason for the order.
 
@@ -508,6 +579,7 @@ reason for the order.
 | 3 | `plan-workflow-03-context` | M | 01 | PRD/RFC into both prompts and the epic-docs copy. Touches `runner/` and the prompts only |
 | 4 | `plan-workflow-04-agents` | M | 01 | the command, the skill, the `architect` agent, the planner and reviewer edits, `docs/workflow.md`. No shell |
 | 5 | `plan-workflow-05-cli` | L | 00, 01, 02 | `local/bin/openbuilder`: launcher, dispatch gate, `--watch`, `land`. The riskiest file, alone, last |
+| 6 | `plan-workflow-06-automerge` | M | 01, 05 | `--auto-merge` and its seven conditions (§3.8). Last, because it merges what the others build, and it cannot merge itself — `local/bin/openbuilder` is on its own protected list |
 
 Merge order is 00 before 05 and 01 before 02. 00 first because slug 05 rewrites four commands in the
 same file, and landing the boundary afterwards would mean auditing four brand-new `gh` call sites

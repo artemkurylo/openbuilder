@@ -122,12 +122,17 @@ The reviewer's findings must be visible to the worker (a review the worker canno
 loop, not a review) and no round may be reviewed twice. Exhaustion, disagreement, and a blocked
 worker are all reported to a human with the reason; none of them loops forever.
 
-### R8 — Merging is one human action that leaves nothing behind
+### R8 — Merging is one authorized action that leaves nothing behind
 
 A single command merges an approved pull request and returns the world to its pre-epic state:
 every branch the epic created is gone from `origin`, and the instance keeps no worktree and no
 per-slug state for it. The command refuses to merge anything not approved, and refuses to guess
-which pull request is meant. Nothing else in the system may merge, ever.
+which pull request is meant.
+
+Nothing merges without a **recorded human authorization**. That authorization takes one of exactly
+two forms: a human running the land command, or an auto-merge the human enabled for that epic under
+R12. The remote implementer never merges under any circumstances — that rule is unchanged and
+absolute.
 
 ### R9 — Every refusal names the reason and the fix
 
@@ -167,6 +172,40 @@ ignoring an ambient `AWS_REGION`, and the AWS provider needing an explicit profi
 ambient one was a work account. Credential and host separation is a standing property of this
 system, not a feature of this epic; R11 finishes the job for GitHub.
 
+### R12 — Auto-merge is opt-in, conditional, and self-halting
+
+Waiting for a human at every merge is the loop's real bottleneck: an epic of six slugs stalls six
+times, each time for as long as it takes someone to look. So the reviewer may merge what it
+approved — but only under every one of these conditions, all of which must hold simultaneously:
+
+1. **Enabled explicitly, per epic, and recorded like any other approval.** Enabling auto-merge is
+   itself a gate: a human authorizes it once, the authorization is recorded durably, and it names
+   the epic it applies to. It is never a default and never global.
+2. **A clean verdict.** The reviewer's verdict is approve with **zero** blocking and **zero**
+   important findings. Nit-only is acceptable. A verdict that needed a judgement call is a verdict a
+   human should see.
+3. **The repository's own checks pass on the merge result, not on the branch.** This repository has
+   no CI, so the reviewer is otherwise the only gate — and the branch that gets merged is the branch
+   `ob-selfupdate` deploys to the instance. Before merging, the merge must be performed locally
+   against the current default branch and the repository's own lint and secret-scrub targets run on
+   that result. A pull request that is correct alone and breaks the default branch together is the
+   failure this condition exists to catch, and it is the one no reviewer reliably sees.
+4. **The diff touches nothing that can disarm the system.** Infrastructure, the waker, the
+   guardrails hook, CI configuration, the learnings store, the story-card contract, and the CLI that
+   drives the whole workflow are excluded by path. A change to the machinery that enforces the rules
+   is exactly the change a human must read.
+5. **Truthful attribution.** The merge is recorded by GitHub as performed by the bot, not by a human
+   who was not there. An audit trail that credits a person for a machine's decision is worse than
+   no audit trail.
+6. **Self-halting.** The first refusal, failed check, or unexpected state stops the whole loop and
+   reports. Auto-merge never retries, never escalates, and never proceeds to the next slug after a
+   failure.
+7. **Legible afterwards.** Every auto-merge leaves a comment enumerating each condition and the
+   observed result, so the decision can be audited without re-deriving it.
+
+A consequence worth stating plainly: condition 4 means the slug that rewrites the workflow CLI can
+never auto-merge. That is correct, not a limitation.
+
 ## 7. Success criteria
 
 Measured on this epic itself, which goes through the workflow it defines:
@@ -185,6 +224,9 @@ Measured on this epic itself, which goes through the workflow it defines:
    command that takes a repository refuses a non-personal owner before making a network call, and
    every command that does make one reaches `github.com` — demonstrated on this laptop, where both
    hosts are in fact authenticated.
+8. Each of R12's seven conditions, violated one at a time, produces a refusal that names the
+   condition it failed and merges nothing — including the case that matters most: a pull request the
+   reviewer approves whose merge into the default branch fails the repository's own lint or scrub.
 
 ## 8. Constraints and assumptions
 

@@ -236,3 +236,29 @@ checks only that an argument is shaped like `owner/repo` — so `openbuilder pla
 passes validation, and the host it resolves to is whatever the environment offers. Nothing has gone
 wrong only because the commands have run inside a `github.com` clone. The instance and the waker
 were already pinned (`cloud-init.yaml.tftpl:50`, `waker/github.py:27`).
+
+### Q11 — May the reviewer merge what it approved, without waiting for you?
+
+**Asked because** you raised it after watching the loop stall on human merges, and it contradicts an
+invariant this repo currently states in fourteen places.
+
+**Answered** yes, as an **option**, so the loop can run to a goal unattended.
+
+**Consequence** PRD R8 is rewritten and R12 added, so both the PRD and the RFC approvals are void
+until re-approved — correct friction for a change that removes the last human gate. The line drawn is
+between the two agents, not around "the bot": the **remote implementer never merges**, unchanged and
+absolute (`runner/prompts/implement.md:26`, `agent/remote/agents/implementer.md:145`); the **local
+reviewer** may, under seven conditions, on a per-epic authorisation recorded like any other approval.
+
+The load-bearing discovery while sizing this: **there is no `.github/workflows` in this repository**,
+so nothing runs on a pull request and the reviewer is the only gate — and `main` is what
+`ob-selfupdate` deploys onto the instance. A bad auto-merge therefore does not merely ship a bug; it
+can break the machine that would otherwise fix it, and recovery needs a human on the box. Hence
+condition 3: the repository's own `make lint` and `make scrub` run on the **merge result**, in a
+scratch worktree, not on the branch — which is also the only way to catch two pull requests that pass
+alone and fail together. `02-rule` and `03-context` both edit `docs/architecture.md`, so that case is
+not hypothetical in this very epic.
+
+Attribution is deliberate: the merge uses the App installation token so GitHub records
+`openbuilder-bot`, not a human who was not there. The laptop can mint that token from the App PEM
+with `waker/rs256.py` alone — proven today.
