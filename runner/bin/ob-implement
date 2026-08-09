@@ -151,6 +151,16 @@ read_backlog() {
   ob_log INFO "loaded ${STORY_COUNT} story card(s) for ${SLUG}"
 }
 
+# copy_epic_docs — land the epic's intake.md, prd.md and rfc.md on the work
+# branch before the agent runs, then re-baseline BASE_SHA unconditionally:
+# assert_progress counts rev-list BASE_SHA..HEAD, so without the re-baseline a
+# docs-only commit would satisfy its "at least one commit" check on behalf of
+# an agent that produced nothing.
+copy_epic_docs() {
+  ob_epic_docs_commit "$SRC_DIR" "origin/${PLAN_BRANCH}" "$EPIC" "$WT_DIR"
+  BASE_SHA="$(git -C "$WT_DIR" rev-parse HEAD)"
+}
+
 render() {
   local scalars blocks worklog
   scalars="${ROUND_DIR}/scalars.tsv"
@@ -337,6 +347,7 @@ main() {
 
   prepare_repo
   read_backlog
+  copy_epic_docs
   render
   run_agent
   assert_progress
