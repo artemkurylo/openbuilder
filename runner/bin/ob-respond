@@ -141,8 +141,12 @@ gather_feedback() {
   } >"$feedback"
 
   # A round with nothing to act on is a human problem, not an agent problem.
+  # Name the filter in the message: the one comment the reviewer is sure they
+  # left is invisible here when it was posted with the App's own token, because
+  # the query above deliberately drops authors whose login starts "openbuilder"
+  # so the bot cannot review itself. That cost a debugging round once.
   if ! grep -q '^- ' "$feedback"; then
-    ob_die "no actionable reviewer feedback found on ${REPO}#${PR}; the changes-requested label needs at least one comment or review body"
+    ob_die "no actionable reviewer feedback found on ${REPO}#${PR}: no unresolved inline comment, no non-approving review body, and no conversation comment from an author other than the bot itself. Comments posted with the openbuilder App token are ignored on purpose — review as a human."
   fi
   ob_log INFO "collected feedback ($(wc -l <"$feedback" | tr -d ' ') lines, unresolved-filter=${FILTER_OK})"
 }

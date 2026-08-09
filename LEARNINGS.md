@@ -138,3 +138,16 @@ swallowed silently.
 **Rule** Do not rewrite published history on the control repository. If you must, reset the instance's
 clone by hand afterwards. The refusal is the feature.
 **Proven** 2026-08-08, after removing an author line from the public history.
+
+### 12. Review as a human, not as the bot
+**Symptom** `ob-respond: no actionable reviewer feedback found on <repo>#<pr>` on a pull request that
+visibly carries a review comment and the `openbuilder:changes-requested` label. The round fails, the
+attempt counter advances and the slug is labelled `openbuilder:blocked`.
+**Cause** `gather_feedback` drops every conversation comment whose author login starts with
+`openbuilder`, so the App cannot feed its own words back to itself. A review posted with the App's
+installation token is authored by `openbuilder-bot[bot]` and is therefore invisible by design.
+**Rule** Post review comments as the human account (`gh`, or the web UI). Reserve the installation
+token for what the instance itself does. When a tool ignores input by design, make it say so in the
+failure message rather than reporting an empty result.
+**Proven** 2026-08-09: the first review round on artemkurylo/openbuilder#1 failed exactly this way; the
+same review posted as the human account was collected on the next pass.
