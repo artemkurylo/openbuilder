@@ -17,7 +17,7 @@ CACHE_DIR := $${XDG_CACHE_HOME:-$$HOME/.cache}/openbuilder
 
 .DEFAULT_GOAL := help
 
-.PHONY: help init plan-tf apply destroy secrets doctor shell logs status fmt lint scrub repo-create
+.PHONY: help init plan-tf apply destroy secrets doctor shell logs status fmt lint scrub hooks repo-create
 
 help: ## Show this help
 	@printf 'openbuilder — control plane for autonomous agentic coding\n\n'
@@ -97,6 +97,9 @@ lint: ## shellcheck every shell script (skipped when shellcheck is absent)
 scrub: ## Check tracked files against the local deny list (see local/bin/ob-scrub-check)
 	@local/bin/ob-scrub-check
 	@local/bin/ob-scrub-check --history
+
+hooks: ## Install the per-clone pre-commit scrub hook (see local/bin/ob-install-hooks)
+	@local/bin/ob-install-hooks
 
 repo-create: ## Create the GitHub control repo and push (no-op if it exists)
 	@if gh repo view '$(CONTROL_REPO)' >/dev/null 2>&1; then \

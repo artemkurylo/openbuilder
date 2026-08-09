@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# ob-install-hooks — install the pre-commit scrub hook into this clone.
+#
+# Why this file exists: ob-scrub-check refuses to publish employer and client
+# names, internal hostnames, account numbers, work email addresses and local
+# directory layouts, and `make scrub` runs it over the working tree and the
+# whole history. Both are opt-in — they only help if someone remembers to run
+# them. The moment that matters is the moment a string enters history, because
+# a match already pushed needs the history rewritten rather than a follow-up
+# commit. This script installs a `pre-commit` hook that runs
+# `ob-scrub-check --staged` and propagates its exit status, so a matching
+# string refuses the commit before it exists.
+#
+# The hook is a convenience, not a guarantee: `git commit --no-verify`
+# bypasses it, and CI remains a separate concern. The hook is opt-in per clone
+# and fully uninstallable.
+#
+#   ob-install-hooks              # install, or report already installed
+#   ob-install-hooks --force      # replace a foreign hook, keeping it as .bak
+#   ob-install-hooks --uninstall  # remove only a hook this tool wrote
+#   ob-install-hooks --help
+set -euo pipefail
+IFS=$'\n\t'
+
+OB_PROG="ob-install-hooks"
+MARKER="Installed by ob-install-hooks"
+FORCE=0
+UNINSTALL=0
+
+usage() {
+  sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# Is the existing hook ours? Anything unreadable or unmarked counts as foreign
+# and is never touched without --force.
+owned() {
+  grep -qF "$MARKER" "$HOOK" 2>/dev/null
+}
+
+install_hook() {
+  if [[ -e "$HOOK" ]] || [[ -L "$HOOK" ]]; then
+    if owned; then
+      printf '%s: pre-commit hook already installed at %s — nothing to do.\n' \
+        "$OB_PROG" "$HOOK"
+      return 0
+    fi
+    if ((FORCE == 0)); then
+      printf '%s: %s already exists and was not installed by this tool;\n' \
+        "$OB_PROG" "$HOOK" >&2
+      printf '%s: refusing to overwrite it. Re-run with --force to replace it\n' \
+        "$OB_PROG" >&2
+      printf '%s: (the previous file is kept next to it as %s.bak).\n' \
+        "$OB_PROG" "$HOOK" >&2
+      return 1
+    fi
+    mv "$HOOK" "$HOOK.bak"
+    printf '%s: preserved the existing hook as %s.bak\n' "$OB_PROG" "$HOOK"
+  fi
+
+  cat >"$HOOK" <<'EOF'
+#!/usr/bin/env bash
+# pre-commit scrub hook — refuses the commit when staged content matches the
+# scrub deny list; bypass with: git commit --no-verify
+# Installed by ob-install-hooks; remove with: local/bin/ob-install-hooks --uninstall
+set -euo pipefail
+IFS=$'\n\t'
+exec local/bin/ob-scrub-check --staged
+EOF
+  chmod +x "$HOOK"
+  printf '%s: installed pre-commit scrub hook at %s\n' "$OB_PROG" "$HOOK"
+}
+
+uninstall_hook() {
+  if [[ ! -e "$HOOK" ]] && [[ ! -L "$HOOK" ]]; then
+    printf '%s: no pre-commit hook at %s — nothing to remove.\n' \
+      "$OB_PROG" "$HOOK"
+    return 0
+  fi
+  if ! owned; then
+    printf '%s: %s was not installed by this tool; refusing to remove it.\n' \
+      "$OB_PROG" "$HOOK" >&2
+    return 1
+  fi
+  rm "$HOOK"
+  printf '%s: removed the pre-commit hook at %s\n' "$OB_PROG" "$HOOK"
+}
+
+case "${1:-}" in
+-h | --help)
+  usage
+  exit 0
+  ;;
+--force) FORCE=1 ;;
+--uninstall) UNINSTALL=1 ;;
+"") ;;
+*)
+  printf '%s: unknown argument: %s\n' "$OB_PROG" "$1" >&2
+  exit 2
+  ;;
+esac
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  printf '%s: not inside a git working tree; nothing to install.\n' "$OB_PROG" >&2
+  exit 1
+}
+cd "$REPO_ROOT"
+
+# The hooks directory is not always `.git/hooks`: a worktree, a submodule or a
+# `core.hooksPath` setting moves it, so ask git rather than constructing the
+# path ourselves, and never change the configuration. The answer may be
+# relative to the current directory, so pin it to an absolute path.
+HOOKS_DIR="$(git rev-parse --git-path hooks)"
+[[ "$HOOKS_DIR" = /* ]] || HOOKS_DIR="$(pwd)/$HOOKS_DIR"
+if [[ ! -d "$HOOKS_DIR" ]]; then
+  if ((UNINSTALL)); then
+    printf '%s: no hooks directory — nothing to remove.\n' "$OB_PROG"
+    exit 0
+  fi
+  mkdir -p "$HOOKS_DIR"
+fi
+HOOKS_DIR="$(cd "$HOOKS_DIR" && pwd)"
+HOOK="$HOOKS_DIR/pre-commit"
+
+if ((UNINSTALL)); then
+  uninstall_hook
+else
+  install_hook
+fi

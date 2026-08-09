@@ -500,7 +500,7 @@ to it.
 openbuilder/
 ├── README.md                 this file: what it is, quickstart, daily loop
 ├── LEARNINGS.md              durable operational knowledge, injected into every round's prompt
-├── Makefile                  targets: help init plan-tf apply destroy secrets doctor shell logs status fmt lint scrub repo-create
+├── Makefile                  targets: help init plan-tf apply destroy secrets doctor shell logs status fmt lint scrub hooks repo-create
 ├── docs/                     architecture, day-2 runbook, GitHub App setup, cost math
 ├── infra/                    Terraform: VPC, public subnet, IAM, SSM params, instance, budget
 ├── infra/templates/          cloud-init template that renders openbuilder.env and calls bootstrap.sh
@@ -515,18 +515,25 @@ openbuilder/
 ├── agent/hooks/              pre-tool-call guardrails hook: no merge, no force-push, no push to main
 ├── backlog/                  SCHEMA.md — the story-card contract — plus a filled-in example
 ├── local/bin/                the `openbuilder` laptop CLI
-└── local/bin/ob-scrub-check  pre-publish check: no private identifiers in the tree, the index or history
+├── local/bin/ob-scrub-check   pre-publish check: no private identifiers in the tree, the index or history
+└── local/bin/ob-install-hooks per-clone pre-commit hook installer for ob-scrub-check --staged
 ```
 
 ## Before you push: `make scrub`
 
 Everything in this repository is public, and the plan text and review comments that flow through it are
-processed by a third-party model. Two targets keep that honest:
+processed by a third-party model. Three targets keep that honest:
 
 | Target | What it does |
 |---|---|
 | `make scrub` | `local/bin/ob-scrub-check` over the tracked working tree, then over every commit (`--history`, which walks `git rev-list --all` — slow and thorough). Exits non-zero on any match |
 | `make lint` | `shellcheck -x -S warning` over `runner/bootstrap.sh`, `runner/bin/*` and `local/bin/*`; skipped with a note when shellcheck is not installed |
+| `make hooks` | `local/bin/ob-install-hooks` — installs a `pre-commit` hook that runs `ob-scrub-check --staged` before every commit, so a matching string refuses the commit before it exists |
+
+The hook is per-clone and opt-in by design — a hook that appears without being asked for gets deleted in
+anger — `--uninstall` removes it, and `git commit --no-verify` bypasses it. It is a convenience, not a
+guarantee: CI is the enforcement that cannot be skipped, and `make scrub --history` still has to be run
+deliberately once, before the first push.
 
 `ob-scrub-check` matches an extended-regex deny list, case-insensitively — employer and client names,
 internal hostnames, cloud account ids, work email domains, the parent directories of your checkout —
