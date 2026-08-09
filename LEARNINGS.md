@@ -200,3 +200,10 @@ module-level constant. `ob-token` already re-mints and caches with an expiry —
 than holding a token yourself.
 **Proven** 2026-08-09: label calls returned 401 mid-session and succeeded on the next line after
 re-minting.
+
+### 17. A hook installed in one repository must be a no-op, not a wall, in every other
+
+**Symptom** `/tmp/shared-hooks/pre-commit: line 4: /tmp/other-repo/local/bin/ob-scrub-check: No such file or directory` (exit 127) — a hook installed in one repository dying in every other repository that shares the same `core.hooksPath`.
+**Cause** `git rev-parse --git-path hooks` honours `core.hooksPath`. When that setting points at a shared directory (a global `~/.githooks` is the common setup), one hook file runs in every repository, and a hook body that references `local/bin/...` relative to the working tree resolves it against whichever repository happens to be committing.
+**Rule** Treat the resolved hooks directory like any shared location: before writing to it, verify it lies inside the repository's own git directory (`git rev-parse --git-common-dir`) and refuse otherwise, naming `--force` for the deliberate case; and write the hook so it resolves its own repository (`git rev-parse --show-toplevel`) and exits 0 quietly when the command it would run is not present there.
+**Proven** 2026-08-09 on the instance while addressing the review of `ob-install-hooks` (artemkurylo/openbuilder#2): a hook body of `exec local/bin/ob-scrub-check --staged` installed under `core.hooksPath=/tmp/shared-hooks` died in an unrelated repository with exactly the quoted error; after the fix, the same hook exits 0 in a repository without the tool and still refuses a staged deny-list match in its own repository.
