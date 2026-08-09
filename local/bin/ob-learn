@@ -281,6 +281,7 @@ section_display_name() {
 }
 
 main() {
+  local line
   parse_args "$@"
   [[ -r "$LEARNINGS" ]] || die "cannot read ${LEARNINGS}"
   read_candidate
@@ -289,7 +290,7 @@ main() {
   next_number
   number_heading
   if ((DRY_RUN)); then
-    printf 'section: %s\n\n' "$SECTION"
+    printf 'section: %s\n\n' "$(section_display_name)"
     for line in "${ENTRY[@]}"; do
       printf '%s\n' "$line"
     done
