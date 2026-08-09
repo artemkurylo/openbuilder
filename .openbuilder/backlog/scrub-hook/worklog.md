@@ -62,3 +62,44 @@ Added `local/bin/ob-install-hooks` (story-01): an executable installer that reso
 - No learnings proposed; the two environment quirks discovered (missing shellcheck; a test-exported `OPENBUILDER_SCRUB_DENY` leaking into a later `make scrub` in the persistent shell) are recorded in the round-001 worklog instead.
 
 
+## Round 002 (review round 2)
+
+- Review defects fixed in `local/bin/ob-install-hooks` (three focused commits):
+  - Argument parsing now loops over `"$@"` (ob-learn style) instead of reading only
+    `$1`, so `--force --bogus` exits 2 naming the unknown argument; `--force` with
+    `--uninstall` is rejected as a contradiction (exit 2, stderr).
+  - Shared `core.hooksPath` refusal: when `git rev-parse --git-path hooks` resolves
+    outside the repository's own git directory, a plain install exits 1, names
+    `core.hooksPath`, offers `--force`, and writes nothing. The comparison uses
+    `git rev-parse --git-common-dir` (not `--absolute-git-dir`), so a linked
+    worktree — whose hooks dir is the common git dir of the same repository — is
+    still allowed, as is uninstall from a forced shared install. The setting is
+    never read or modified.
+  - Hook body now resolves its own repository (`git rev-parse --show-toplevel`)
+    and exits 0 quietly when that repository has no executable
+    `local/bin/ob-scrub-check`, instead of dying with "No such file or directory"
+    in a repo it was never installed for (the reviewer's repro: a hook forced into
+    a shared dir fires in every repo; it must be a no-op, not a wall). Still
+    `exec`s the check when present, so exit status propagates.
+  - `--force` now says when it replaces an existing `.bak` (reviewer's optional
+    item, cheap so done).
+- Round-1 behaviors re-verified in a scratch clone of the worktree: --help exit 0;
+  plain install prints the absolute path; second run "already installed" with the
+  file byte-identical; staged deny-list match refuses the commit while a clean
+  commit passes; foreign-hook refusal names --force and leaves the file intact;
+  --force keeps the foreign hook as `.bak`; --uninstall removes only ours;
+  outside-repo exit 1; unknown argument exit 2; make hooks + make help (listed).
+- Shared-hooksPath scenarios exercised with `GIT_CONFIG_COUNT=1
+  GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/tmp/shared-hooks`: plain
+  run refuses (exit 1, nothing created); `--force` installs there; the hook then
+  fires in an unrelated repo and exits 0 quietly, and in its own repo runs
+  ob-scrub-check (exit 1 on a staged match). Linked-worktree install of the same
+  clone is allowed and the hook fires from the worktree root. Clone handed back
+  hookless; scratch dirs removed.
+- `make lint` (shellcheck v0.11.0 static binary on PATH, same as round 1) exit 0
+  over all 15 scripts including the new hook-body check on an installed copy;
+  `make scrub` exit 0. Working tree clean.
+- Learning proposed this round: shared `core.hooksPath` — a hooks dir outside the
+  repository's own git dir is run by every repo, so refuse the install and make
+  the hook a no-op where the tool it invokes is absent. Candidate appended to the
+  round-002 proposal file for the reviewer.
