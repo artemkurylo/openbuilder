@@ -54,6 +54,9 @@ install_hook() {
         "$OB_PROG" "$HOOK" >&2
       return 1
     fi
+    if [[ -e "$HOOK.bak" ]] || [[ -L "$HOOK.bak" ]]; then
+      printf '%s: replacing the previous %s.bak\n' "$OB_PROG" "$HOOK"
+    fi
     mv "$HOOK" "$HOOK.bak"
     printf '%s: preserved the existing hook as %s.bak\n' "$OB_PROG" "$HOOK"
   fi
