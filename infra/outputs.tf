@@ -35,6 +35,17 @@ output "ssm_parameter_names" {
   }
 }
 
+output "waker" {
+  description = "The scheduled power-on side of the loop: function name, cadence, and the two commands you actually need — a manual check and its logs."
+  value = {
+    function_name = aws_lambda_function.waker.function_name
+    schedule      = aws_cloudwatch_event_rule.waker.schedule_expression
+    enabled       = var.waker_enabled
+    invoke        = "aws lambda invoke --region ${var.region}${local.profile_flag} --function-name ${aws_lambda_function.waker.function_name} --payload '{}' --cli-binary-format raw-in-base64-out /dev/stdout"
+    logs          = "aws logs tail ${aws_cloudwatch_log_group.waker.name} --region ${var.region}${local.profile_flag} --since 1h"
+  }
+}
+
 output "set_secrets_commands" {
   description = "Ready-to-paste commands that fill the parameter slots: three inline values plus the App PEM read from a file. Terraform never sees these values — it only owns the empty slots."
   value       = <<-EOT

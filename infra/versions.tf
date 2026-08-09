@@ -9,6 +9,13 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 6.23"
     }
+
+    # Zips waker/ into the Lambda bundle. The function is stdlib-only, so this
+    # replaces a build step, a layer and a container registry.
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.4"
+    }
   }
 
   # ---------------------------------------------------------------------------

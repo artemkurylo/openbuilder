@@ -185,6 +185,45 @@ variable "extra_apt_packages" {
 }
 
 # -----------------------------------------------------------------------------
+# Waker (power-on side of the loop; see waker.tf)
+# -----------------------------------------------------------------------------
+
+variable "waker_enabled" {
+  description = "Run the scheduled waker. False disables the EventBridge rule and leaves power-on to the laptop CLI; the Lambda stays deployed and manually invokable."
+  type        = bool
+  default     = true
+}
+
+variable "waker_interval_minutes" {
+  description = "How often the waker checks GitHub for actionable work. This is the worst-case delay between labelling a PR `openbuilder:changes-requested` and the instance booting."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.waker_interval_minutes >= 1 && var.waker_interval_minutes <= 60
+    error_message = "waker_interval_minutes must be between 1 and 60."
+  }
+}
+
+variable "waker_flap_guard_minutes" {
+  description = "Refuse to start the instance if it was launched fewer than this many minutes ago and is already stopped again. Must stay below idle_stop_minutes, otherwise it would block legitimate wakes."
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.waker_flap_guard_minutes >= 0
+    error_message = "waker_flap_guard_minutes cannot be negative."
+  }
+}
+
+variable "waker_log_retention_days" {
+  description = "CloudWatch retention for the waker's log group. It logs a few lines every interval, forever, so unlimited retention is a slow leak."
+  type        = number
+  default     = 14
+}
+
+
+# -----------------------------------------------------------------------------
 # Derived values
 # -----------------------------------------------------------------------------
 
