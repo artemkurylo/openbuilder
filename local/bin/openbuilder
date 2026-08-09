@@ -602,7 +602,7 @@ ob_command_table() {
 usage: openbuilder <command> [args]
 
   plan <owner/repo> <epic>          design branch + Opus 5 workflow session for an epic
-  dispatch <owner/repo> <slug>      commit + push the plan branch, hand it to the instance
+  dispatch <owner/repo> <slug>      gate the backlog, cut and push the plan branch
   review <owner/repo> <pr>          review a pull request with Opus 5
   approve <owner/repo> <pr>         label a pull request approved
   request-changes <owner/repo> <pr> ask the instance for another round
@@ -726,6 +726,14 @@ EOF
         "$seed"
 }
 
+# ob_epic_of_plan — read plan.md on stdin, print the epic named by its
+# '- epic:' bullet (RFC §2). Prints nothing when the line is absent, so callers
+# distinguish "no epic" from an unreadable file. Reading stdin is what lets
+# cmd_dispatch feed a file and cmd_status feed an API response.
+ob_epic_of_plan() {
+    awk '/^- epic:/ {print $3; exit}'
+}
+
 # ---------------------------------------------------------------------------
 # dispatch
 # ---------------------------------------------------------------------------
@@ -738,20 +746,16 @@ cmd_dispatch() {
     ob_validate_slug "$slug"
     ob_need git gh aws jq
 
-    # Start the instance first: the poll loop is the only trigger, so a stopped
-    # instance would otherwise turn a dispatch into a silent no-op.
-    ob_ensure_running
-
-    local dir branch backlog stories
+    local dir backlog epic design current branch stories rc
     dir=$(ob_clone_dir "$repo")
-    [[ -d $dir/.git ]] ||
-        ob_die "no local clone at $dir — run '$OB_PROG plan $repo $slug' first"
-    ob_assert_origin_host "$dir"
-    branch=$(ob_plan_branch "$slug")
     backlog=.openbuilder/backlog/$slug
 
+    [[ -d $dir/.git ]] ||
+        ob_die "no local clone at $dir — run '$OB_PROG plan $repo <epic>' first"
+    ob_assert_origin_host "$dir"
+
     [[ -d $dir/$backlog ]] ||
-        ob_die "$backlog does not exist in $dir — run '$OB_PROG plan $repo $slug' first"
+        ob_die "$backlog does not exist in $dir — run '$OB_PROG plan $repo <epic>' first"
     [[ -f $dir/$backlog/plan.md ]] ||
         ob_die "$backlog/plan.md is missing — the planner did not finish"
 
@@ -759,42 +763,112 @@ cmd_dispatch() {
     [[ $stories -gt 0 ]] ||
         ob_die "$backlog contains no story-*.md cards — nothing for the instance to implement"
 
-    if [[ $(git -C "$dir" rev-parse --abbrev-ref HEAD) != "$branch" ]]; then
-        ob_info "switching $dir to $branch"
-        git -C "$dir" checkout "$branch" --quiet
+    # The planner wrote the cards on the design branch; the epic line names the
+    # gate record that must cover them. Validate the value so a backticked epic
+    # copied from a PRD header fails loudly instead of becoming a path.
+    epic=$(ob_epic_of_plan <"$dir/$backlog/plan.md")
+    [[ -n $epic ]] ||
+        ob_die "$backlog/plan.md has no '- epic:' line; dispatch cannot tell which epic gates this slug.
+  Add a line reading exactly '- epic: <epic>' under its first heading (backlog/SCHEMA.md)."
+    ob_validate_slug "$epic"
+
+    design=$(ob_design_branch "$epic")
+    current=$(git -C "$dir" rev-parse --abbrev-ref HEAD)
+    [[ $current == "$design" ]] || ob_die "$dir is on branch $current, not the design branch $design for epic $epic.
+  Run: $OB_PROG plan $repo $epic"
+
+    # An approval covers committed bytes only, and ob-gate verify has nothing to
+    # say about a file it never recorded. `status --porcelain` catches untracked
+    # new story cards too — the exact "no extra story-*.md" case rule 4b checks.
+    if [[ -n $(git -C "$dir" status --porcelain -- "$backlog") ]]; then
+        ob_die "$backlog has uncommitted or untracked changes in $dir:
+  $(git -C "$dir" status --porcelain -- "$backlog")
+  An approval covers committed bytes only. Commit these, then re-approve:
+    (cd $dir && $OB_BIN_DIR/ob-gate record $epic backlog $slug)"
     fi
 
-    git -C "$dir" add -- "$backlog"
-    if git -C "$dir" diff --cached --quiet -- "$backlog"; then
-        ob_info "backlog already committed; nothing new to stage"
-    else
-        # Authored with the operator's own git identity on purpose: the plan is
-        # the human's contribution, only the work branch belongs to the bot.
-        git -C "$dir" commit --quiet -m "openbuilder: backlog for $slug" -- "$backlog"
-        ob_info "committed $backlog ($stories story cards)"
-    fi
+    ob_need_gate
+    # verify takes the slug so it answers about this slug alone: an epic with
+    # *some* recorded backlog approval must not satisfy a different slug's gate.
+    rc=0
+    ob_gate "$dir" verify "$epic" backlog "$slug" || rc=$?
+    case $rc in
+    0)
+        ob_info "backlog approval for $slug on epic $epic verified"
+        ;;
+    3)
+        ob_die "the recorded backlog approval for $slug no longer matches the files on $design — an artifact changed after it was approved.
+  Re-approve this slug, then dispatch again:
+    (cd $dir && $OB_BIN_DIR/ob-gate record $epic backlog $slug)"
+        ;;
+    4)
+        ob_die "no backlog approval is recorded for $slug in .openbuilder/epics/$epic/state.json.
+  Approve this slug, then dispatch again:
+    (cd $dir && $OB_BIN_DIR/ob-gate record $epic backlog $slug)"
+        ;;
+    2)
+        ob_die "ob-gate rejected 'verify $epic backlog $slug' as a usage error (exit 2); the CLI and ob-gate disagree about the command surface"
+        ;;
+    *)
+        ob_die "ob-gate verify $epic backlog $slug failed with exit $rc"
+        ;;
+    esac
 
-    ob_info "pushing $branch to origin"
+    # The ordering is the whole gate: a plan branch cut before the stage pointer
+    # moved carries stage=backlog, which rule 4b declines on every poll pass,
+    # logging nothing to the operational log. So record the stage, then prove it
+    # landed on the design-branch tip and on origin before cutting anything.
+    ob_info "recording stage=dispatched for epic $epic on $design"
+    ob_gate "$dir" stage "$epic" dispatched ||
+        ob_die "'ob-gate stage $epic dispatched' failed; no plan branch was created"
+
+    local stage_now
+    stage_now=$(git -C "$dir" show "$design:.openbuilder/epics/$epic/state.json" | jq -r '.stage')
+    [[ $stage_now == dispatched ]] || ob_die "state.json on $design still says stage='$stage_now' after 'ob-gate stage $epic dispatched'; refusing to cut $(ob_plan_branch "$slug"), because rule 4b would decline it on every poll pass forever"
+
+    git -C "$dir" fetch --quiet origin
+    [[ $(git -C "$dir" rev-parse "$design") == $(git -C "$dir" rev-parse "origin/$design") ]] ||
+        ob_die "$design differs from origin/$design after 'ob-gate stage $epic dispatched'; push it before dispatching:
+  git -C $dir push origin $design"
+
+    # Start the instance first: the poll loop is the only trigger, so a stopped
+    # instance would otherwise turn a dispatch into a silent no-op.
+    ob_ensure_running
+
+    # Cut the plan branch from the design tip without checking it out, so the
+    # clone stays on the design branch for the next slug.
+    branch=$(ob_plan_branch "$slug")
+    if git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$branch" &&
+        ! git -C "$dir" merge-base --is-ancestor "origin/$branch" "$design"; then
+        ob_die "origin/$branch already exists and is not an ancestor of $design; pushing it would rewrite history, which openbuilder never does.
+  Delete it first if this dispatch is intentional:
+    gh api -X DELETE repos/$repo/git/refs/heads/$branch"
+    fi
+    git -C "$dir" branch -f "$branch" "$design"
+    ob_info "created plan branch $branch from $design"
     git -C "$dir" push --quiet --set-upstream origin "$branch"
+    ob_info "pushed $branch to origin"
 
     ob_ensure_labels "$repo"
 
     cat <<EOF
 
 Dispatched $repo :: $slug
+  design branch : $design
   plan branch : $branch  ($stories story cards)
   work branch : $(ob_work_branch "$slug")  (created by the instance)
 
 What happens next, without any further action from you:
   1. Within 60s the instance's openbuilder-poll timer sees $branch.
-  2. It finds no pull request for $(ob_work_branch "$slug") and runs ob-implement.
-  3. On success it pushes the work branch, opens a pull request and labels it
+  2. Rule 4b re-checks the recorded backlog approval against the plan branch. A mismatch is a silent skip — '$OB_PROG status $repo' is where it shows up.
+  3. It finds no pull request for $(ob_work_branch "$slug") and runs ob-implement.
+  4. On success it pushes the work branch, opens a pull request and labels it
      'openbuilder:awaiting-review'. On failure it labels 'openbuilder:blocked'
      and comments the log tail.
 
 Watch it:  $OB_PROG status $repo
            $OB_PROG logs -f
-Then:      $OB_PROG review $repo <pr>
+Then:      $OB_PROG review --watch $repo <pr>
 EOF
 }
 
@@ -904,6 +978,68 @@ cmd_request_changes() {
 # status
 # ---------------------------------------------------------------------------
 
+# ob_status_unapproved <repo> <slug> — would rule 4b decline this plan branch?
+# Prints exactly one token and never exits non-zero: '-' (rule 4b would let it
+# through), 'yes' (rule 4b would decline it), '?' (an API call failed or a
+# response did not parse, so the answer is unknown). Reports the same predicate
+# rule 4b evaluates on the instance, because a rule-4b decline is deliberately
+# silent (RFC §4.2-4.3) and this is the one visible surface for it. Three
+# serial API calls per branch that has no pull request; no caching.
+ob_status_unapproved() {
+    local repo=$1 slug=$2
+    local branch plan_md epic state_json listing verdict
+
+    branch=$(ob_plan_branch "$slug")
+
+    plan_md=$(ob_gh api "repos/$repo/contents/.openbuilder/backlog/$slug/plan.md?ref=$branch" \
+        -H 'Accept: application/vnd.github.raw' 2>/dev/null) || {
+        printf '?\n'
+        return 0
+    }
+    epic=$(printf '%s\n' "$plan_md" | ob_epic_of_plan)
+    [[ -n $plan_md && -n $epic && $epic =~ ^[a-z0-9][a-z0-9-]{1,48}$ ]] || {
+        printf 'yes\n'
+        return 0
+    }
+
+    state_json=$(ob_gh api "repos/$repo/contents/.openbuilder/epics/$epic/state.json?ref=$branch" \
+        -H 'Accept: application/vnd.github.raw' 2>/dev/null) || {
+        printf '?\n'
+        return 0
+    }
+    jq empty <<<"$state_json" 2>/dev/null || {
+        printf 'yes\n'
+        return 0
+    }
+
+    listing=$(ob_gh api "repos/$repo/contents/.openbuilder/backlog/$slug?ref=$branch" 2>/dev/null) || {
+        printf '?\n'
+        return 0
+    }
+
+    # Rule 4b's predicate: stage == dispatched, an approval record for this
+    # slug, and the recorded files map exactly equal to what the branch
+    # carries — no extra card, no missing card, no changed sha. With `-e`,
+    # exit 0 means true, 1 means false, anything else is a jq failure.
+    verdict=0
+    jq -e -n \
+        --argjson listing "$listing" \
+        --argjson state "$state_json" \
+        --arg slug "$slug" \
+        '([ $listing[] | select(.type == "file" and (.name == "plan.md" or (.name | test("^story-.*\\.md$")))) | {(.name): .sha} ] | add) as $disk
+         | ($state | type) == "object"
+           and $state.stage == "dispatched"
+           and (($state.approvals.backlog[$slug] // {}) | type) == "object"
+           and (($state.approvals.backlog[$slug].files // {}) | type) == "object"
+           and $state.approvals.backlog[$slug].files == ($disk // {})' >/dev/null 2>&1 || verdict=$?
+    case $verdict in
+    0) printf -- '-\n' ;;
+    1) printf 'yes\n' ;;
+    *) printf '?\n' ;;
+    esac
+    return 0
+}
+
 cmd_status() {
     local usage="usage: $OB_PROG status [owner/repo]"
     [[ $# -le 1 ]] || ob_die "$usage"
@@ -951,17 +1087,23 @@ cmd_status() {
     fi
 
     printf '%s\n' "$repo"
-    printf '%-26s %-5s %-5s %-6s %-40s %-22s\n' \
-        SLUG PLAN WORK PR LABELS 'LAST ACTIVITY'
-    printf '%-26s %-5s %-5s %-6s %-40s %-22s\n' \
-        '--------------------------' '-----' '-----' '------' \
+    printf '%-26s %-5s %-5s %-6s %-7s %-40s %-22s\n' \
+        SLUG PLAN WORK PR UNAPPR LABELS 'LAST ACTIVITY'
+    printf '%-26s %-5s %-5s %-6s %-7s %-40s %-22s\n' \
+        '--------------------------' '-----' '-----' '------' '-------' \
         '----------------------------------------' '----------------------'
 
-    local slug plan work pr labels updated
+    local slug plan work pr labels updated unappr
     while IFS=$'\t' read -r slug plan work pr labels updated; do
         [[ -n $slug ]] || continue
-        printf '%-26s %-5s %-5s %-6s %-40s %-22s\n' \
-            "$slug" "$plan" "$work" "$pr" "$labels" "$updated"
+        # Rule 4b never reaches a slug that already has a pull request
+        # (RFC §4.2), so only a PR-less branch needs the API predicate.
+        unappr='-'
+        if [[ $pr == '-' ]]; then
+            unappr=$(ob_status_unapproved "$repo" "$slug")
+        fi
+        printf '%-26s %-5s %-5s %-6s %-7s %-40s %-22s\n' \
+            "$slug" "$plan" "$work" "$pr" "$unappr" "$labels" "$updated"
     done <<<"$rows"
 }
 

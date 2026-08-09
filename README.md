@@ -362,8 +362,12 @@ and nothing more.
 openbuilder dispatch you/your-repo healthz-endpoint
 ```
 
-This starts the instance and waits for it, commits the backlog directory, pushes
-`openbuilder/plan/healthz-endpoint`, and makes sure the six `openbuilder:*` labels exist in the repo.
+`openbuilder dispatch` is the gate that spends money. It verifies the recorded backlog approval for
+the slug and refuses when that approval is absent or void — a card edited (and committed) after
+approval must be re-approved with `ob-gate record <epic> backlog <slug>` first. It then records
+`stage: dispatched` on the design branch, cuts `openbuilder/plan/healthz-endpoint` from the
+design-branch tip and pushes it, starts the instance when needed, and makes sure the six
+`openbuilder:*` labels exist in the repo.
 
 ### 11. Wait for the PR
 

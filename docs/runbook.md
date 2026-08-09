@@ -84,6 +84,10 @@ crash. The fix is upstream: the story card was ambiguous. Tighten it and re-disp
 
 ```sh
 # edit .openbuilder/backlog/<slug>/story-NN-*.md in your local clone, then
+# commit the change — editing a card voids its approval, and dispatch refuses a
+# voided approval — then re-record it from inside the clone:
+cd <clone>
+local/bin/ob-gate record <epic> backlog <slug>
 openbuilder dispatch you/your-repo <slug>
 ```
 
@@ -787,10 +791,13 @@ sudo -u openbuilder git -C /opt/openbuilder/src/you__your-repo branch -D openbui
 sudo -u openbuilder rm -rf /opt/openbuilder/state/you__your-repo__<slug>
 ```
 
-Push updated story cards if you changed them, and make sure the plan branch carries `openbuilder:queued`
-again:
+Push updated story cards if you changed them — but editing a card voids its approval (the recorded
+bytes no longer match, and `openbuilder dispatch` refuses a voided approval). Commit the change and
+re-record it from inside the clone before dispatching:
 
 ```sh
+git -C <clone> commit -am 'story: tighten acceptance criteria'
+(cd <clone> && local/bin/ob-gate record <epic> backlog <slug>)
 openbuilder dispatch you/your-repo <slug>
 ```
 
