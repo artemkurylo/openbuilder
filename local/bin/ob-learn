@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# ob-learn — turn an accepted candidate learning into a numbered, placed entry
+# in LEARNINGS.md, without hand-editing.
+#
+# LEARNINGS.md is the durable store of operational knowledge in this
+# repository; both round scripts inject it verbatim into every prompt, and
+# everything in the repository is public. Publishing an entry by hand means
+# finding the highest `### N.`, picking the right section, keeping the
+# four-line entry shape and remembering the deny list — each a chance to
+# commit a malformed entry, or an employer identifier, into the public repo.
+#
+# This script does only the mechanical part and stops: it never commits and
+# never pushes. The reviewer still commits, exactly as before.
+#
+#   ob-learn --section implementer|environment [-f FILE] [--dry-run]
+#   ob-learn --help
+#
+# The candidate is read from FILE when -f is given, otherwise from stdin. It
+# must be a level-3 markdown heading followed by the **Symptom**, **Cause**,
+# **Rule** and **Proven** lines, in that order. The entry is numbered one
+# higher than the highest `### N.` in LEARNINGS.md and inserted as the last
+# entry of the section named by --section. --dry-run prints the fully numbered
+# entry and its target section without touching LEARNINGS.md.
+#
+# Like ob-scrub-check, a deny list — $OPENBUILDER_SCRUB_DENY, else .scrub-deny
+# at the repo root, one extended regex per line, `#` comments and blanks
+# ignored — is consulted before anything is written. A candidate that matches
+# it is refused outright, with a count and never with the matching text:
+# echoing the string a deny list protects leaks it.
+set -euo pipefail
+IFS=$'\n\t'
+
+OB_PROG="ob-learn"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+LEARNINGS="${REPO_ROOT}/LEARNINGS.md"
+DENY="${OPENBUILDER_SCRUB_DENY:-${REPO_ROOT}/.scrub-deny}"
+
+SECTION=""
+INPUT="" # candidate file; empty means stdin
+DRY_RUN=0
+NEXT_NUM=0
+CANDIDATE=() # raw candidate lines, leading and trailing blanks stripped
+ENTRY=()     # numbered entry lines, exactly as they will be written
+TMP_PATTERNS=""
+TMP_LEARNINGS=""
+
+usage() {
+  cat <<EOF
+usage: ${OB_PROG} --section implementer|environment [-f FILE] [--dry-run]
+       ${OB_PROG} --help
+
+  --section implementer|environment
+      target section of LEARNINGS.md (required)
+  -f FILE
+      read the candidate entry from FILE (default: stdin)
+  --dry-run
+      print the numbered entry and its target section without
+      changing LEARNINGS.md
+  --help
+      print this help and exit
+EOF
+}
+
+cleanup() {
+  if [[ -n "$TMP_PATTERNS" ]]; then
+    rm -f "$TMP_PATTERNS"
+  fi
+  if [[ -n "$TMP_LEARNINGS" ]]; then
+    rm -f "$TMP_LEARNINGS"
+  fi
+  return 0
+}
+trap cleanup EXIT
+
+die() {
+  local msg="$1" code="${2:-1}"
+  printf '%s: %s\n' "$OB_PROG" "$msg" >&2
+  exit "$code"
+}
+
+parse_args() {
+  local arg
+  while (($# > 0)); do
+    arg="$1"
+    case "$arg" in
+      --section)
+        [[ $# -ge 2 ]] || die "missing value for --section (accepted: implementer, environment)" 2
+        shift
+        SECTION="$1"
+        case "$SECTION" in
+          implementer | environment) ;;
+          *) die "unknown --section value: '${SECTION}' (accepted: implementer, environment)" 2 ;;
+        esac
+        ;;
+      -f)
+        [[ $# -ge 2 ]] || die "missing value for -f" 2
+        shift
+        INPUT="$1"
+        ;;
+      --dry-run)
+        DRY_RUN=1
+        ;;
+      --help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown argument: '${arg}' (accepted: --section, -f, --dry-run, --help)" 2
+        ;;
+    esac
+    shift
+  done
+  [[ -n "$SECTION" ]] || die "missing required --section (accepted: implementer, environment)" 2
+}
+
+read_candidate() {
+  local line
+  if [[ -n "$INPUT" ]]; then
+    [[ -r "$INPUT" ]] || die "cannot read candidate file: ${INPUT}" 2
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      CANDIDATE+=("$line")
+    done <"$INPUT"
+  else
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      CANDIDATE+=("$line")
+    done
+  fi
+  # Strip leading and trailing blank lines so the entry is written cleanly.
+  local first=0 last="${#CANDIDATE[@]}"
+  while ((first < last)) && [[ -z "${CANDIDATE[$first]}" ]]; do
+    first=$((first + 1))
+  done
+  while ((last > first)) && [[ -z "${CANDIDATE[$((last - 1))]}" ]]; do
+    last=$((last - 1))
+  done
+  CANDIDATE=("${CANDIDATE[@]:first:last - first}")
+}
+
+validate_candidate() {
+  local line stripped
+  (( ${#CANDIDATE[@]} > 0 )) || die "candidate is empty"
+  line="${CANDIDATE[0]}"
+  stripped="${line#"${line%%[![:space:]]*}"}"
+  [[ "$stripped" =~ ^###[[:space:]]+ ]] ||
+    die "candidate must start with a level-3 markdown heading (### ...)"
+  # The four labels must each appear at the start of a line, in this order.
+  local -a labels=('**Symptom**' '**Cause**' '**Rule**' '**Proven**')
+  local i=0
+  for line in "${CANDIDATE[@]:1}"; do
+    [[ -z "$line" ]] && continue
+    stripped="${line#"${line%%[![:space:]]*}"}"
+    if ((i < ${#labels[@]})) && [[ "$stripped" == "${labels[$i]}"* ]]; then
+      i=$((i + 1))
+      continue
+    fi
+    # A label that already appeared means the candidate repeats it; reject
+    # rather than silently skipping the duplicate.
+    for ((j = 0; j < i; j++)); do
+      if [[ "$stripped" == "${labels[$j]}"* ]]; then
+        die "candidate repeats the ${labels[$j]} label"
+      fi
+    done
+    # A later label showing up before the expected one means the expected one
+    # is missing (the labels are out of order); report the missing line.
+    for ((j = i + 1; j < ${#labels[@]}; j++)); do
+      if [[ "$stripped" == "${labels[$j]}"* ]]; then
+        die "candidate is missing the ${labels[$i]} line (labels must appear in order)"
+      fi
+    done
+  done
+  ((i >= ${#labels[@]})) || die "candidate is missing the ${labels[$i]} line"
+}
+
+check_deny() {
+  [[ -r "$DENY" ]] || return 0
+  TMP_PATTERNS="$(mktemp)"
+  grep -vE '^[[:space:]]*(#|$)' -- "$DENY" >"$TMP_PATTERNS" || true
+  [[ -s "$TMP_PATTERNS" ]] || return 0
+  local count
+  count="$(printf '%s\n' "${CANDIDATE[@]}" | grep -i -E -c -f "$TMP_PATTERNS" || true)"
+  if ((count > 0)); then
+    printf '%s: the candidate matches the deny list (%s line(s)); nothing matched is\n' \
+      "$OB_PROG" "$count" >&2
+    printf '%s: printed on purpose — fix the text before adding the entry.\n' "$OB_PROG" >&2
+    exit 1
+  fi
+}
+
+next_number() {
+  local highest=0 line n
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^###[[:space:]]+([0-9]+)[.] ]]; then
+      n="${BASH_REMATCH[1]}"
+      if ((n > highest)); then
+        highest="$n"
+      fi
+    fi
+  done <"$LEARNINGS"
+  NEXT_NUM=$((highest + 1))
+}
+
+number_heading() {
+  local heading="${CANDIDATE[0]}"
+  local stripped="${heading#"${heading%%[![:space:]]*}"}"
+  local rest
+  # The heading was already validated as ^### + whitespace, so this matches.
+  [[ "$stripped" =~ ^###[[:space:]]+(.*)$ ]]
+  rest="${BASH_REMATCH[1]}"
+  # Drop a leading "<number>." token so the old number never survives, and
+  # the literal "N." of the entry template; keep the rest of the heading
+  # verbatim in both cases.
+  if [[ "$rest" =~ ^[0-9]+[.][[:space:]]*(.*)$ ]]; then
+    rest="${BASH_REMATCH[1]}"
+  elif [[ "$rest" == "N."* ]]; then
+    rest="${rest#N.}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+  fi
+  ENTRY=("### ${NEXT_NUM}. ${rest}" "${CANDIDATE[@]:1}")
+}
+
+write_learnings() {
+  # Assemble the new file in memory, then write it atomically: build the
+  # content in a temp file on the same filesystem and move it into place, so
+  # an interrupted run cannot leave the store truncated.
+  local -a lines=() out=()
+  local line i=0 idx=-1 end
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lines+=("$line")
+  done <"$LEARNINGS"
+
+  if [[ "$SECTION" == "implementer" ]]; then
+    for ((i = 0; i < ${#lines[@]}; i++)); do
+      if [[ "${lines[$i]}" =~ ^##[[:space:]]+Environment[[:space:]]+truths[[:space:]]*$ ]]; then
+        idx="$i"
+        break
+      fi
+    done
+    ((idx >= 0)) || die "LEARNINGS.md has no '## Environment truths' heading"
+    end="$idx"
+    while ((end > 0)) && [[ -z "${lines[$((end - 1))]}" ]]; do
+      end=$((end - 1))
+    done
+    for ((i = 0; i < end; i++)); do
+      out+=("${lines[$i]}")
+    done
+    out+=("")
+    for line in "${ENTRY[@]}"; do
+      out+=("$line")
+    done
+    out+=("")
+    for ((i = idx; i < ${#lines[@]}; i++)); do
+      out+=("${lines[$i]}")
+    done
+  else
+    end="${#lines[@]}"
+    while ((end > 0)) && [[ -z "${lines[$((end - 1))]}" ]]; do
+      end=$((end - 1))
+    done
+    for ((i = 0; i < end; i++)); do
+      out+=("${lines[$i]}")
+    done
+    out+=("")
+    for line in "${ENTRY[@]}"; do
+      out+=("$line")
+    done
+  fi
+
+  # Leave the file ending in a single newline: drop trailing blank lines.
+  end="${#out[@]}"
+  while ((end > 0)) && [[ -z "${out[$((end - 1))]}" ]]; do
+    end=$((end - 1))
+  done
+
+  TMP_LEARNINGS="$(mktemp "${REPO_ROOT}/.ob-learn.tmp.XXXXXX")"
+  cp -p "$LEARNINGS" "$TMP_LEARNINGS"
+  for ((i = 0; i < end; i++)); do
+    printf '%s\n' "${out[$i]}"
+  done >"$TMP_LEARNINGS"
+  mv "$TMP_LEARNINGS" "$LEARNINGS"
+}
+
+section_display_name() {
+  if [[ "$SECTION" == "implementer" ]]; then
+    printf 'Rules the implementer must follow'
+  else
+    printf 'Environment truths'
+  fi
+}
+
+main() {
+  local line
+  parse_args "$@"
+  [[ -r "$LEARNINGS" ]] || die "cannot read ${LEARNINGS}"
+  read_candidate
+  validate_candidate
+  check_deny
+  next_number
+  number_heading
+  if ((DRY_RUN)); then
+    printf 'section: %s\n\n' "$(section_display_name)"
+    for line in "${ENTRY[@]}"; do
+      printf '%s\n' "$line"
+    done
+  else
+    write_learnings
+    printf '%s: inserted ### %s. as the last entry of %s\n' \
+      "$OB_PROG" "$NEXT_NUM" "$(section_display_name)"
+  fi
+}
+
+main "$@"

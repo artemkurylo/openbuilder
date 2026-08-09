@@ -28,6 +28,10 @@ override.tf.json
 # default repo. Never committed.
 .openbuilder.local
 
+# Leftover temp file from an interrupted local/bin/ob-learn run. Contains a
+# partial copy of a candidate entry; never committed.
+.ob-learn.tmp.*
+
 # --- Secrets --------------------------------------------------------------
 # The GitHub App private key, and anything else key-shaped.
 *.pem
