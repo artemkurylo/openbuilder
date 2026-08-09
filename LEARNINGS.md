@@ -151,3 +151,36 @@ token for what the instance itself does. When a tool ignores input by design, ma
 failure message rather than reporting an empty result.
 **Proven** 2026-08-09: the first review round on artemkurylo/openbuilder#1 failed exactly this way; the
 same review posted as the human account was collected on the next pass.
+
+### 13. A timer that measures from completion drifts, so no clock second is safe
+**Symptom** two consecutive hand-run `ob-idle-stop` invocations, deliberately scheduled 25 and 28
+seconds past the minute to dodge the poll pass, both hit `condition 1 failed — locks held: poll`.
+**Cause** `openbuilder-poll.timer` uses `OnUnitInactiveSec=60s`, which counts from when the previous
+run *finished*, not when it started. A pass that takes ~7 s therefore gives a ~67 s period, and its
+start walks forward roughly 7 s every cycle. Aligning to a fixed second aligns to a moving target.
+**Rule** Never assume a periodic job starts at a fixed offset. Either read the next start
+(`systemctl list-timers`), or retry until the lock is free instead of trying to predict the window.
+**Proven** 2026-08-09: poll starts observed at :56, :07, :18, :28 — 11 s of drift per cycle for a
+60 s interval and a ~7 s run.
+
+### 14. A file injected verbatim must contain no template syntax
+**Symptom** the rendered prompt of the first real round carried a literal `{{LEARNINGS_OUT}}` at line
+326, where the surrounding text had every other placeholder substituted.
+**Cause** the prompt renderer substitutes scalars but inserts block files **verbatim**, deliberately —
+model- and human-authored text must never be interpreted. `LEARNINGS.md` is a block, and its own
+editing rules quoted the placeholder by name, so the placeholder survived into the model's context.
+**Rule** When a document is included verbatim into a template, it may describe a placeholder but must
+never spell one. Grep the rendered artefact for unsubstituted syntax; the count should be zero.
+**Proven** 2026-08-09: `grep -c "{{[A-Z_]*}}"` on the round-001 prompt returned 1, and named the line.
+
+### 15. A GitHub App installation token lasts an hour; bind it per operation
+**Symptom** a long session started returning HTTP 401 on calls that had worked for an hour, while a
+freshly minted token in the same process worked immediately.
+**Cause** installation tokens expire after one hour. Worse, the helper captured the token in a
+default argument, which most languages evaluate once at definition time, so every later call kept
+using the first token no matter how many times it was re-minted.
+**Rule** Treat a short-lived credential as per-operation state, never as a default or a cached
+module-level constant. `ob-token` already re-mints and caches with an expiry — go through it rather
+than holding a token yourself.
+**Proven** 2026-08-09: label calls returned 401 mid-session and succeeded on the next line after
+re-minting.

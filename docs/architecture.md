@@ -568,6 +568,65 @@ what `OPENBUILDER_MAX_ATTEMPTS` and the `openbuilder:blocked` label are for — 
 give up loudly rather than to grind. Story-card quality carries the whole load: a vague card produces a
 vague PR, and this is the design's real dependency on human effort.
 
+### OpenRouter pay-per-use instead of an OpenCode Zen or Go subscription
+
+The remote implementer stays on `openrouter/deepseek/deepseek-v4-flash-0731`, billed per token, rather than
+on an OpenCode subscription.
+
+**A switch would be configuration, not integration.** `omp` ships two built-in provider ids for exactly
+this — `opencode-zen` and `opencode-go` — and its own `providers.md` provider/environment-variable table
+shows both credentialed by `OPENCODE_API_KEY`. There is no custom `models.yml` provider to write, no
+`baseUrl` to set and no build step: the work is one secret slot, one exported variable name and the model
+strings.
+
+The exact build we run is in the OpenCode Zen catalog twice. models.dev's `opencode` provider
+(endpoint `https://opencode.ai/zen/v1`, OpenAI-compatible, package `@ai-sdk/openai-compatible`) carries:
+
+| models.dev id | Model | Context | Output | $/Mtok in | $/Mtok out |
+|---|---|---|---|---|---|
+| `deepseek-v4-flash` | `deepseek/deepseek-v4-flash-0731` | 1,000,000 | 384,000 | $0.14 | $0.28 |
+| `deepseek-v4-flash-free` | `deepseek/deepseek-v4-flash-0731` | 200,000 | 128,000 | $0.00 | $0.00 |
+
+The comment in `agent/remote/config.yml` records OpenRouter's rate for the same model as $0.09 / $0.18 per
+Mtok, so Zen's paid tier is ~1.55x OpenRouter per token and its free tier gives up 800k of context.
+
+**Six coupling points**, all confirmed by reading the code:
+
+- `infra/ssm.tf` — the secret slot, currently `openrouter_api_key`.
+- `runner/bin/ob-common.sh`, ~line 670 — exports `OPENROUTER_API_KEY` into the omp child process.
+- `agent/remote/config.yml` — four `modelRoles` entries plus `disabledProviders`.
+- `infra/variables.tf` — the `model` / `smol_model` defaults rendered into cloud-init.
+- `runner/bin/ob-doctor`, ~line 74 — the SSM parameter existence check.
+- `runner/bin/ob-doctor`, ~line 140 — `probe_openrouter`, which asks the provider directly for its
+  verbatim `.error.message`.
+
+**The arithmetic does not favour a subscription yet.** One real story on 2026-08-09
+(`artemkurylo/openbuilder#1`) cost $0.0663 for the implement round and $0.0335 for the review-response
+round — ~$0.10 per story round-trip. A $10/month subscription therefore breaks even at ~100 stories/month
+at OpenRouter's rate, or ~65 stories/month against Zen's pay-per-use rate. Below that it costs more, not
+less.
+
+**Three things are unverified, and they must be checked from the instance.** Whether the **Go**
+subscription entitles `deepseek-v4-flash` specifically, and at what rate limits, is unknown: models.dev
+lists Zen's 87-model catalog, and Go is a subscription-gated subset of it. Go's price ($5 first month, then
+$10/month) is unverified too — it comes from search-result snippets, because the page itself could not be
+fetched: the operator's corporate DNS resolves `opencode.ai` to an OpenDNS block page, and the same DNS
+blocks `openrouter.ai` from that laptop. The instance has clean egress, so that is where to check. The
+third unknown is the exact model-id string `omp` expects for the provider. One command settles the
+entitlement and the string together, and it is the thing to run before touching any of the six points
+above: `OPENCODE_API_KEY=... omp models opencode-go`.
+
+**The failure modes differ in kind, and that is the actual decision.** Pay-per-use degrades on *billing*:
+visible in AWS Budgets, visible at the provider, and already reported verbatim by `ob-doctor`'s
+`probe_openrouter`. A subscription degrades on *rate*, and a 429 in the middle of a round is an unattended
+failure at 3am — `ob-respond` fails loud, labels the slug `openbuilder:blocked` and parks it until a human
+clears the label. Cheaper tokens are not worth trading a billing signal you watch for a rate signal you
+discover in the morning.
+
+**Tradeoff:** spend is variable and unbounded in principle, so a runaway loop lands on the budget instead
+of on a throttle. Two things reverse this decision: wanting flat, predictable billing regardless of volume,
+or sustained volume past the break-even above.
+
 ## 6. Security model
 
 ### What is enforced
