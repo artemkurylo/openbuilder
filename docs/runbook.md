@@ -84,6 +84,10 @@ crash. The fix is upstream: the story card was ambiguous. Tighten it and re-disp
 
 ```sh
 # edit .openbuilder/backlog/<slug>/story-NN-*.md in your local clone, then
+# commit the change — editing a card voids its approval, and dispatch refuses a
+# voided approval — then re-record it from inside the clone:
+cd <clone>
+local/bin/ob-gate record <epic> backlog <slug>
 openbuilder dispatch you/your-repo <slug>
 ```
 
@@ -496,6 +500,12 @@ itself a failure is unrelated. That is what the review gate is for.
 gh pr checks <pr> --repo you/your-repo
 gh pr diff <pr> --repo you/your-repo
 openbuilder review you/your-repo <pr>
+openbuilder review --watch you/your-repo <pr>   # unattended: reviews each new
+                                                # head sha once, applies its own
+                                                # verdict, stops after
+                                                # OPENBUILDER_MAX_ATTEMPTS (6)
+                                                # rounds; exit 4 = blocked,
+                                                # exit 5 = rounds exhausted
 ```
 
 Then hand it back with the failure quoted in a comment, which is what `ob-respond` will read:
@@ -787,10 +797,13 @@ sudo -u openbuilder git -C /opt/openbuilder/src/you__your-repo branch -D openbui
 sudo -u openbuilder rm -rf /opt/openbuilder/state/you__your-repo__<slug>
 ```
 
-Push updated story cards if you changed them, and make sure the plan branch carries `openbuilder:queued`
-again:
+Push updated story cards if you changed them — but editing a card voids its approval (the recorded
+bytes no longer match, and `openbuilder dispatch` refuses a voided approval). Commit the change and
+re-record it from inside the clone before dispatching:
 
 ```sh
+git -C <clone> commit -am 'story: tighten acceptance criteria'
+(cd <clone> && local/bin/ob-gate record <epic> backlog <slug>)
 openbuilder dispatch you/your-repo <slug>
 ```
 
@@ -1158,6 +1171,9 @@ ob-scrub-check: email domains, and the parent directories of your checkout.
 | Update the instance | `sudo -u openbuilder /opt/openbuilder/bin/ob-selfupdate` |
 | Hand the PR back to the instance | `openbuilder request-changes you/your-repo <pr>` |
 | Tell the instance to stop touching a PR | `openbuilder approve you/your-repo <pr>` |
+| Drive a PR to a verdict unattended | `openbuilder review --watch you/your-repo <pr>` |
+| Merge and clean up | `openbuilder land you/your-repo <pr>` |
+| Why is my plan branch doing nothing? | `openbuilder status you/your-repo` (read the `UNAPPR` column) |
 | Reset attempts | `printf '0\n' \| sudo -u openbuilder tee /opt/openbuilder/state/<key>/attempts` then `rm -f .../blocked-reported` |
 | Read the newest round's report | `cat /opt/openbuilder/state/<key>/rounds/*/final.md \| tail -40` |
 | Why did the poller skip my slug? | `sudo journalctl -u openbuilder-poll.service --since today \| grep DECISION` |
@@ -1168,3 +1184,55 @@ ob-scrub-check: email domains, and the parent directories of your checkout.
 | Confirm the instance sees a published learning | `sudo -u openbuilder bash -c 'source /opt/openbuilder/bin/ob-common.sh; ob_load_env; out=$(mktemp); ob_learnings "$out"; wc -l <"$out"'` |
 | Which source the learnings came from | `grep -F 'learnings:' /opt/openbuilder/log/openbuilder.log \| tail -5` |
 | Refuse to publish a private identifier | `make scrub` (or `local/bin/ob-scrub-check --staged` before a commit) |
+## 20. Refusals from the laptop CLI
+
+A refusal is a message on stderr (and always exits non-zero). Every refusal this slug added, quoted
+verbatim from `local/bin/openbuilder`, with the cause and the fix. Appended as §20 rather than
+renumbering: the section numbers are things other documents point at.
+
+| Refusal (grep this) | Cause | Fix |
+|---|---|---|
+| `local/bin/ob-gate is missing or not executable at $OB_BIN_DIR/ob-gate — the epic gate cannot run without it` | `plan-workflow-01-gate` has not merged, or the script was removed | merge the gate slug; reinstall `local/bin/ob-gate` |
+| `plan <owner/repo> <epic>` (usage line) | `openbuilder plan` needs exactly an owner/repo and an epic | `openbuilder plan you/your-repo <epic>` |
+| `invalid slug '$1' (must match` | the epic (or slug) is not `^[a-z0-9][a-z0-9-]{1,48}$` | rename it; a backticked value copied from a PRD header fails here on purpose |
+| `$dir has uncommitted changes on branch $current; commit or stash them before switching to $branch` | resuming would reset the design branch to origin's tip and discard uncommitted work | commit or stash in the clone, then re-run `openbuilder plan` |
+| `an approval for epic $epic is void: an approved artifact changed after it was approved.` | a PRD/RFC/backlog approved in an earlier session changed on disk | re-approve the artifact — see "Un-voiding an approval" below |
+| `ob-gate rejected 'verify $epic --all'` | the CLI and `ob-gate` disagree about the command surface | fix the versions of the two scripts together |
+| `no local clone at $dir — run '$OB_PROG plan $repo <epic>' first` | dispatch needs the design-branch clone that `plan` creates | `openbuilder plan you/your-repo <epic>` |
+| `$backlog/plan.md has no '- epic:' line; dispatch cannot tell which epic gates this slug.` | the card set carries no `- epic: <epic>` bullet (RFC §2) | add the line under the first `# ` heading (backlog/SCHEMA.md) |
+| `$dir is on branch $current, not the design branch $design for epic $epic.` | the clone is on the wrong branch — an approval is read from the design branch | `openbuilder plan you/your-repo <epic>` |
+| `$backlog has uncommitted or untracked changes in $dir:` | an approval covers committed bytes only, and ob-gate verify cannot see uncommitted files | commit the changes, then re-approve |
+| `the recorded backlog approval for $slug no longer matches the files on $design — an artifact changed after it was approved.` | a card was edited after `ob-gate record` (exit 3 from verify) | commit the edit, re-record, dispatch again — see "Un-voiding an approval" |
+| `no backlog approval is recorded for $slug in .openbuilder/epics/$epic/state.json.` | this slug was never approved (exit 4) — an approval for another slug does not satisfy it | `(cd <clone> && local/bin/ob-gate record <epic> backlog <slug>)`, then dispatch again |
+| `no backlog approval is recorded` (status `UNAPPR` = `yes`) | rule 4b would decline this plan branch on every poll pass, silently | approve the backlog, or delete the branch |
+| `'ob-gate stage $epic dispatched' failed; no plan branch was created` | the stage pointer did not move | investigate `ob-gate` and re-dispatch |
+| `refusing to cut` | `state.json` on the design branch still says `stage: backlog` after the stage call — cutting now would carry `stage: backlog`, which rule 4b declines forever | fix the stage ordering bug; the assertion exists to catch it |
+| `$design differs from origin/$design after 'ob-gate stage $epic dispatched'; push it before dispatching:` | the local design tip is not on origin, so the audit trail would not survive | `git -C <clone> push origin <design>` |
+| `origin/$branch already exists and is not an ancestor of $design; pushing it would rewrite history, which openbuilder never does.` | a leftover plan branch is not an ancestor of the design tip | delete it first: `gh api -X DELETE repos/<repo>/git/refs/heads/<branch>` |
+| `usage: $OB_PROG review [--watch] <owner/repo> <pr>` | `review` wants one optional `--watch` and exactly two positionals | `openbuilder review [--watch] you/your-repo <pr>` |
+| `$repo#$pr is blocked; a human is required` (exit 4) | the PR carries `openbuilder:blocked` — the agent gave up | read the last comment, fix the blocker, re-request changes |
+| `review rounds for $repo#$pr reached $rounds_max (OPENBUILDER_MAX_ATTEMPTS) without a verdict; a human is required` (exit 5) | the watch loop spent its whole round budget with no verdict | intervene by hand; raise `OPENBUILDER_MAX_ATTEMPTS` only after thinking about the cost |
+| `usage: $OB_PROG land <owner/repo> <pr>` | `land` wants exactly an owner/repo and a PR number | `openbuilder land you/your-repo <pr>` |
+| `$repo#$pr is not labelled $OB_LABEL_PREFIX:approved; land never merges an unapproved pull request.` | `land` refuses to guess | `openbuilder review --watch you/your-repo <pr>`, then `openbuilder approve` |
+| `$repo#$pr is $state, not OPEN; there is nothing to land` | the PR is merged/closed already | nothing to do |
+| `the head branch of $repo#$pr is '$head', not under $OB_BRANCH_PREFIX/work/; land only handles openbuilder pull requests` | the PR is not one of ours | merge it by hand, if at all |
+| `cannot read .openbuilder/backlog/$slug/plan.md on $plan_branch; land cannot tell which epic to clean up` | the plan branch is gone or the backlog is missing | restore the branch before landing |
+| `.openbuilder/backlog/$slug/plan.md on $plan_branch has no '- epic:' line; land cannot tell which epic to clean up` | the plan branch lacks the RFC §2 bullet | add `- epic: <epic>` before landing |
+| `cannot read .openbuilder/epics/$epic/state.json on $design_branch; land will not delete branches it cannot account for` | missing or malformed epic state; deleting branches on a guess is the one thing land never does | restore `state.json`, or clean up by hand |
+| `confirmation did not match \"land $slug\"; nothing was merged and nothing was deleted` | the typed answer was not exactly `land <slug>` | type the exact slug — it is what makes the wrong PR unconfirmable by muscle memory |
+| `gh pr merge $pr failed; nothing was deleted` | the merge refused or raced | retry; nothing was touched |
+| `instance cleanup failed (exit $rc); prune it by hand:` | the SSM teardown did not finish — the merge and branch deletions already happened | run the two `sudo` commands the warning prints |
+
+### Un-voiding an approval
+
+An approval is void because the **bytes changed** — `ob-gate` records git blob shas and re-checks them,
+so there is no flag that suppresses the check and there should not be one. The fix is always to commit
+the artifact as it now is and re-record the approval from inside the clone:
+
+```sh
+git -C <clone> add <artifact> && git -C <clone> commit -m 'fix: ...'
+(cd <clone> && local/bin/ob-gate record <epic> prd|rfc|backlog <slug>)
+```
+
+Then re-run the command that refused. For a backlog slug the re-record also re-commits and re-pushes
+`state.json` on the design branch, so a dispatch right after it sees intact bytes.

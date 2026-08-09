@@ -76,6 +76,14 @@ OB_LABELS=(
 OB_LOG_FOLLOW_INTERVAL=5
 OB_LOG_CHUNK_BYTES=16000
 
+# `review --watch` label-poll interval: the instance's poll timer ticks on the
+# same cadence, so both sides observe the loop once a minute. Not configurable.
+OB_WATCH_INTERVAL=60
+# One headless reviewer run is bounded like an instance round (the
+# OPENBUILDER_MAX_RUNTIME default in runner/bin/ob-common.sh); the watch loop
+# retries until its own round cap instead.
+OB_WATCH_MAX_TIME=45m
+
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
@@ -549,7 +557,7 @@ ob_install_local_assets() {
     local dir=$1
     local exclude="$dir/.git/info/exclude"
 
-    mkdir -p "$dir/.omp/agents" "$dir/.omp/hooks/pre"
+    mkdir -p "$dir/.omp/agents" "$dir/.omp/hooks/pre" "$dir/.omp/commands"
     if [[ -d $OB_ROOT/agent/local/agents ]]; then
         cp -R "$OB_ROOT/agent/local/agents/." "$dir/.omp/agents/"
     else
@@ -557,6 +565,11 @@ ob_install_local_assets() {
     fi
     if [[ -f $OB_ROOT/agent/hooks/pre/guardrails.ts ]]; then
         cp "$OB_ROOT/agent/hooks/pre/guardrails.ts" "$dir/.omp/hooks/pre/guardrails.ts"
+    fi
+    if [[ -d $OB_ROOT/agent/local/commands ]]; then
+        cp -R "$OB_ROOT/agent/local/commands/." "$dir/.omp/commands/"
+    else
+        ob_warn "missing $OB_ROOT/agent/local/commands — /openbuilder-plan will not be available in the session"
     fi
 
     mkdir -p "$(dirname "$exclude")"
@@ -568,6 +581,25 @@ ob_install_local_assets() {
 
 ob_plan_branch() { printf '%s/plan/%s\n' "$OB_BRANCH_PREFIX" "$1"; }
 ob_work_branch() { printf '%s/work/%s\n' "$OB_BRANCH_PREFIX" "$1"; }
+ob_design_branch() { printf '%s/design/%s\n' "$OB_BRANCH_PREFIX" "$1"; }
+
+# ob_gate <clone-dir> <args...> — run local/bin/ob-gate inside the clone, so its
+# own `git rev-parse --show-toplevel` resolves to the target repository. The
+# gate's exit code is the interface (RFC §3.4): 0 intact, 1 operational refusal,
+# 2 usage, 3 void, 4 absent. Returned unchanged; no logging here.
+ob_gate() {
+    local dir=$1
+    shift
+    ( cd "$dir" && "$OB_BIN_DIR/ob-gate" "$@" )
+}
+
+# ob_need_gate — refuse when the gate is missing. There is no graceful
+# degradation: every call site reads its exit code, so absence must be a dead
+# stop with a message that names the missing piece.
+ob_need_gate() {
+    [[ -x $OB_BIN_DIR/ob-gate ]] ||
+        ob_die "local/bin/ob-gate is missing or not executable at $OB_BIN_DIR/ob-gate — the epic gate cannot run without it"
+}
 
 # ---------------------------------------------------------------------------
 # help
@@ -577,11 +609,12 @@ ob_command_table() {
     cat <<'EOF'
 usage: openbuilder <command> [args]
 
-  plan <owner/repo> <slug>          scaffold a backlog and plan it with Opus 5
-  dispatch <owner/repo> <slug>      commit + push the plan branch, hand it to the instance
-  review <owner/repo> <pr>          review a pull request with Opus 5
+  plan <owner/repo> <epic>          design branch + Opus 5 workflow session for an epic
+  dispatch <owner/repo> <slug>      gate the backlog, cut and push the plan branch
+  review [--watch] <owner/repo> <pr>  review a pull request with Opus 5; --watch runs every round
   approve <owner/repo> <pr>         label a pull request approved
   request-changes <owner/repo> <pr> ask the instance for another round
+  land <owner/repo> <pr>            merge an approved pull request and delete every branch it used
   status [owner/repo]               slugs, branches, pull requests, labels
   logs [-f] [-n lines]              tail the instance's operational log over SSM
   shell                             interactive SSM session on the instance
@@ -608,101 +641,106 @@ cmd_help() {
 # ---------------------------------------------------------------------------
 
 cmd_plan() {
-    local usage="usage: $OB_PROG plan <owner/repo> <slug>"
+    local usage="usage: $OB_PROG plan <owner/repo> <epic>"
     [[ $# -eq 2 ]] || ob_die "$usage"
-    local repo=$1 slug=$2
+    local repo=$1 epic=$2
     ob_validate_repo "$repo"
-    ob_validate_slug "$slug"
+    ob_validate_slug "$epic"
     ob_need git gh omp
+    ob_need_gate
 
-    local dir branch base backlog
+    local dir branch base current rc
     dir=$(ob_ensure_clone "$repo")
-    branch=$(ob_plan_branch "$slug")
+    branch=$(ob_design_branch "$epic")
     base=$(ob_default_branch "$repo")
+    current=$(git -C "$dir" rev-parse --abbrev-ref HEAD)
 
-    if git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
-        ob_info "checking out existing plan branch $branch"
+    # Exactly three cases, in this order: already on the design branch (no git
+    # command at all — `checkout -B --track` would reset the branch to origin's
+    # tip and discard the session's uncommitted work), dirty tree (refuse), and
+    # existing-or-new branch. Push only on creation, never on checkout.
+    if [[ $current == "$branch" ]]; then
+        ob_info "already on design branch $branch"
+    elif ! git -C "$dir" diff --quiet || ! git -C "$dir" diff --cached --quiet; then
+        ob_die "$dir has uncommitted changes on branch $current; commit or stash them before switching to $branch
+  git -C $dir status --short"
+    elif git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+        ob_info "checking out existing design branch $branch"
         git -C "$dir" checkout -B "$branch" --track "origin/$branch" --quiet
     else
-        ob_info "creating plan branch $branch from origin/$base"
+        ob_info "creating design branch $branch from origin/$base"
         git -C "$dir" checkout -B "$branch" "origin/$base" --quiet
-    fi
-
-    backlog=$dir/.openbuilder/backlog/$slug
-    mkdir -p "$backlog"
-    if [[ ! -f $backlog/plan.md ]]; then
-        ob_write_plan_scaffold "$backlog/plan.md" "$repo" "$slug" "$base"
-        ob_info "scaffolded .openbuilder/backlog/$slug/plan.md"
-    else
-        ob_info "reusing existing .openbuilder/backlog/$slug/plan.md"
+        git -C "$dir" push --quiet --set-upstream origin "$branch"
+        ob_info "pushed $branch to origin"
     fi
 
     ob_install_local_assets "$dir"
 
+    # Verify every approval already recorded for the epic. Absent is normal
+    # before the first gate (the session starts intake); void is fatal, because
+    # the sessions would resume from unapproved text.
+    if [[ ! -f $dir/.openbuilder/epics/$epic/state.json ]]; then
+        ob_info "no epic directory for $epic yet — the session will start intake"
+    else
+        rc=0
+        ob_gate "$dir" verify "$epic" --all || rc=$?
+        case $rc in
+        0)
+            ob_info "approvals for epic $epic verified"
+            ;;
+        3)
+            ob_die "an approval for epic $epic is void: an approved artifact changed after it was approved.
+  Inspect it:   (cd $dir && $OB_BIN_DIR/ob-gate show $epic)
+  Re-approve:   (cd $dir && $OB_BIN_DIR/ob-gate record $epic <stage>)"
+            ;;
+        4)
+            ob_info "no approvals recorded for epic $epic yet"
+            ;;
+        2)
+            ob_die "ob-gate rejected 'verify $epic --all' as a usage error (exit 2); the CLI and ob-gate disagree about the command surface"
+            ;;
+        *)
+            ob_die "ob-gate verify $epic --all failed with exit $rc"
+            ;;
+        esac
+    fi
+
     local seed
     seed=$(
         cat <<EOF
-You are running as the openbuilder planner for $repo, slug \`$slug\`.
+You are running as the openbuilder workflow session for $repo, epic \`$epic\`.
 
-Delegate the planning work to the \`planner\` agent (task tool, agent: "planner")
-and use the \`write-backlog\` skill for the story-card format.
+Load the \`openbuilder-workflow\` skill and resume epic \`$epic\`. Do not ask me what
+to do first — the skill and the recorded stage decide that.
 
-Deliverables, all inside \`.openbuilder/backlog/$slug/\` in this checkout
-(current branch: \`$branch\`, base branch: \`$base\`):
+The epic's durable state is \`.openbuilder/epics/$epic/\` on the current branch
+(\`$branch\`): intake.md, prd.md, rfc.md, state.json. Read state.json first and
+continue at the stage it names. If that directory does not exist this is a new
+epic: run \`$OB_BIN_DIR/ob-gate init $epic --repo $repo\` and start intake.
 
-1. \`plan.md\` — replace the scaffold. The first \`# \` heading becomes the pull
-   request title, so make it a real, specific title.
-2. \`story-<NN>-<name>.md\` — one card per story, numbered 01, 02, ... in
-   dependency order, matching the contract in the openbuilder repo's
-   \`backlog/SCHEMA.md\` (frontmatter: id, title, size, depends_on, files,
-   acceptance; body sections: ## Context, ## Change, ## Acceptance,
-   ## Out of scope).
+\`$OB_BIN_DIR/ob-gate\` is the only thing that may write state.json or record an
+approval. Never edit state.json by hand, and never record an approval I did not
+give in this session.
 
-Read the actual code in this repository before writing any card. Cards are
-consumed by a smaller model with no access to this conversation, so every card
-must be self-contained: exact file paths, exact identifier names, explicit
-acceptance criteria, explicit non-goals.
-
-Do not commit, do not push, do not create branches. \`openbuilder dispatch\`
-does that. Stop and ask when a requirement is genuinely missing.
+Never create or push a branch under \`openbuilder/plan/\` — \`openbuilder dispatch\`
+does that, and it is the gate that spends money.
 EOF
     )
 
-    ob_info "launching omp planner ($OB_OPUS_MODEL) in $dir"
+    ob_info "launching omp workflow session ($OB_OPUS_MODEL) in $dir"
     GH_HOST=github.com GH_REPO="$repo" exec omp \
         --cwd "$dir" \
         --model "$OB_OPUS_MODEL" \
-        --append-system-prompt "openbuilder planner session for $repo slug $slug. Produce backlog story cards under .openbuilder/backlog/$slug/. Never commit, push, or merge." \
+        --append-system-prompt "openbuilder workflow session for $repo epic $epic on branch $branch. Artifacts live in .openbuilder/epics/$epic/. Only local/bin/ob-gate writes state.json. Never push a branch under openbuilder/plan/, never merge." \
         "$seed"
 }
 
-ob_write_plan_scaffold() {
-    local path=$1 repo=$2 slug=$3 base=$4
-    cat >"$path" <<EOF
-# $slug
-
-- repo: \`$repo\`
-- slug: \`$slug\`
-- base branch: \`$base\`
-- plan branch: \`$(ob_plan_branch "$slug")\`
-- work branch: \`$(ob_work_branch "$slug")\`
-
-## Goal
-
-_Replace this section with the outcome you want, in one paragraph._
-
-## Context
-
-_What exists today, and which parts of the repository are involved._
-
-## Stories
-
-_One line per story card in this directory, in dependency order._
-
-## Out of scope
-
-_What the implementer must not touch._
-EOF
+# ob_epic_of_plan — read plan.md on stdin, print the epic named by its
+# '- epic:' bullet (RFC §2). Prints nothing when the line is absent, so callers
+# distinguish "no epic" from an unreadable file. Reading stdin is what lets
+# cmd_dispatch feed a file and cmd_status feed an API response.
+ob_epic_of_plan() {
+    awk '/^- epic:/ {print $3; exit}'
 }
 
 # ---------------------------------------------------------------------------
@@ -717,20 +755,16 @@ cmd_dispatch() {
     ob_validate_slug "$slug"
     ob_need git gh aws jq
 
-    # Start the instance first: the poll loop is the only trigger, so a stopped
-    # instance would otherwise turn a dispatch into a silent no-op.
-    ob_ensure_running
-
-    local dir branch backlog stories
+    local dir backlog epic design current branch stories rc
     dir=$(ob_clone_dir "$repo")
-    [[ -d $dir/.git ]] ||
-        ob_die "no local clone at $dir — run '$OB_PROG plan $repo $slug' first"
-    ob_assert_origin_host "$dir"
-    branch=$(ob_plan_branch "$slug")
     backlog=.openbuilder/backlog/$slug
 
+    [[ -d $dir/.git ]] ||
+        ob_die "no local clone at $dir — run '$OB_PROG plan $repo <epic>' first"
+    ob_assert_origin_host "$dir"
+
     [[ -d $dir/$backlog ]] ||
-        ob_die "$backlog does not exist in $dir — run '$OB_PROG plan $repo $slug' first"
+        ob_die "$backlog does not exist in $dir — run '$OB_PROG plan $repo <epic>' first"
     [[ -f $dir/$backlog/plan.md ]] ||
         ob_die "$backlog/plan.md is missing — the planner did not finish"
 
@@ -738,42 +772,112 @@ cmd_dispatch() {
     [[ $stories -gt 0 ]] ||
         ob_die "$backlog contains no story-*.md cards — nothing for the instance to implement"
 
-    if [[ $(git -C "$dir" rev-parse --abbrev-ref HEAD) != "$branch" ]]; then
-        ob_info "switching $dir to $branch"
-        git -C "$dir" checkout "$branch" --quiet
+    # The planner wrote the cards on the design branch; the epic line names the
+    # gate record that must cover them. Validate the value so a backticked epic
+    # copied from a PRD header fails loudly instead of becoming a path.
+    epic=$(ob_epic_of_plan <"$dir/$backlog/plan.md")
+    [[ -n $epic ]] ||
+        ob_die "$backlog/plan.md has no '- epic:' line; dispatch cannot tell which epic gates this slug.
+  Add a line reading exactly '- epic: <epic>' under its first heading (backlog/SCHEMA.md)."
+    ob_validate_slug "$epic"
+
+    design=$(ob_design_branch "$epic")
+    current=$(git -C "$dir" rev-parse --abbrev-ref HEAD)
+    [[ $current == "$design" ]] || ob_die "$dir is on branch $current, not the design branch $design for epic $epic.
+  Run: $OB_PROG plan $repo $epic"
+
+    # An approval covers committed bytes only, and ob-gate verify has nothing to
+    # say about a file it never recorded. `status --porcelain` catches untracked
+    # new story cards too — the exact "no extra story-*.md" case rule 4b checks.
+    if [[ -n $(git -C "$dir" status --porcelain -- "$backlog") ]]; then
+        ob_die "$backlog has uncommitted or untracked changes in $dir:
+  $(git -C "$dir" status --porcelain -- "$backlog")
+  An approval covers committed bytes only. Commit these, then re-approve:
+    (cd $dir && $OB_BIN_DIR/ob-gate record $epic backlog $slug)"
     fi
 
-    git -C "$dir" add -- "$backlog"
-    if git -C "$dir" diff --cached --quiet -- "$backlog"; then
-        ob_info "backlog already committed; nothing new to stage"
-    else
-        # Authored with the operator's own git identity on purpose: the plan is
-        # the human's contribution, only the work branch belongs to the bot.
-        git -C "$dir" commit --quiet -m "openbuilder: backlog for $slug" -- "$backlog"
-        ob_info "committed $backlog ($stories story cards)"
-    fi
+    ob_need_gate
+    # verify takes the slug so it answers about this slug alone: an epic with
+    # *some* recorded backlog approval must not satisfy a different slug's gate.
+    rc=0
+    ob_gate "$dir" verify "$epic" backlog "$slug" || rc=$?
+    case $rc in
+    0)
+        ob_info "backlog approval for $slug on epic $epic verified"
+        ;;
+    3)
+        ob_die "the recorded backlog approval for $slug no longer matches the files on $design — an artifact changed after it was approved.
+  Re-approve this slug, then dispatch again:
+    (cd $dir && $OB_BIN_DIR/ob-gate record $epic backlog $slug)"
+        ;;
+    4)
+        ob_die "no backlog approval is recorded for $slug in .openbuilder/epics/$epic/state.json.
+  Approve this slug, then dispatch again:
+    (cd $dir && $OB_BIN_DIR/ob-gate record $epic backlog $slug)"
+        ;;
+    2)
+        ob_die "ob-gate rejected 'verify $epic backlog $slug' as a usage error (exit 2); the CLI and ob-gate disagree about the command surface"
+        ;;
+    *)
+        ob_die "ob-gate verify $epic backlog $slug failed with exit $rc"
+        ;;
+    esac
 
-    ob_info "pushing $branch to origin"
+    # The ordering is the whole gate: a plan branch cut before the stage pointer
+    # moved carries stage=backlog, which rule 4b declines on every poll pass,
+    # logging nothing to the operational log. So record the stage, then prove it
+    # landed on the design-branch tip and on origin before cutting anything.
+    ob_info "recording stage=dispatched for epic $epic on $design"
+    ob_gate "$dir" stage "$epic" dispatched ||
+        ob_die "'ob-gate stage $epic dispatched' failed; no plan branch was created"
+
+    local stage_now
+    stage_now=$(git -C "$dir" show "$design:.openbuilder/epics/$epic/state.json" | jq -r '.stage')
+    [[ $stage_now == dispatched ]] || ob_die "state.json on $design still says stage='$stage_now' after 'ob-gate stage $epic dispatched'; refusing to cut $(ob_plan_branch "$slug"), because rule 4b would decline it on every poll pass forever"
+
+    git -C "$dir" fetch --quiet origin
+    [[ $(git -C "$dir" rev-parse "$design") == $(git -C "$dir" rev-parse "origin/$design") ]] ||
+        ob_die "$design differs from origin/$design after 'ob-gate stage $epic dispatched'; push it before dispatching:
+  git -C $dir push origin $design"
+
+    # Start the instance first: the poll loop is the only trigger, so a stopped
+    # instance would otherwise turn a dispatch into a silent no-op.
+    ob_ensure_running
+
+    # Cut the plan branch from the design tip without checking it out, so the
+    # clone stays on the design branch for the next slug.
+    branch=$(ob_plan_branch "$slug")
+    if git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$branch" &&
+        ! git -C "$dir" merge-base --is-ancestor "origin/$branch" "$design"; then
+        ob_die "origin/$branch already exists and is not an ancestor of $design; pushing it would rewrite history, which openbuilder never does.
+  Delete it first if this dispatch is intentional:
+    gh api -X DELETE repos/$repo/git/refs/heads/$branch"
+    fi
+    git -C "$dir" branch -f "$branch" "$design"
+    ob_info "created plan branch $branch from $design"
     git -C "$dir" push --quiet --set-upstream origin "$branch"
+    ob_info "pushed $branch to origin"
 
     ob_ensure_labels "$repo"
 
     cat <<EOF
 
 Dispatched $repo :: $slug
+  design branch : $design
   plan branch : $branch  ($stories story cards)
   work branch : $(ob_work_branch "$slug")  (created by the instance)
 
 What happens next, without any further action from you:
   1. Within 60s the instance's openbuilder-poll timer sees $branch.
-  2. It finds no pull request for $(ob_work_branch "$slug") and runs ob-implement.
-  3. On success it pushes the work branch, opens a pull request and labels it
+  2. Rule 4b re-checks the recorded backlog approval against the plan branch. A mismatch is a silent skip — '$OB_PROG status $repo' is where it shows up.
+  3. It finds no pull request for $(ob_work_branch "$slug") and runs ob-implement.
+  4. On success it pushes the work branch, opens a pull request and labels it
      'openbuilder:awaiting-review'. On failure it labels 'openbuilder:blocked'
      and comments the log tail.
 
 Watch it:  $OB_PROG status $repo
            $OB_PROG logs -f
-Then:      $OB_PROG review $repo <pr>
+Then:      $OB_PROG review --watch $repo <pr>
 EOF
 }
 
@@ -782,7 +886,29 @@ EOF
 # ---------------------------------------------------------------------------
 
 cmd_review() {
-    local usage="usage: $OB_PROG review <owner/repo> <pr>"
+    local usage="usage: $OB_PROG review [--watch] <owner/repo> <pr>"
+    local watch=0
+    local -a positional=()
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+        --watch)
+            watch=1
+            shift
+            ;;
+        -h | --help)
+            printf '%s\n' "$usage"
+            return 0
+            ;;
+        -*)
+            ob_die "$usage"
+            ;;
+        *)
+            positional+=("$1")
+            shift
+            ;;
+        esac
+    done
+    set -- "${positional[@]}"
     [[ $# -eq 2 ]] || ob_die "$usage"
     local repo=$1 pr=$2
     ob_validate_repo "$repo"
@@ -791,6 +917,11 @@ cmd_review() {
 
     # The instance must be up: whatever verdict we post starts the next round.
     ob_ensure_running
+
+    if [[ $watch -eq 1 ]]; then
+        ob_review_watch "$repo" "$pr"
+        return $?
+    fi
 
     local dir head
     dir=$(ob_ensure_clone "$repo")
@@ -840,6 +971,140 @@ EOF
         "$seed"
 }
 
+# ob_review_watch <repo> <pr> — carry a pull request to a verdict with nobody at
+# the keyboard (RFC §3.6). Poll the labels every OB_WATCH_INTERVAL s and act on
+# the first match; review each new head sha exactly once, remembering the last
+# reviewed sha in $OB_CACHE_DIR/review/; and hand out at most
+# OPENBUILDER_MAX_ATTEMPTS review rounds. The reviewer applies its own verdict
+# (cmd_approve / cmd_request_changes), because leaving the PR unlabelled stalls
+# the loop. Exit codes: 0 approved, 1 refusal, 4 blocked, 5 rounds exhausted.
+ob_review_watch() {
+    local repo=$1 pr=$2
+    ob_need git gh omp aws jq
+    ob_ensure_running
+
+    local dir
+    dir=$(ob_ensure_clone "$repo")
+    ob_install_local_assets "$dir"
+
+    local marker_dir marker rounds_max rounds
+    marker_dir="$OB_CACHE_DIR/review"
+    mkdir -p "$marker_dir"
+    marker="$marker_dir/$(ob_repo_key "$repo")__$pr"
+    # Sanitise the instance-side attempt cap the way ob-poll does: strip
+    # non-digits, then default to 6.
+    rounds_max=${OPENBUILDER_MAX_ATTEMPTS//[^0-9]/}
+    rounds_max=${rounds_max:-6}
+    rounds=0
+
+    ob_info "watching $repo#$pr every ${OB_WATCH_INTERVAL}s, at most $rounds_max review rounds (Ctrl-C to stop)"
+
+    local labels head_sha head ndjson rc seed
+    while :; do
+        labels=$(ob_pr_labels "$repo" "$pr")
+
+        # First match wins, so blocked beats approved.
+        if printf '%s\n' "$labels" | grep -qxF "$OB_LABEL_PREFIX:blocked"; then
+            ob_warn "#$pr is labelled $OB_LABEL_PREFIX:blocked; last comment follows"
+            ob_gh pr view "$pr" --repo "$repo" --json comments --jq '.comments | last | .body'
+            printf '%s\n' "$OB_PROG: $repo#$pr is blocked; a human is required" >&2
+            exit 4
+        fi
+        if printf '%s\n' "$labels" | grep -qxF "$OB_LABEL_PREFIX:approved"; then
+            printf 'approved. land it with: %s land %s %s\n' "$OB_PROG" "$repo" "$pr"
+            exit 0
+        fi
+        if printf '%s\n' "$labels" | grep -qxF "$OB_LABEL_PREFIX:changes-requested" ||
+            printf '%s\n' "$labels" | grep -qxF "$OB_LABEL_PREFIX:in-progress"; then
+            ob_info "#$pr is $OB_LABEL_PREFIX:in-progress/changes-requested; the instance owns it — waiting ${OB_WATCH_INTERVAL}s"
+            sleep "$OB_WATCH_INTERVAL"
+            continue
+        fi
+        if printf '%s\n' "$labels" | grep -qxF "$OB_LABEL_PREFIX:awaiting-review"; then
+            head_sha=$(ob_gh pr view "$pr" --repo "$repo" --json headRefOid --jq '.headRefOid') || head_sha=''
+            head=$(ob_gh pr view "$pr" --repo "$repo" --json headRefName --jq '.headRefName') || head=''
+            if [[ -z $head_sha || -z $head ]]; then
+                ob_warn "could not read the head sha of #$pr; retrying in ${OB_WATCH_INTERVAL}s"
+                sleep "$OB_WATCH_INTERVAL"
+                continue
+            fi
+            if [[ -f $marker && $(<"$marker") == "$head_sha" ]]; then
+                ob_info "#$pr head $head_sha already reviewed — waiting ${OB_WATCH_INTERVAL}s"
+                sleep "$OB_WATCH_INTERVAL"
+                continue
+            fi
+
+            # Review this round, then loop back to read the verdict label.
+            rounds=$((rounds + 1))
+            if [[ $rounds -gt $rounds_max ]]; then
+                printf '%s\n' "$OB_PROG: review rounds for $repo#$pr reached $rounds_max (OPENBUILDER_MAX_ATTEMPTS) without a verdict; a human is required" >&2
+                exit 5
+            fi
+
+            git -C "$dir" fetch --prune --quiet origin
+            if git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$head"; then
+                ob_info "checking out $head for local inspection"
+                git -C "$dir" checkout -B "$head" --track "origin/$head" --quiet
+                git -C "$dir" reset --hard --quiet "origin/$head"
+            else
+                ob_warn "origin/$head not found locally; reviewing from the GitHub API only"
+            fi
+
+            ob_info "reviewing #$pr at $head_sha headlessly (round $rounds of $rounds_max)"
+
+            seed=$(
+                cat <<EOF
+You are running as the openbuilder reviewer for $repo pull request #$pr
+(head branch \`$head\`).
+
+Start by reading \`pr://$pr\` — that gives you the description, the diff and
+every existing comment. Then delegate to the \`reviewer\` agent (task tool,
+agent: "reviewer") and follow the \`review-openbuilder-pr\` skill.
+
+The pull request was produced by a small model from the story cards in
+\`.openbuilder/backlog/\` on the plan branch, and its own notes are in
+\`.openbuilder/backlog/<slug>/worklog.md\` on \`$head\`. Check the diff against
+the acceptance criteria of every card, not against your own taste.
+
+Finish by running exactly one of these two commands yourself, and nothing else:
+  $OB_BIN_DIR/openbuilder approve $repo $pr
+  $OB_BIN_DIR/openbuilder request-changes $repo $pr
+
+Before request-changes, post line-anchored review comments a small model can act
+on without guessing. You are running unattended: there is no human to hand the
+verdict to, and leaving the pull request unlabelled stalls the loop.
+
+Never merge, never push to $head, never push to a default branch.
+EOF
+            )
+
+            ndjson="$marker_dir/$(ob_repo_key "$repo")__$pr.round-$(printf '%02d' "$rounds").ndjson"
+            rc=0
+            GH_REPO="$repo" omp --cwd "$dir" -p --no-pty --mode json --approval-mode yolo --auto-approve \
+                --no-session --max-time "$OB_WATCH_MAX_TIME" --model "$OB_OPUS_MODEL" \
+                --append-system-prompt "openbuilder reviewer session for $repo pull request #$pr. Read-only on the branch: comment and label, never merge, never push." \
+                "$seed" >"$ndjson" 2>&1 || rc=$?
+            ob_info "reviewer transcript: $ndjson"
+
+            # The marker is written only after a run exits 0: a failed run must
+            # be retried, not remembered as reviewed. The round counter has
+            # already advanced, so a repeatedly failing run is bounded by the
+            # cap instead of looping forever.
+            if [[ $rc -eq 0 ]]; then
+                printf '%s\n' "$head_sha" >"$marker"
+                ob_info "recorded reviewed head $head_sha for #$pr"
+            else
+                ob_warn "reviewer run for #$pr exited $rc; marker not written, retrying next pass"
+            fi
+            sleep "$OB_WATCH_INTERVAL"
+            continue
+        fi
+
+        ob_info "#$pr has no $OB_LABEL_PREFIX label yet — waiting ${OB_WATCH_INTERVAL}s"
+        sleep "$OB_WATCH_INTERVAL"
+    done
+}
+
 cmd_approve() {
     local usage="usage: $OB_PROG approve <owner/repo> <pr>"
     [[ $# -eq 2 ]] || ob_die "$usage"
@@ -880,8 +1145,237 @@ cmd_request_changes() {
 }
 
 # ---------------------------------------------------------------------------
+# land
+# ---------------------------------------------------------------------------
+
+# cmd_land <owner/repo> <pr> — the only merge path, and the only teardown
+# (RFC §3.7). Refuses every unsafe state before any destructive call, merges
+# with `--squash --delete-branch`, deletes the plan branch, deletes the design
+# branch only when no other slug of the epic is unlanded, and prunes the
+# instance over SSM. Never re-runnable past the merge, so everything that can
+# refuse refuses before it. Exit codes: 0 landed, 1 refusal, 4 blocked,
+# 6 instance prune failed.
+cmd_land() {
+    local usage="usage: $OB_PROG land <owner/repo> <pr>"
+    [[ $# -eq 2 ]] || ob_die "$usage"
+    local repo=$1 pr=$2
+    ob_validate_repo "$repo"
+    ob_validate_pr "$pr"
+    ob_need gh aws jq
+
+    local view state head slug plan_branch epic design_branch
+    view=$(ob_gh pr view "$pr" --repo "$repo" --json headRefName,labels,state,title,baseRefName) ||
+        ob_die "cannot read pull request #$pr in $repo"
+
+    if ! jq -e --arg l "$OB_LABEL_PREFIX:approved" \
+        '.labels | map(.name) | index($l)' <<<"$view" >/dev/null 2>&1; then
+        ob_die "$repo#$pr is not labelled $OB_LABEL_PREFIX:approved; land never merges an unapproved pull request.
+  Review it first:  $OB_PROG review --watch $repo $pr"
+    fi
+
+    state=$(jq -r '.state' <<<"$view")
+    [[ $state == OPEN ]] ||
+        ob_die "$repo#$pr is $state, not OPEN; there is nothing to land"
+
+    head=$(jq -r '.headRefName' <<<"$view")
+    [[ $head == "$OB_BRANCH_PREFIX/work/"* ]] ||
+        ob_die "the head branch of $repo#$pr is '$head', not under $OB_BRANCH_PREFIX/work/; land only handles openbuilder pull requests"
+    slug=${head#"$OB_BRANCH_PREFIX/work/"}
+    ob_validate_slug "$slug"
+    plan_branch=$(ob_plan_branch "$slug")
+
+    # land makes no local git call: plan.md and state.json are read over the
+    # contents API with the raw-content header.
+    local plan_md
+    plan_md=$(ob_gh api "repos/$repo/contents/.openbuilder/backlog/$slug/plan.md?ref=$plan_branch" \
+        -H 'Accept: application/vnd.github.raw' 2>/dev/null) ||
+        ob_die "cannot read .openbuilder/backlog/$slug/plan.md on $plan_branch; land cannot tell which epic to clean up"
+    epic=$(printf '%s\n' "$plan_md" | ob_epic_of_plan)
+    [[ -n $epic ]] ||
+        ob_die ".openbuilder/backlog/$slug/plan.md on $plan_branch has no '- epic:' line; land cannot tell which epic to clean up"
+    ob_validate_slug "$epic"
+    design_branch=$(ob_design_branch "$epic")
+
+    local state_json
+    state_json=$(ob_gh api "repos/$repo/contents/.openbuilder/epics/$epic/state.json?ref=$design_branch" \
+        -H 'Accept: application/vnd.github.raw' 2>/dev/null) ||
+        ob_die "cannot read .openbuilder/epics/$epic/state.json on $design_branch; land will not delete branches it cannot account for"
+    if ! jq -e '.slugs | type == "array"' <<<"$state_json" >/dev/null 2>&1; then
+        ob_die "cannot read .openbuilder/epics/$epic/state.json on $design_branch; land will not delete branches it cannot account for"
+    fi
+    local -a slugs=()
+    local s
+    while IFS= read -r s; do
+        [[ -n $s ]] || continue
+        slugs+=("$s")
+    done <<<"$(jq -r '.slugs[]' <<<"$state_json")"
+
+    # A slug from state.json.slugs is unlanded while its plan ref is still
+    # present; land deletes the plan branch, so absence of the ref is the
+    # landed signal. First listing feeds the confirmation display (this slug
+    # excluded — its ref still exists until step 8).
+    local plan_refs keep_design=0
+    plan_refs=$(ob_gh api "repos/$repo/git/matching-refs/heads/$OB_BRANCH_PREFIX/plan/" --jq '.[].ref' 2>/dev/null || true)
+    for s in "${slugs[@]}"; do
+        [[ $s == "$slug" ]] && continue
+        if printf '%s\n' "$plan_refs" | grep -qxF "refs/heads/$OB_BRANCH_PREFIX/plan/$s"; then
+            keep_design=1
+        fi
+    done
+
+    local title base key
+    title=$(jq -r '.title' <<<"$view")
+    base=$(jq -r '.baseRefName' <<<"$view")
+    key=$(ob_repo_key "$repo")__$slug
+
+    printf 'land %s#%s: %s\n' "$repo" "$pr" "$title"
+    printf '  head branch : %s\n' "$head"
+    printf '  base branch : %s\n' "$base"
+    printf 'will delete:\n'
+    printf '  %s\n' "$head"
+    printf '  %s\n' "$plan_branch"
+    if [[ $keep_design -eq 1 ]]; then
+        printf '  %s (kept — epic %s has other unlanded slugs)\n' "$design_branch" "$epic"
+    else
+        printf '  %s\n' "$design_branch"
+    fi
+    printf 'on the instance:\n'
+    printf '  %s/work/%s\n' "$OB_REMOTE_HOME" "$key"
+    printf '  %s/state/%s\n' "$OB_REMOTE_HOME" "$key"
+
+    local answer
+    printf 'type "land %s" to proceed: ' "$slug"
+    read -r answer || ob_die "confirmation did not match \"land $slug\"; nothing was merged and nothing was deleted"
+    [[ $answer == "land $slug" ]] ||
+        ob_die "confirmation did not match \"land $slug\"; nothing was merged and nothing was deleted"
+
+    local unlanded=0
+    ob_gh pr merge "$pr" --repo "$repo" --squash --delete-branch ||
+        ob_die "gh pr merge $pr failed; nothing was deleted"
+    ob_info "merged $repo#$pr and deleted $head"
+
+    if ! ob_gh api -X DELETE "repos/$repo/git/refs/heads/$plan_branch" >/dev/null 2>&1; then
+        ob_warn "could not delete $plan_branch (already gone?)"
+    fi
+    ob_info "deleted $plan_branch"
+
+    # Re-list after the plan-branch deletion so this slug is no longer among
+    # the survivors; any remaining ref from state.json.slugs keeps the design
+    # branch alive for the rest of the epic.
+    plan_refs=$(ob_gh api "repos/$repo/git/matching-refs/heads/$OB_BRANCH_PREFIX/plan/" --jq '.[].ref' 2>/dev/null || true)
+    unlanded=0
+    for s in "${slugs[@]}"; do
+        if printf '%s\n' "$plan_refs" | grep -qxF "refs/heads/$OB_BRANCH_PREFIX/plan/$s"; then
+            unlanded=1
+        fi
+    done
+    if [[ $unlanded -eq 1 ]]; then
+        ob_info "keeping $design_branch — epic $epic has unlanded slugs"
+    else
+        if ! ob_gh api -X DELETE "repos/$repo/git/refs/heads/$design_branch" >/dev/null 2>&1; then
+            ob_warn "could not delete $design_branch (already gone?)"
+        fi
+        ob_info "deleted $design_branch — epic $epic has no unlanded slugs"
+    fi
+
+    # Prune the instance: worktree, local work branch and per-slug state. The
+    # merge and the branch deletions already happened; the report above is
+    # printed first because a failed prune must not look like a full teardown —
+    # report it, exit 6, and never stop the instance (ob-idle-stop owns that).
+    printf 'landed %s#%s :: %s\n' "$repo" "$pr" "$slug"
+    printf 'deleted %s\n' "$head"
+    printf 'deleted %s\n' "$plan_branch"
+    if [[ $unlanded -eq 1 ]]; then
+        printf 'kept %s (unlanded slugs remain)\n' "$design_branch"
+        printf 'epic %s still has unlanded slugs. Dispatch the next one:\n' "$epic"
+        for s in "${slugs[@]}"; do
+            if printf '%s\n' "$plan_refs" | grep -qxF "refs/heads/$OB_BRANCH_PREFIX/plan/$s"; then
+                printf '  %s dispatch %s %s\n' "$OB_PROG" "$repo" "$s"
+            fi
+        done
+    else
+        printf 'deleted %s\n' "$design_branch"
+    fi
+
+    local rc=0 out
+    ob_ensure_running
+    rc=0
+    out=$(ob_ssm_exec "$(ob_land_prune_script "$repo" "$slug")") || rc=$?
+    [[ -n $out ]] && printf '%s' "$out"
+    if [[ $rc -ne 0 ]]; then
+        ob_warn "instance cleanup failed (exit $rc); prune it by hand:
+  $OB_PROG shell
+  sudo -u $OB_REMOTE_USER git -C $OB_REMOTE_HOME/src/$(ob_repo_key "$repo") worktree remove --force $OB_REMOTE_HOME/work/$key
+  sudo rm -rf $OB_REMOTE_HOME/state/$key"
+        return 6
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
+
+# ob_status_unapproved <repo> <slug> — would rule 4b decline this plan branch?
+# Prints exactly one token and never exits non-zero: '-' (rule 4b would let it
+# through), 'yes' (rule 4b would decline it), '?' (an API call failed or a
+# response did not parse, so the answer is unknown). Reports the same predicate
+# rule 4b evaluates on the instance, because a rule-4b decline is deliberately
+# silent (RFC §4.2-4.3) and this is the one visible surface for it. Three
+# serial API calls per branch that has no pull request; no caching.
+ob_status_unapproved() {
+    local repo=$1 slug=$2
+    local branch plan_md epic state_json listing verdict
+
+    branch=$(ob_plan_branch "$slug")
+
+    plan_md=$(ob_gh api "repos/$repo/contents/.openbuilder/backlog/$slug/plan.md?ref=$branch" \
+        -H 'Accept: application/vnd.github.raw' 2>/dev/null) || {
+        printf '?\n'
+        return 0
+    }
+    epic=$(printf '%s\n' "$plan_md" | ob_epic_of_plan)
+    [[ -n $plan_md && -n $epic && $epic =~ ^[a-z0-9][a-z0-9-]{1,48}$ ]] || {
+        printf 'yes\n'
+        return 0
+    }
+
+    state_json=$(ob_gh api "repos/$repo/contents/.openbuilder/epics/$epic/state.json?ref=$branch" \
+        -H 'Accept: application/vnd.github.raw' 2>/dev/null) || {
+        printf '?\n'
+        return 0
+    }
+    jq empty <<<"$state_json" 2>/dev/null || {
+        printf 'yes\n'
+        return 0
+    }
+
+    listing=$(ob_gh api "repos/$repo/contents/.openbuilder/backlog/$slug?ref=$branch" 2>/dev/null) || {
+        printf '?\n'
+        return 0
+    }
+
+    # Rule 4b's predicate: stage == dispatched, an approval record for this
+    # slug, and the recorded files map exactly equal to what the branch
+    # carries — no extra card, no missing card, no changed sha. With `-e`,
+    # exit 0 means true, 1 means false, anything else is a jq failure.
+    verdict=0
+    jq -e -n \
+        --argjson listing "$listing" \
+        --argjson state "$state_json" \
+        --arg slug "$slug" \
+        '([ $listing[] | select(.type == "file" and (.name == "plan.md" or (.name | test("^story-.*\\.md$")))) | {(.name): .sha} ] | add) as $disk
+         | ($state | type) == "object"
+           and $state.stage == "dispatched"
+           and (($state.approvals.backlog[$slug] // {}) | type) == "object"
+           and (($state.approvals.backlog[$slug].files // {}) | type) == "object"
+           and $state.approvals.backlog[$slug].files == ($disk // {})' >/dev/null 2>&1 || verdict=$?
+    case $verdict in
+    0) printf -- '-\n' ;;
+    1) printf 'yes\n' ;;
+    *) printf '?\n' ;;
+    esac
+    return 0
+}
 
 cmd_status() {
     local usage="usage: $OB_PROG status [owner/repo]"
@@ -930,17 +1424,23 @@ cmd_status() {
     fi
 
     printf '%s\n' "$repo"
-    printf '%-26s %-5s %-5s %-6s %-40s %-22s\n' \
-        SLUG PLAN WORK PR LABELS 'LAST ACTIVITY'
-    printf '%-26s %-5s %-5s %-6s %-40s %-22s\n' \
-        '--------------------------' '-----' '-----' '------' \
+    printf '%-26s %-5s %-5s %-6s %-7s %-40s %-22s\n' \
+        SLUG PLAN WORK PR UNAPPR LABELS 'LAST ACTIVITY'
+    printf '%-26s %-5s %-5s %-6s %-7s %-40s %-22s\n' \
+        '--------------------------' '-----' '-----' '------' '-------' \
         '----------------------------------------' '----------------------'
 
-    local slug plan work pr labels updated
+    local slug plan work pr labels updated unappr
     while IFS=$'\t' read -r slug plan work pr labels updated; do
         [[ -n $slug ]] || continue
-        printf '%-26s %-5s %-5s %-6s %-40s %-22s\n' \
-            "$slug" "$plan" "$work" "$pr" "$labels" "$updated"
+        # Rule 4b never reaches a slug that already has a pull request
+        # (RFC §4.2), so only a PR-less branch needs the API predicate.
+        unappr='-'
+        if [[ $pr == '-' ]]; then
+            unappr=$(ob_status_unapproved "$repo" "$slug")
+        fi
+        printf '%-26s %-5s %-5s %-6s %-7s %-40s %-22s\n' \
+            "$slug" "$plan" "$work" "$pr" "$unappr" "$labels" "$updated"
     done <<<"$rows"
 }
 
@@ -1159,6 +1659,29 @@ done
 EOF
 }
 
+# Builds the strictly POSIX teardown payload for `cmd_land`. AWS-RunShellScript
+# runs /bin/sh (dash on Ubuntu) — no [[, no arrays, no ${var//x/y} — and every
+# git command runs as the openbuilder service user, because root git trips
+# git's "dubious ownership" refusal on an openbuilder-owned clone.
+ob_land_prune_script() {
+    local repo=$1 slug=$2
+    local src
+    src=$OB_REMOTE_HOME/src/$(ob_repo_key "$repo")
+    cat <<EOF
+key=$(ob_repo_key "$repo")__$slug
+src=$src
+wt=$OB_REMOTE_HOME/work/\$key
+st=$OB_REMOTE_HOME/state/\$key
+if [ -d "\$wt" ]; then
+  sudo -u $OB_REMOTE_USER git -C "\$src" worktree remove --force "\$wt" 2>/dev/null || rm -rf "\$wt"
+fi
+sudo -u $OB_REMOTE_USER git -C "\$src" worktree prune 2>/dev/null || true
+sudo -u $OB_REMOTE_USER git -C "\$src" branch -D $OB_BRANCH_PREFIX/work/$slug 2>/dev/null || true
+rm -rf "\$st"
+printf 'pruned %s and %s\n' "\$wt" "\$st"
+EOF
+}
+
 cmd_cost() {
     local usage="usage: $OB_PROG cost"
     [[ $# -eq 0 ]] || ob_die "$usage"
@@ -1217,6 +1740,7 @@ main() {
     review) cmd_review "$@" ;;
     approve) cmd_approve "$@" ;;
     request-changes) cmd_request_changes "$@" ;;
+    land) cmd_land "$@" ;;
     status) cmd_status "$@" ;;
     logs) cmd_logs "$@" ;;
     shell) cmd_shell "$@" ;;
