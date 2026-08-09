@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# obrun — run a bash script on the openbuilder instance through SSM.
+#
+# AWS-RunShellScript executes /bin/sh (dash) on Ubuntu, so bashisms in the
+# script body fail with "Bad substitution". Base64-wrap the whole thing and pipe
+# it to bash instead. macOS base64 line-wraps at 76 columns, hence the `tr -d`.
+#
+#   usage: obrun <<'EOF' ... EOF     |     obrun -f script.sh
+set -euo pipefail
+
+# Config comes from .openbuilder.local, the same file the openbuilder CLI reads,
+# so a rebuilt instance only has to be renamed in one place. Real environment
+# variables still win.
+OB_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [[ -r "${OB_ROOT}/.openbuilder.local" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "${OB_ROOT}/.openbuilder.local"
+  set +a
+fi
+
+PROFILE="${OPENBUILDER_AWS_PROFILE:-openbuilder-deploy}"
+REGION="${OPENBUILDER_REGION:-eu-central-1}"
+INSTANCE="${OPENBUILDER_INSTANCE_ID:?set OPENBUILDER_INSTANCE_ID in .openbuilder.local}"
+
+if [[ "${1:-}" == "-f" ]]; then
+  payload="$(base64 <"$2" | tr -d '\n')"
+else
+  payload="$(base64 | tr -d '\n')"
+fi
+
+command_id="$(aws ssm send-command \
+  --profile "$PROFILE" --region "$REGION" --instance-ids "$INSTANCE" \
+  --document-name AWS-RunShellScript \
+  --parameters "commands=[\"echo ${payload} | base64 -d | bash\"]" \
+  --query 'Command.CommandId' --output text)"
+
+for _ in $(seq 1 60); do
+  sleep 3
+  status="$(aws ssm get-command-invocation --profile "$PROFILE" --region "$REGION" \
+    --command-id "$command_id" --instance-id "$INSTANCE" \
+    --query 'Status' --output text 2>/dev/null || printf 'Pending')"
+  case "$status" in
+  Pending | InProgress | Delayed) continue ;;
+  *) break ;;
+  esac
+done
+
+aws ssm get-command-invocation --profile "$PROFILE" --region "$REGION" \
+  --command-id "$command_id" --instance-id "$INSTANCE" \
+  --query '[Status,StandardOutputContent,StandardErrorContent]' --output text
