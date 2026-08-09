@@ -72,9 +72,11 @@ and each `plan.md` carries the same `- epic:` line.
     "prd": { "at": "2026-08-09T08:50:27Z", "blob": "92074e0…" },
     "rfc": { "at": "…", "blob": "…" },
     "backlog": {
-      "at": "…",
-      "slug": "plan-workflow-01-gate",
-      "files": { "plan.md": "<blob>", "story-01-…md": "<blob>" }
+      "plan-workflow-00-host": {
+        "at": "…",
+        "files": { "plan.md": "<blob>", "story-01-…md": "<blob>" }
+      },
+      "plan-workflow-01-gate": { "at": "…", "files": { "…": "…" } }
     }
   }
 }
@@ -97,6 +99,14 @@ one blob sha per entry, so an exact set-and-sha comparison is two lines of `jq` 
 stdlib Python. Deriving a git tree sha instead would mean reimplementing tree serialisation in both
 languages to save one field. The map also gives a precise refusal: `story-02-…md changed since
 approval`, not "the backlog changed".
+
+**Why it is keyed by slug.** An epic has one PRD and one RFC but several backlogs (R10), each
+approved and dispatched at a different moment. A single `approvals.backlog` object would let the
+design branch remember only the most recently approved slug, so `ob-gate verify --all` could not
+confirm that slug 01 was ever approved once slug 02 had been. Each plan branch would still carry a
+correct snapshot, because it is cut at its own dispatch moment and never rewritten — which is why
+this is a bookkeeping defect rather than a hole in the gate — but the design branch is the audit
+trail, and an audit trail that forgets is not one.
 
 `state.json` is deliberately **not** part of the record that lands on `main` — see §7.
 
@@ -283,9 +293,9 @@ For a slug whose plan branch exists and which has no pull request yet:
    decline;
 2. read `.openbuilder/epics/<epic>/state.json` on the plan branch. Absent, unparseable, or
    `stage != "dispatched"` → decline;
-3. require `approvals.backlog.slug == <slug>`, and every entry of `approvals.backlog.files` to
-   match the blob sha of that file in the plan branch's `.openbuilder/backlog/<slug>/` listing,
-   with no extra and no missing `story-*.md`. Mismatch → decline.
+3. require `approvals.backlog[<slug>]` to exist, and every entry of its `files` map to match the
+   blob sha of that file in the plan branch's `.openbuilder/backlog/<slug>/` listing, with no extra
+   and no missing `story-*.md`. Mismatch → decline.
 
 Pass → rule 5 proceeds exactly as today. Three GitHub API calls in the rule-5 candidate path only —
 contents of `plan.md`, contents of `state.json`, listing of the backlog directory. A slug that
