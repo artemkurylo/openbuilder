@@ -17,6 +17,10 @@ set -uo pipefail
 TESTS_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TESTS_LIB="${TESTS_ROOT}/tests/lib.sh"
 export TESTS_ROOT TESTS_LIB
+# A case file that imports from waker/ would otherwise drop a waker/__pycache__
+# into the working tree. A test run must leave no trace in the repo, so the
+# runner forbids bytecode for every case rather than trusting each one to.
+export PYTHONDONTWRITEBYTECODE=1
 cd -- "$TESTS_ROOT" || exit 1
 
 pattern="${1:-}"
