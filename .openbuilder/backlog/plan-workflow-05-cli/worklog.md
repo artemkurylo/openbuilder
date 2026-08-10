@@ -124,3 +124,37 @@ Docs kept true: README §13 already said "deletes the design branch (only when n
 epic is still unlanded)", which the new predicate satisfies; no README edit was needed this round.
 `make lint` clean; `make scrub` exits 0 but reports "no deny list ... nothing to check" — the
 gitignored `.scrub-deny` does not exist anywhere on this box, so scrub is vacuous here (learning 21).
+
+## Round 2 — 2026-08-10T10:09:13Z
+
+Review-response round by `ob-respond` (attempt 2 of 6).
+
+- action: respond to review
+- pull request: #8
+- model: `openrouter/deepseek/deepseek-v4-flash-0731`
+- new commits: 1
+- cost: 0.46214296880000005 USD
+
+### Agent summary
+
+## Summary
+All six review items are fixed in commit `ca5e5a2` (pushed). `review --watch` now defaults `OPENBUILDER_MAX_ATTEMPTS` before stripping so it starts with the variable unset; `land`'s design-branch predicate now requires positive evidence of landing (a merged `openbuilder/work/<slug>` PR) and keeps the design branch for never-dispatched slugs — with the story-04 card amended in the same round; the headless reviewer child pins `GH_HOST=github.com`; the runbook's `ob-gate` invocations use an absolute control-repo path; the duplicate `ob_ensure_running` and the missing blank line are gone.
+
+## Feedback
+- `local/bin/openbuilder:996`: fixed — default before strip: `rounds_max=${OPENBUILDER_MAX_ATTEMPTS:-6}`, then non-digit strip. Verified end-to-end: with the var unset, `review --watch` reaches the loop (`at most 6 review rounds`) and the marker path (`already reviewed`) instead of dying with `unbound variable`.
+- `local/bin/openbuilder:1272` (`land` predicate): fixed — new `ob_slug_landed()` checks `gh pr list --head openbuilder/work/<slug> --state merged` (exact headRefName via jq); absence of a plan ref is no longer treated as landed. Story-04 card step 9 and acceptance amended to match; the amended card is committed in this PR (`.openbuilder/backlog/plan-workflow-05-cli/story-04-land-teardown.md`) because the authoritative card on the plan branch cannot be pushed to from a work branch — please sync it there. RFC §3.7 step 4 already says "only when no other slug of the epic is unlanded", which the new predicate satisfies.
+- `local/bin/openbuilder:1083`: fixed — `GH_HOST=github.com` pinned on the headless launch; measured with `GH_HOST=github.example-enterprise.net` exported, the omp child sees `github.com`.
+- `docs/runbook.md:90,806,1234,1206`: fixed — `local/bin/ob-gate` replaced with `<control-repo>/local/bin/ob-gate` (note added on first use) so it resolves in the control repo, not the target clone.
+- `local/bin/openbuilder:984`: fixed — duplicate `ob_ensure_running` removed from `ob_review_watch`; `cmd_review` still ensures the instance before branching.
+- `docs/runbook.md:1187`: fixed — blank line before `## 20.`.
+
+## Verification
+- `make lint` (shellcheck 0.10.0, `-x -S warning`) -> exit 0, clean.
+- Sandbox (local bare repo + gh/aws/omp PATH stubs): `OPENBUILDER_MAX_ATTEMPTS` unset + marker set -> `already reviewed`, zero omp calls; marker cleared -> `round 1 of 6` started, omp child env `GH_HOST=github.com` (also with enterprise host exported); `land` with sibling `other-slug` never dispatched -> design branch kept (no DELETE-REF-CALL), `openbuilder dispatch ... other-slug` on stdout, exit 6 with manual-prune warning (SSM stubbed failed, as in round 001); sibling with a merged PR -> design branch deleted, exit 0; merge + plan-branch delete calls recorded in both.
+- `help` greps: `land <owner/repo> <pr>` = 1, `gh pr merge` = 0, `-p --no-pty --mode json` = 1, `--approval-mode yolo --auto-approve` = 1. All 31 §20 refusal cells match the source (4 annotated cells match as substrings, as in round 1).
+- `make scrub` -> exit 0 but reports "no deny list ... nothing to check": the gitignored `.scrub-deny` does not exist anywhere on this box, so scrub is vacuous here (learning 21); no identifiers were added by this round.
+
+## Still open
+- The authoritative story-04 card and plan.md on `openbuilder/plan/plan-workflow-05-cli` still carry the old "plan ref present" predicate; I cannot push to the plan branch from a work branch. The amended card is in this PR for review — sync it to the plan branch (and the plan.md Risks paragraph) when merging.
+
+
