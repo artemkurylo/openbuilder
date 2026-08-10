@@ -87,7 +87,9 @@ crash. The fix is upstream: the story card was ambiguous. Tighten it and re-disp
 # commit the change — editing a card voids its approval, and dispatch refuses a
 # voided approval — then re-record it from inside the clone:
 cd <clone>
-local/bin/ob-gate record <epic> backlog <slug>
+# <control-repo> is the absolute path to your control-repo clone — ob-gate
+# lives in the control repo's local/bin, not in the target clone.
+<control-repo>/local/bin/ob-gate record <epic> backlog <slug>
 openbuilder dispatch you/your-repo <slug>
 ```
 
@@ -803,7 +805,7 @@ re-record it from inside the clone before dispatching:
 
 ```sh
 git -C <clone> commit -am 'story: tighten acceptance criteria'
-(cd <clone> && local/bin/ob-gate record <epic> backlog <slug>)
+(cd <clone> && <control-repo>/local/bin/ob-gate record <epic> backlog <slug>)
 openbuilder dispatch you/your-repo <slug>
 ```
 
@@ -1184,6 +1186,7 @@ ob-scrub-check: email domains, and the parent directories of your checkout.
 | Confirm the instance sees a published learning | `sudo -u openbuilder bash -c 'source /opt/openbuilder/bin/ob-common.sh; ob_load_env; out=$(mktemp); ob_learnings "$out"; wc -l <"$out"'` |
 | Which source the learnings came from | `grep -F 'learnings:' /opt/openbuilder/log/openbuilder.log \| tail -5` |
 | Refuse to publish a private identifier | `make scrub` (or `local/bin/ob-scrub-check --staged` before a commit) |
+
 ## 20. Refusals from the laptop CLI
 
 A refusal is a message on stderr (and always exits non-zero). Every refusal this slug added, quoted
@@ -1203,7 +1206,7 @@ renumbering: the section numbers are things other documents point at.
 | `$dir is on branch $current, not the design branch $design for epic $epic.` | the clone is on the wrong branch — an approval is read from the design branch | `openbuilder plan you/your-repo <epic>` |
 | `$backlog has uncommitted or untracked changes in $dir:` | an approval covers committed bytes only, and ob-gate verify cannot see uncommitted files | commit the changes, then re-approve |
 | `the recorded backlog approval for $slug no longer matches the files on $design — an artifact changed after it was approved.` | a card was edited after `ob-gate record` (exit 3 from verify) | commit the edit, re-record, dispatch again — see "Un-voiding an approval" |
-| `no backlog approval is recorded for $slug in .openbuilder/epics/$epic/state.json.` | this slug was never approved (exit 4) — an approval for another slug does not satisfy it | `(cd <clone> && local/bin/ob-gate record <epic> backlog <slug>)`, then dispatch again |
+| `no backlog approval is recorded for $slug in .openbuilder/epics/$epic/state.json.` | this slug was never approved (exit 4) — an approval for another slug does not satisfy it | `(cd <clone> && <control-repo>/local/bin/ob-gate record <epic> backlog <slug>)`, then dispatch again |
 | `no backlog approval is recorded` (status `UNAPPR` = `yes`) | rule 4b would decline this plan branch on every poll pass, silently | approve the backlog, or delete the branch |
 | `'ob-gate stage $epic dispatched' failed; no plan branch was created` | the stage pointer did not move | investigate `ob-gate` and re-dispatch |
 | `refusing to cut` | `state.json` on the design branch still says `stage: backlog` after the stage call — cutting now would carry `stage: backlog`, which rule 4b declines forever | fix the stage ordering bug; the assertion exists to catch it |
@@ -1231,7 +1234,7 @@ the artifact as it now is and re-record the approval from inside the clone:
 
 ```sh
 git -C <clone> add <artifact> && git -C <clone> commit -m 'fix: ...'
-(cd <clone> && local/bin/ob-gate record <epic> prd|rfc|backlog <slug>)
+(cd <clone> && <control-repo>/local/bin/ob-gate record <epic> prd|rfc|backlog <slug>)
 ```
 
 Then re-run the command that refused. For a backlog slug the re-record also re-commits and re-pushes

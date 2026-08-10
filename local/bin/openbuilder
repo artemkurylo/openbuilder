@@ -981,7 +981,6 @@ EOF
 ob_review_watch() {
     local repo=$1 pr=$2
     ob_need git gh omp aws jq
-    ob_ensure_running
 
     local dir
     dir=$(ob_ensure_clone "$repo")
@@ -991,10 +990,11 @@ ob_review_watch() {
     marker_dir="$OB_CACHE_DIR/review"
     mkdir -p "$marker_dir"
     marker="$marker_dir/$(ob_repo_key "$repo")__$pr"
-    # Sanitise the instance-side attempt cap the way ob-poll does: strip
-    # non-digits, then default to 6.
-    rounds_max=${OPENBUILDER_MAX_ATTEMPTS//[^0-9]/}
-    rounds_max=${rounds_max:-6}
+    # Sanitise the instance-side attempt cap the way ob-poll does. Default
+    # BEFORE stripping: OPENBUILDER_MAX_ATTEMPTS is normally unset on the
+    # laptop, and ${VAR//[^0-9]/} on an unset var is a set -u fatal, not empty.
+    rounds_max=${OPENBUILDER_MAX_ATTEMPTS:-6}
+    rounds_max=${rounds_max//[^0-9]/}
     rounds=0
 
     ob_info "watching $repo#$pr every ${OB_WATCH_INTERVAL}s, at most $rounds_max review rounds (Ctrl-C to stop)"
@@ -1080,7 +1080,7 @@ EOF
 
             ndjson="$marker_dir/$(ob_repo_key "$repo")__$pr.round-$(printf '%02d' "$rounds").ndjson"
             rc=0
-            GH_REPO="$repo" omp --cwd "$dir" -p --no-pty --mode json --approval-mode yolo --auto-approve \
+            GH_HOST=github.com GH_REPO="$repo" omp --cwd "$dir" -p --no-pty --mode json --approval-mode yolo --auto-approve \
                 --no-session --max-time "$OB_WATCH_MAX_TIME" --model "$OB_OPUS_MODEL" \
                 --append-system-prompt "openbuilder reviewer session for $repo pull request #$pr. Read-only on the branch: comment and label, never merge, never push." \
                 "$seed" >"$ndjson" 2>&1 || rc=$?
@@ -1148,6 +1148,21 @@ cmd_request_changes() {
 # land
 # ---------------------------------------------------------------------------
 
+# ob_slug_landed <repo> <slug> — has this slug's work branch ever been merged?
+# Positive evidence of landing: a pull request whose head branch is exactly
+# openbuilder/work/<slug> and whose state is merged. Absence of a plan ref is
+# NOT evidence — a slug that was never dispatched has no plan ref either, and
+# its approved artifacts live only on the design branch until it is, so land
+# decides whether to keep the design branch on this predicate, never on ref
+# absence (RFC §3.7 step 4: a slug that was never dispatched is unlanded).
+ob_slug_landed() {
+    local repo=$1 slug=$2 count
+    count=$(ob_gh pr list --repo "$repo" --head "$OB_BRANCH_PREFIX/work/$slug" \
+        --state merged --json headRefName |
+        jq -r --arg w "$OB_BRANCH_PREFIX/work/$slug" '[.[] | select(.headRefName == $w)] | length') || return 1
+    [[ -n $count && $count -gt 0 ]]
+}
+
 # cmd_land <owner/repo> <pr> — the only merge path, and the only teardown
 # (RFC §3.7). Refuses every unsafe state before any destructive call, merges
 # with `--squash --delete-branch`, deletes the plan branch, deletes the design
@@ -1210,16 +1225,22 @@ cmd_land() {
         slugs+=("$s")
     done <<<"$(jq -r '.slugs[]' <<<"$state_json")"
 
-    # A slug from state.json.slugs is unlanded while its plan ref is still
-    # present; land deletes the plan branch, so absence of the ref is the
-    # landed signal. First listing feeds the confirmation display (this slug
-    # excluded — its ref still exists until step 8).
-    local plan_refs keep_design=0
-    plan_refs=$(ob_gh api "repos/$repo/git/matching-refs/heads/$OB_BRANCH_PREFIX/plan/" --jq '.[].ref' 2>/dev/null || true)
+    # A slug from state.json.slugs counts as unlanded until there is positive
+    # evidence it landed — a merged PR for its openbuilder/work/ branch. Absence
+    # of a plan ref is NOT that evidence (a never-dispatched slug has none, and
+    # its approved artifacts live only on the design branch), so land keeps the
+    # design branch for any listed slug that has not landed. This slug is
+    # excluded: it is the one being merged right now. Computed once, before the
+    # merge, because nothing it reads changes during this command.
+    local keep_design=0
+    local -a unlanded_slugs=()
     for s in "${slugs[@]}"; do
         [[ $s == "$slug" ]] && continue
-        if printf '%s\n' "$plan_refs" | grep -qxF "refs/heads/$OB_BRANCH_PREFIX/plan/$s"; then
+        if ob_slug_landed "$repo" "$s"; then
+            :
+        else
             keep_design=1
+            unlanded_slugs+=("$s")
         fi
     done
 
@@ -1249,7 +1270,6 @@ cmd_land() {
     [[ $answer == "land $slug" ]] ||
         ob_die "confirmation did not match \"land $slug\"; nothing was merged and nothing was deleted"
 
-    local unlanded=0
     ob_gh pr merge "$pr" --repo "$repo" --squash --delete-branch ||
         ob_die "gh pr merge $pr failed; nothing was deleted"
     ob_info "merged $repo#$pr and deleted $head"
@@ -1259,17 +1279,7 @@ cmd_land() {
     fi
     ob_info "deleted $plan_branch"
 
-    # Re-list after the plan-branch deletion so this slug is no longer among
-    # the survivors; any remaining ref from state.json.slugs keeps the design
-    # branch alive for the rest of the epic.
-    plan_refs=$(ob_gh api "repos/$repo/git/matching-refs/heads/$OB_BRANCH_PREFIX/plan/" --jq '.[].ref' 2>/dev/null || true)
-    unlanded=0
-    for s in "${slugs[@]}"; do
-        if printf '%s\n' "$plan_refs" | grep -qxF "refs/heads/$OB_BRANCH_PREFIX/plan/$s"; then
-            unlanded=1
-        fi
-    done
-    if [[ $unlanded -eq 1 ]]; then
+    if [[ $keep_design -eq 1 ]]; then
         ob_info "keeping $design_branch — epic $epic has unlanded slugs"
     else
         if ! ob_gh api -X DELETE "repos/$repo/git/refs/heads/$design_branch" >/dev/null 2>&1; then
@@ -1285,13 +1295,11 @@ cmd_land() {
     printf 'landed %s#%s :: %s\n' "$repo" "$pr" "$slug"
     printf 'deleted %s\n' "$head"
     printf 'deleted %s\n' "$plan_branch"
-    if [[ $unlanded -eq 1 ]]; then
+    if [[ $keep_design -eq 1 ]]; then
         printf 'kept %s (unlanded slugs remain)\n' "$design_branch"
         printf 'epic %s still has unlanded slugs. Dispatch the next one:\n' "$epic"
-        for s in "${slugs[@]}"; do
-            if printf '%s\n' "$plan_refs" | grep -qxF "refs/heads/$OB_BRANCH_PREFIX/plan/$s"; then
-                printf '  %s dispatch %s %s\n' "$OB_PROG" "$repo" "$s"
-            fi
+        for s in "${unlanded_slugs[@]}"; do
+            printf '  %s dispatch %s %s\n' "$OB_PROG" "$repo" "$s"
         done
     else
         printf 'deleted %s\n' "$design_branch"
