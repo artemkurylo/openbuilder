@@ -1,0 +1,13 @@
+{
+  "stage": "dispatched",
+  "approvals": {
+    "backlog": {
+      "demo-slug": {
+        "files": {
+          "plan.md": "blob-plan-md",
+          "story-01-x.md": "blob-story-01-x"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# rule4b-parity-lib.sh — the injection rig shared by the rule 4b parity cases
+# (tests/cases/rule4b-parity*.sh). Sourced after tests/lib.sh; not a case file
+# itself, which is why it lives beside tests/lib.sh and not under tests/cases/.
+#
+# Rule 4b decides whether the EC2 instance powers on, and it is implemented
+# twice: `backlog_decline_reason` in runner/bin/ob-poll (bash, on the instance)
+# and in waker/github.py (python, in a Lambda that ticks every five minutes).
+# A one-sided change either bills the owner forever or never wakes the box, so
+# the two must agree byte for byte. This rig runs both halves offline by
+# replacing the one I/O boundary each of them has:
+#
+#   bash   — every GitHub read goes through `ob_gh api`; we extract the four
+#            rule 4b functions out of ob-poll (which cannot be sourced: it ends
+#            in `main "$@"`) and define `ob_gh` as a fixture reader.
+#   python — every GitHub read goes through `_contents` / `_backlog_files`;
+#            tests/cases/rule4b_waker.py monkeypatches exactly those two and
+#            reads the same fixture tree. waker/github.py is not modified.
+#
+# Fixture tree, one directory per case, mirroring the paths GitHub is asked for:
+#   tests/fixtures/rule4b/<case>/contents/<repo-path>      file body
+#   tests/fixtures/rule4b/<case>/listings/<repo-path>.json directory listing
+# A path the fixture omits is a 404 in both halves.
+#
+# Both halves are run ONCE per case file, over every fixture directory, and the
+# outcomes are cached on disk; the assertions then read the cache. Spawning a
+# python interpreter per case cost seconds on a pyenv shim.
+
+RULE4B_REPO='acme/widgets'
+RULE4B_PREFIX='obtest'
+RULE4B_SLUG='demo-slug'
+RULE4B_FIXTURES="${TESTS_ROOT}/tests/fixtures/rule4b"
+RULE4B_WAKER="${TESTS_ROOT}/tests/cases/rule4b_waker.py"
+RULE4B_WORK=''
+RULE4B_EXTRACT=''
+RULE4B_DRIVER=''
+# Fixture case names rule4b_parity has been asked about, so a case file can
+# assert that no fixture directory sits there uncovered.
+RULE4B_EXERCISED=''
+
+# rule4b_skip_unless_present — SKIP the whole case file unless both halves of
+# rule 4b exist in the working tree. Rule 4b landed on main in PR #5; on a branch
+# that predates the merge a parity test cannot find its subjects, and must say so
+# rather than pass.
+rule4b_skip_unless_present() {
+  if ! grep -Fq 'backlog_decline_reason() {' "${TESTS_ROOT}/runner/bin/ob-poll" ||
+    ! grep -Fq 'def backlog_decline_reason(' "${TESTS_ROOT}/waker/github.py"; then
+    skip 'rule 4b not on this branch yet (PR #5)'
+  fi
+  # ob-poll's rule 4b uses mapfile and associative arrays.
+  if ((BASH_VERSINFO[0] < 4)); then
+    skip "ob-poll's rule 4b needs bash >= 4, this is bash ${BASH_VERSION}"
+  fi
+}
+
+# rule4b_setup — extract the bash half, assert the extraction actually found the
+# function bodies (without those assertions a renamed function would turn every
+# case below into a comparison of two empty strings), then run both halves over
+# the whole fixture tree.
+rule4b_setup() {
+  local extracted
+  RULE4B_WORK="$(tmpdir)"
+  RULE4B_EXTRACT="${RULE4B_WORK}/rule4b-from-ob-poll.sh"
+  RULE4B_DRIVER="${RULE4B_WORK}/driver.sh"
+  mkdir -p "${RULE4B_WORK}/bash" "${RULE4B_WORK}/python"
+
+  awk '
+    /^(safe_field|gh_contents_raw|backlog_listing|backlog_decline_reason)\(\) [{]$/ { keep = 1 }
+    keep { print }
+    keep && /^[}]$/ { keep = 0; print "" }
+  ' "${TESTS_ROOT}/runner/bin/ob-poll" >"$RULE4B_EXTRACT"
+
+  extracted="$(cat "$RULE4B_EXTRACT")"
+  assert_contains 'safe_field() {' "$extracted" \
+    'extraction: safe_field lifted out of runner/bin/ob-poll'
+  assert_contains 'gh_contents_raw() {' "$extracted" \
+    'extraction: gh_contents_raw lifted out of runner/bin/ob-poll'
+  assert_contains 'backlog_listing() {' "$extracted" \
+    'extraction: backlog_listing lifted out of runner/bin/ob-poll'
+  assert_contains 'backlog_decline_reason() {' "$extracted" \
+    'extraction: backlog_decline_reason lifted out of runner/bin/ob-poll'
+  assert_contains 'backlog-unapproved:no-approval' "$extracted" \
+    'extraction: whole function bodies came across, not just signatures'
+  assert_status 0 'extraction: the extracted rule 4b code parses as bash' \
+    -- bash -n "$RULE4B_EXTRACT"
+
+  _rule4b_write_driver
+  RULE4B_LIB="$RULE4B_EXTRACT" bash "$RULE4B_DRIVER" "$RULE4B_FIXTURES" \
+    "$RULE4B_PREFIX" reason_many "${RULE4B_WORK}/bash" "$RULE4B_REPO" "$RULE4B_SLUG"
+  # PYTHONDONTWRITEBYTECODE: importing waker/github.py would otherwise drop a
+  # waker/__pycache__ into the working tree, and a test must leave no trace.
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${TESTS_ROOT}/waker" python3 "$RULE4B_WAKER" reason_many \
+    "$RULE4B_FIXTURES" "${RULE4B_WORK}/python" "$RULE4B_REPO" "$RULE4B_PREFIX" "$RULE4B_SLUG"
+}
+
+# _rule4b_write_driver — the bash half plus its stubbed GitHub boundary.
+_rule4b_write_driver() {
+  cat >"$RULE4B_DRIVER" <<'RULE4B_DRIVER_EOF'
+#!/usr/bin/env bash
+# Generated by tests/rule4b-parity-lib.sh. Runs ob-poll's rule 4b functions with
+# their single GitHub boundary served from a fixture directory.
+# Usage: driver.sh <fixtures-root> <branch-prefix> reason_many <out-dir> <repo> <slug>
+#        driver.sh <fixtures-root> <branch-prefix> safe_field_many <limit> <value> ...
+# Env: RULE4B_LIB — the functions extracted from runner/bin/ob-poll.
+set -euo pipefail
+IFS=$'\n\t'
+
+FIXTURES="$1"
+OPENBUILDER_BRANCH_PREFIX="$2"
+MODE="$3"
+shift 3
+[[ -d "$FIXTURES" ]] || {
+  printf 'no such fixture root: %s\n' "$FIXTURES" >&2
+  exit 3
+}
+FIXTURE=''
+RULE4B_REQUEST_LOG='/dev/null'
+
+# ob_gh api [-H <header>]... <endpoint> [--jq <filter>] — stands in for
+# `gh api`. rule 4b only ever asks for repos/<repo>/contents/<path>?ref=<ref>:
+# with the raw Accept header it wants a file body, otherwise a JSON directory
+# listing that it filters with --jq. A path the fixture omits exits 1, the way
+# `gh api` fails on a 404.
+ob_gh() {
+  local raw=0 endpoint='' filter='' path ref file
+  shift # the literal `api`
+  while (($# > 0)); do
+    case "$1" in
+      -H)
+        case "$2" in *github.raw*) raw=1 ;; esac
+        shift 2
+        ;;
+      --jq)
+        filter="$2"
+        shift 2
+        ;;
+      -*) shift ;;
+      *)
+        endpoint="$1"
+        shift
+        ;;
+    esac
+  done
+  path="${endpoint#*/contents/}"
+  path="${path%%\?*}"
+  ref="${endpoint##*\?ref=}"
+  printf 'GET ref=%s path=%s\n' "$ref" "$path" >>"$RULE4B_REQUEST_LOG"
+  if ((raw)); then
+    file="${FIXTURE}/contents/${path}"
+  else
+    file="${FIXTURE}/listings/${path}.json"
+  fi
+  [[ -f "$file" ]] || return 1
+  if [[ -n "$filter" ]]; then
+    jq -r "$filter" <"$file"
+  else
+    cat "$file"
+  fi
+}
+
+# shellcheck source=/dev/null
+source "$RULE4B_LIB"
+
+case "$MODE" in
+  reason_many)
+    out="$1"
+    repo="$2"
+    slug="$3"
+    for FIXTURE in "$FIXTURES"/*/; do
+      FIXTURE="${FIXTURE%/}"
+      case_name="${FIXTURE##*/}"
+      RULE4B_REQUEST_LOG="${out}/${case_name}.log"
+      : >"$RULE4B_REQUEST_LOG"
+      backlog_decline_reason "$repo" "$slug" >"${out}/${case_name}.reason"
+    done
+    ;;
+  safe_field_many)
+    while (($# > 1)); do
+      safe_field "$2" "$1"
+      printf '\n'
+      shift 2
+    done
+    ;;
+  *)
+    printf 'unknown driver mode: %s\n' "$MODE" >&2
+    exit 3
+    ;;
+esac
+RULE4B_DRIVER_EOF
+}
+
+# rule4b_bash_reason <fixture-case> — ob-poll's cached reason for a fixture.
+rule4b_bash_reason() {
+  local file="${RULE4B_WORK}/bash/${1}.reason"
+  if [[ -f "$file" ]]; then
+    cat "$file"
+  else
+    printf 'bash-half-never-ran-for(%s)' "$1"
+  fi
+}
+
+# rule4b_py_reason <fixture-case> — waker/github.py's cached reason.
+rule4b_py_reason() {
+  local file="${RULE4B_WORK}/python/${1}.reason"
+  if [[ -f "$file" ]]; then
+    cat "$file"
+  else
+    printf 'python-half-never-ran-for(%s)' "$1"
+  fi
+}
+
+# rule4b_parity <fixture-case> <expected-reason> <label> — assert both halves
+# return <expected-reason>, that they agree byte for byte, and that they asked
+# GitHub for the same refs and paths in the same order. <expected-reason> is the
+# empty string for an approved backlog.
+rule4b_parity() {
+  local case_dir="$1" expected="$2" label="$3"
+  local from_bash from_python
+  RULE4B_EXERCISED="${RULE4B_EXERCISED}${case_dir}
+"
+  from_bash="$(rule4b_bash_reason "$case_dir")"
+  from_python="$(rule4b_py_reason "$case_dir")"
+  assert_eq "$expected" "$from_bash" "${label} — ob-poll (bash)"
+  assert_eq "$expected" "$from_python" "${label} — waker/github.py (python)"
+  assert_eq "$from_bash" "$from_python" "${label} — the two halves agree byte for byte"
+  assert_eq "$(cat "${RULE4B_WORK}/bash/${case_dir}.log" 2>/dev/null || true)" \
+    "$(cat "${RULE4B_WORK}/python/${case_dir}.log" 2>/dev/null || true)" \
+    "${label} — both halves read the same refs and paths"
+}
+
+# rule4b_assert_every_fixture_exercised <fixture-case-covered-elsewhere>... —
+# assert that every directory under tests/fixtures/rule4b was passed to
+# rule4b_parity by this case file, except the ones named here. A fixture nobody
+# asserts on is the failure mode that matters most: the tree still looks
+# complete, the suite still passes, and the outcome it was built to pin down is
+# no longer covered by anything.
+rule4b_assert_every_fixture_exercised() {
+  local dir name on_disk=''
+  for dir in "$RULE4B_FIXTURES"/*/; do
+    name="${dir%/}"
+    name="${name##*/}"
+    case " $* " in
+      *" ${name} "*) continue ;;
+    esac
+    on_disk="${on_disk}${name}
+"
+  done
+  assert_eq "$(printf '%s' "$on_disk" | LC_ALL=C sort)" \
+    "$(printf '%s' "$RULE4B_EXERCISED" | LC_ALL=C sort)" \
+    'every fixture under tests/fixtures/rule4b is asserted on by a case here'
+}
+
+# rule4b_safe_field_parity <value> <limit> <expected> <label> [... more quads] —
+# the scrubbing helpers, safe_field (bash) and _safe_field (python), on the same
+# hostile inputs. A scrubbed value can never contain a newline, so one result per
+# line is unambiguous. Takes the whole table at once: both halves run in a single
+# process each.
+rule4b_safe_field_parity() {
+  local -a values=() limits=() expected=() labels=() args=() bash_out=() python_out=()
+  local index line
+  while (($# >= 4)); do
+    values+=("$1")
+    limits+=("$2")
+    expected+=("$3")
+    labels+=("$4")
+    args+=("$2" "$1")
+    shift 4
+  done
+  while IFS= read -r line; do
+    bash_out+=("$line")
+  done < <(RULE4B_LIB="$RULE4B_EXTRACT" bash "$RULE4B_DRIVER" "$RULE4B_FIXTURES" \
+    "$RULE4B_PREFIX" safe_field_many "${args[@]}")
+  while IFS= read -r line; do
+    python_out+=("$line")
+  done < <(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${TESTS_ROOT}/waker" \
+    python3 "$RULE4B_WAKER" safe_field_many "${args[@]}")
+  for index in "${!values[@]}"; do
+    assert_eq "${expected[index]}" "${bash_out[index]:-<no bash output>}" \
+      "${labels[index]} — safe_field (bash)"
+    assert_eq "${expected[index]}" "${python_out[index]:-<no python output>}" \
+      "${labels[index]} — _safe_field (python)"
+    assert_eq "${bash_out[index]:-<no bash output>}" "${python_out[index]:-<no python output>}" \
+      "${labels[index]} — the two scrubbers agree byte for byte"
+  done
+}

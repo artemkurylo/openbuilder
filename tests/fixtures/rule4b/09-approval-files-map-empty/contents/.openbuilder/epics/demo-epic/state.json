@@ -1,0 +1,10 @@
+{
+  "stage": "dispatched",
+  "approvals": {
+    "backlog": {
+      "demo-slug": {
+        "files": {}
+      }
+    }
+  }
+}

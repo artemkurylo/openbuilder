@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# tests/run — the openbuilder test runner.
+#
+# Usage:  tests/run [pattern]
+#
+# Runs every tests/cases/*.sh whose filename contains <pattern> (all of them
+# when absent), each in its own bash subshell with TESTS_LIB and TESTS_ROOT
+# exported and cwd at the repo root. Case files emit unnumbered result lines
+# through tests/lib.sh; this script numbers them, counts them and decides the
+# exit status. Everything else a case prints on stdout becomes a `#` diagnostic;
+# a case's stderr (the library under test logs there) passes straight through.
+#
+# Hermetic by default: nothing here touches the network. A case that needs it
+# calls skip_unless_live and is skipped unless OB_TEST_LIVE=1.
+set -uo pipefail
+
+TESTS_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+TESTS_LIB="${TESTS_ROOT}/tests/lib.sh"
+export TESTS_ROOT TESTS_LIB
+# A case file that imports from waker/ would otherwise drop a waker/__pycache__
+# into the working tree. A test run must leave no trace in the repo, so the
+# runner forbids bytecode for every case rather than trusting each one to.
+export PYTHONDONTWRITEBYTECODE=1
+cd -- "$TESTS_ROOT" || exit 1
+
+pattern="${1:-}"
+
+files=()
+for f in tests/cases/*.sh; do
+  [ -f "$f" ] || continue
+  case "$(basename -- "$f")" in
+  *"$pattern"*) files+=("$f") ;;
+  esac
+done
+
+if [ "${#files[@]}" -eq 0 ]; then
+  if [ -n "$pattern" ]; then
+    printf 'no case file in tests/cases/ matches %s\n' "$pattern" >&2
+  else
+    printf 'no case files in tests/cases/\n' >&2
+  fi
+  exit 1
+fi
+
+n=0
+passed=0
+failed=0
+todos=0
+skipped=0
+
+# _emit <ok|not ok> <label-with-trailing-marker>
+_emit() {
+  n=$((n + 1))
+  printf '%s %d - %s\n' "$1" "$n" "$2"
+}
+
+for f in "${files[@]}"; do
+  printf '# %s\n' "$f"
+  out=''
+  rc=0
+  out="$(bash "$f")" || rc=$?
+  emitted=0
+  while IFS= read -r line; do
+    case "$line" in
+    'ok - '*)
+      emitted=$((emitted + 1))
+      rest="${line#ok - }"
+      case "$line" in
+      *' # SKIP '*) skipped=$((skipped + 1)) ;;
+      *' # TODO '*) todos=$((todos + 1)) ;;
+      *) passed=$((passed + 1)) ;;
+      esac
+      _emit 'ok' "$rest"
+      ;;
+    'not ok - '*)
+      emitted=$((emitted + 1))
+      failed=$((failed + 1))
+      _emit 'not ok' "${line#not ok - }"
+      ;;
+    '') ;;
+    *) printf '# %s\n' "$line" ;;
+    esac
+  done <<<"$out"
+
+  if [ "$rc" -ne 0 ]; then
+    failed=$((failed + 1))
+    _emit 'not ok' "$f # case file exited ${rc}"
+  elif [ "$emitted" -eq 0 ]; then
+    # A case file that ends quietly has verified nothing; that must never read
+    # as green. skip/skip_unless_live always emit a SKIP result instead.
+    failed=$((failed + 1))
+    _emit 'not ok' "$f # no assertions emitted"
+  fi
+done
+
+printf '%d passed, %d failed, %d todo, %d skipped\n' \
+  "$passed" "$failed" "$todos" "$skipped"
+
+[ "$failed" -eq 0 ] || exit 1

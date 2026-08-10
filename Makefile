@@ -17,7 +17,7 @@ CACHE_DIR := $${XDG_CACHE_HOME:-$$HOME/.cache}/openbuilder
 
 .DEFAULT_GOAL := help
 
-.PHONY: help init plan-tf apply destroy secrets doctor shell logs status fmt lint scrub hooks repo-create
+.PHONY: help init plan-tf apply destroy secrets doctor shell logs status fmt lint scrub hooks repo-create test
 
 help: ## Show this help
 	@printf 'openbuilder — control plane for autonomous agentic coding\n\n'
@@ -76,6 +76,9 @@ status: ## Show slugs, branches, PRs and labels (make status REPO=owner/repo)
 
 fmt: ## terraform fmt -recursive
 	terraform fmt -recursive
+
+test: ## Run the test suite in tests/cases (hermetic; OB_TEST_LIVE=1 adds the live cases)
+	@tests/run
 
 lint: ## shellcheck every shell script (skipped when shellcheck is absent)
 	@if ! command -v shellcheck >/dev/null 2>&1; then \

@@ -155,6 +155,33 @@ response, an exact string in an output, or a test that must pass. It should neve
 | Tests are added | `test/health.test.js` exists and `npm test` passes, including a case for the 503 path |
 | The endpoint is documented | `README.md` contains a `## Health check` section documenting the route and both status codes |
 
+### Prefer a committed test over a command the round runs once
+
+Mechanically checkable is the floor, not the goal. A criterion the round satisfies by running a command
+proves the behaviour on one revision and then evaporates with the transcript; the next round can
+reintroduce the same defect and nothing objects. So when the behaviour is testable, the criterion must
+name **a test the round commits**, and the test must be wired into `make test`.
+
+| Evaporates | Defends the behaviour |
+|---|---|
+| `ob_epic_name` prints nothing for a plan.md with no `- epic:` line | `tests/cases/runner-epic-docs.sh` asserts all five extraction cases and `tests/run runner-epic-docs` passes |
+| both halves of the rule table agree, checked against live fixture branches | `tests/cases/rule4b-parity.sh` asserts the two implementations return byte-identical reasons for every outcome, with both HTTP boundaries stubbed, and passes offline |
+| `land` refuses an unapproved pull request | a case asserts the refusal AND that the stubbed `gh` call log contains no `pr merge` |
+
+Three consequences worth stating, because each one is a place a round will otherwise take the easy path:
+
+- **Hermetic beats faithful.** A test that needs the network, a token or the instance runs when someone
+  remembers; a test with its I/O boundaries stubbed runs on every change. Stub the boundary and assert the
+  decision. Keep a live variant behind `OB_TEST_LIVE=1` when the real integration is worth exercising.
+- **A defect you must not fix yet is still a test.** Register it as a TODO with the reason and the slug
+  that will fix it. It stays green today and turns red the moment the fix lands, which is what makes it a
+  guard rather than a note.
+- **Assert the effect, and assert what did NOT happen.** For anything irreversible — a merge, a push, a
+  branch deletion — the test must also prove the refusal path made no such call. Exit codes lie
+  (LEARNINGS 18, 19, 24); a call log does not.
+
+A round that verified something worth keeping and left no test behind has not finished the card.
+
 ## Template
 
 Copy this and fill it in. This is a complete, valid card.
