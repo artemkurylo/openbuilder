@@ -13,6 +13,11 @@ the instance is stopped AND at least one slug is actionable. It never stops the
 instance: that decision stays with the instance itself, which is the only party
 that knows whether a job is mid-flight.
 
+The rule table now includes rule 4b, the backlog approval gate: unlike rules 1
+and 4, which are instance-local state this function cannot see, rule 4b is fully
+visible from GitHub, at the cost of three extra contents reads per plan branch
+that has no pull request.
+
 The whole run is one API-Gateway-free, VPC-free, dependency-free function, so a
 tick costs microcents and sits inside the perpetual free tier.
 """

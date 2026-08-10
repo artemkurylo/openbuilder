@@ -6,7 +6,9 @@
 # Deliberate logging rule: an uneventful pass writes NOTHING to
 # $OPENBUILDER_HOME/log/openbuilder.log — decisions go to stdout (the journal)
 # only. ob-idle-stop treats the log's mtime as "when work last happened", so a
-# chatty poll pass would keep the instance awake forever.
+# chatty poll pass would keep the instance awake forever. Rule 4b reads the plan
+# branch's backlog approval and declines with action=skip when it is missing, so
+# a decline costs no attempt, no label, no comment and no log line.
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -48,6 +50,122 @@ list_plan_refs() {
   ob_gh api \
     "repos/${repo}/git/matching-refs/heads/${OPENBUILDER_BRANCH_PREFIX}/plan/" \
     --jq '.[].ref' 2>/dev/null || true
+}
+
+# safe_field <value> <max-len> — scrub a value that came from branch content so
+# it cannot break the key=value shape of a DECISION line. Keeps only
+# [A-Za-z0-9._-], truncates to <max-len>, prints `-` when empty. Always returns 0.
+safe_field() {
+  local value="$1" max="$2" out
+  out="${value//[^A-Za-z0-9._-]/}"
+  out="${out:0:max}"
+  if [[ -z "$out" ]]; then
+    printf '%s' '-'
+  else
+    printf '%s' "$out"
+  fi
+  return 0
+}
+
+# gh_contents_raw <owner/repo> <ref> <path> — the body of a file at a ref, on
+# stdout; the `raw` Accept header returns the bytes directly. Empty output means
+# unreadable (404, 502, rate limit). `gh api` prints a non-2xx response body to
+# stdout and fails non-zero, so the exit status is what distinguishes a missing
+# file from a real body; stderr is discarded.
+gh_contents_raw() {
+  local repo="$1" ref="$2" path="$3" out rc=0
+  out="$(ob_gh api -H "Accept: application/vnd.github.raw" \
+    "repos/${repo}/contents/${path}?ref=${ref}" 2>/dev/null)" || rc=$?
+  if ((rc != 0)); then
+    return 0
+  fi
+  printf '%s' "$out"
+}
+
+# backlog_listing <owner/repo> <ref> <dir> — one `name<TAB>sha` line per file
+# entry of a directory listing at a ref. An entry's sha is the git blob sha, so
+# the file-set check needs no card content. Empty output means unreadable.
+backlog_listing() {
+  local repo="$1" ref="$2" dir="$3" out rc=0
+  out="$(ob_gh api "repos/${repo}/contents/${dir}?ref=${ref}" \
+    --jq '.[] | select(.type == "file") | "\(.name)\t\(.sha)"' 2>/dev/null)" || rc=$?
+  if ((rc != 0)); then
+    return 0
+  fi
+  printf '%s\n' "$out"
+}
+
+# backlog_decline_reason <owner/repo> <slug> — rule 4b. Reads the plan branch's
+# backlog approval from GitHub and prints the reason string (no trailing newline)
+# when the backlog is not approved; prints nothing when it is. Always returns 0:
+# a non-zero return would abort the pass under `set -e`, and a decline has no
+# side effect, so a read failure is reported as the same reason as an absent file.
+backlog_decline_reason() {
+  local repo="$1" slug="$2"
+  local ref dir body epic stage recorded_entries
+  local -A recorded=() listed=()
+  local -a listing=() all_names=() names=()
+  local name sha n rsha lsha
+
+  ref="${OPENBUILDER_BRANCH_PREFIX}/plan/${slug}"
+  dir=".openbuilder/backlog/${slug}"
+
+  body="$(gh_contents_raw "$repo" "$ref" "${dir}/plan.md")" || true
+  epic="$(printf '%s' "$body" | awk '/^- epic:/ {print $3; exit}')" || true
+  if [[ -z "$body" || -z "$epic" || ! "$epic" =~ ^[a-z0-9][a-z0-9-]{1,48}$ ]]; then
+    printf 'backlog-unapproved:no-epic-line'
+    return 0
+  fi
+
+  body="$(gh_contents_raw "$repo" "$ref" ".openbuilder/epics/${epic}/state.json")" || true
+  if [[ -z "$body" ]] || ! printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
+    printf 'backlog-unapproved:no-state'
+    return 0
+  fi
+
+  stage="$(printf '%s' "$body" | jq -r '.stage // empty' 2>/dev/null)" || true
+  if [[ "$stage" != "dispatched" ]]; then
+    printf 'backlog-unapproved:stage=%s' "$(safe_field "$stage" 32)"
+    return 0
+  fi
+
+  recorded_entries="$(printf '%s' "$body" | jq -r --arg s "$slug" \
+    '.approvals.backlog[$s].files // {} | to_entries[] | "\(.key)\t\(.value)"' 2>/dev/null)" || true
+  if [[ -z "$recorded_entries" ]]; then
+    printf 'backlog-unapproved:no-approval'
+    return 0
+  fi
+
+  mapfile -t listing < <(backlog_listing "$repo" "$ref" "$dir")
+  while IFS=$'\t' read -r name sha; do
+    [[ -n "$name" ]] || continue
+    listed["$name"]="$sha"
+  done < <(printf '%s\n' "${listing[@]+"${listing[@]}"}")
+  while IFS=$'\t' read -r name sha; do
+    [[ -n "$name" ]] || continue
+    recorded["$name"]="$sha"
+  done < <(printf '%s\n' "$recorded_entries")
+
+  for n in "${!recorded[@]}"; do
+    all_names+=("$n")
+  done
+  for n in "${!listed[@]}"; do
+    if [[ "$n" == "plan.md" || "$n" == story-*.md ]]; then
+      all_names+=("$n")
+    fi
+  done
+  mapfile -t names < <(printf '%s\n' "${all_names[@]}" | LC_ALL=C sort -u)
+
+  for name in "${names[@]}"; do
+    rsha="${recorded[$name]:-}"
+    lsha="${listed[$name]:-}"
+    if [[ -z "$rsha" || -z "$lsha" || "$rsha" != "$lsha" ]]; then
+      printf 'backlog-unapproved:files-differ(%s)' "$(safe_field "$name" 48)"
+      return 0
+    fi
+  done
+
+  return 0
 }
 
 # run_action <script-name> <args...> — dispatch, unless this is a dry run.
@@ -92,7 +210,7 @@ mark_blocked() {
 # at most one action per slug per pass.
 evaluate() {
   local repo="$1" slug="$2"
-  local key work_branch pr labels attempts
+  local key work_branch pr labels attempts reason
 
   key="$(ob_slug_key "$repo" "$slug")"
   work_branch="${OPENBUILDER_BRANCH_PREFIX}/work/${slug}"
@@ -127,6 +245,15 @@ evaluate() {
     decision "$repo" "$slug" 4 block "attempts=${attempts}/${MAX_ATTEMPTS}"
     mark_blocked "$repo" "$slug" "$pr" "$attempts"
     return 0
+  fi
+
+  # --- Rule 4b: plan branch present, no PR, backlog not approved -> skip quietly.
+  if [[ -z "$pr" ]]; then
+    reason="$(backlog_decline_reason "$repo" "$slug")"
+    if [[ -n "$reason" ]]; then
+      decision "$repo" "$slug" 4b skip "$reason"
+      return 0
+    fi
   fi
 
   # --- Rule 5: no PR with head <prefix>/work/<slug> -> implement.
