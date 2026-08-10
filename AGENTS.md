@@ -72,6 +72,19 @@ So: dispatch the review, let it post its own verdict and label, and read the res
 than as a formality. When it disagrees with the session that wrote the code, that disagreement is the
 most valuable output the system produces — do not overrule it silently.
 
+**Proven the day the rule was written.** The session that had planned the epic read `plan-workflow-05-cli`
+inline and was heading toward approval: it had checked the dispatch gate, the land refusals and the watch
+loop, and found them sound. A fresh reviewer dispatched for that pull request alone found two blocking
+defects in the same diff. `review --watch` died on its first line under `set -u` — the laptop CLI had
+copied `ob-poll`'s two sanitising lines without `ob-poll`'s default, so the entire unattended-review
+requirement was unreachable as shipped. And `cmd_land` treated "no plan ref exists" as "that slug landed",
+which is equally true of a slug never dispatched — so the first `land` of a multi-slug epic would delete
+the design branch, at that moment the only copy of the epic's intake, PRD, RFC and all forty-four cards,
+including those of a slug not yet built. Both were reproduced, not argued.
+
+The first defect was in code the planning session had read twice. That is the measurement error, exactly:
+it knew what the line was *for*, so it read the intent instead of the line.
+
 ## House rules
 
 - **Verify by running it, not by reading it.** Every claim in these docs was demonstrated. Three of the
