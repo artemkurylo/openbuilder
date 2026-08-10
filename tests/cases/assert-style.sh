@@ -214,7 +214,7 @@ assert_eq '2' "$(count_lines "$flagged")" \
 # relative and the labels below name a real file and line.
 
 scanned=()
-for f in local/bin/* runner/bin/* tests/run tests/lib.sh tests/cases/*.sh; do
+for f in local/bin/* runner/bin/* tests/run tests/*.sh tests/cases/*.sh; do
   [ -f "$f" ] || continue
   scanned+=("$f")
 done
