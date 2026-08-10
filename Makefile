@@ -87,7 +87,7 @@ lint: ## shellcheck every shell script (skipped when shellcheck is absent)
 		exit 0; \
 	fi; \
 	files=''; \
-	for f in runner/bootstrap.sh local/bin/* runner/bin/*; do \
+	for f in runner/bootstrap.sh local/bin/* runner/bin/* tests/run tests/*.sh tests/cases/*.sh; do \
 		if [ -f "$$f" ]; then files="$$files $$f"; fi; \
 	done; \
 	if [ -z "$$files" ]; then \
