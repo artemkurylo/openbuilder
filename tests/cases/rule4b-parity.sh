@@ -70,6 +70,15 @@ rule4b_parity 12-approved-and-matching '' \
 rule4b_parity 13-approved-with-worklog-md '' \
   'approved slug whose listing also carries worklog.md and a subdirectory: still no decline'
 
+# --- no fixture may sit there uncovered ------------------------------------
+# The one fixture not asserted on above is the known bash/python divergence,
+# which needs a file of its own because it is marked TODO. If that file were
+# deleted, its fixture would go unexercised, so this pins the hand-off too.
+rule4b_assert_every_fixture_exercised 14-state-json-valid-json-not-an-object
+assert_contains '14-state-json-valid-json-not-an-object' \
+  "$(cat "${TESTS_ROOT}/tests/cases/rule4b-parity-nonobject-state.sh")" \
+  'the one fixture excluded above is still claimed by the sibling TODO case file'
+
 # --- the scrubbing helper both halves use for a reason field ---------------
 # safe_field / _safe_field keep only [A-Za-z0-9._-], truncate to the limit, and
 # render empty as `-`. It runs on branch content, so it is what stops a hostile

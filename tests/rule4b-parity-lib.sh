@@ -34,10 +34,14 @@ RULE4B_WAKER="${TESTS_ROOT}/tests/cases/rule4b_waker.py"
 RULE4B_WORK=''
 RULE4B_EXTRACT=''
 RULE4B_DRIVER=''
+# Fixture case names rule4b_parity has been asked about, so a case file can
+# assert that no fixture directory sits there uncovered.
+RULE4B_EXERCISED=''
 
 # rule4b_skip_unless_present — SKIP the whole case file unless both halves of
-# rule 4b exist in the working tree. Rule 4b is still unmerged (PR #5), and a
-# parity test that cannot find its subjects must say so, not pass.
+# rule 4b exist in the working tree. Rule 4b landed on main in PR #5; on a branch
+# that predates the merge a parity test cannot find its subjects, and must say so
+# rather than pass.
 rule4b_skip_unless_present() {
   if ! grep -Fq 'backlog_decline_reason() {' "${TESTS_ROOT}/runner/bin/ob-poll" ||
     ! grep -Fq 'def backlog_decline_reason(' "${TESTS_ROOT}/waker/github.py"; then
@@ -212,6 +216,8 @@ rule4b_py_reason() {
 rule4b_parity() {
   local case_dir="$1" expected="$2" label="$3"
   local from_bash from_python
+  RULE4B_EXERCISED="${RULE4B_EXERCISED}${case_dir}
+"
   from_bash="$(rule4b_bash_reason "$case_dir")"
   from_python="$(rule4b_py_reason "$case_dir")"
   assert_eq "$expected" "$from_bash" "${label} — ob-poll (bash)"
@@ -220,6 +226,28 @@ rule4b_parity() {
   assert_eq "$(cat "${RULE4B_WORK}/bash/${case_dir}.log" 2>/dev/null || true)" \
     "$(cat "${RULE4B_WORK}/python/${case_dir}.log" 2>/dev/null || true)" \
     "${label} — both halves read the same refs and paths"
+}
+
+# rule4b_assert_every_fixture_exercised <fixture-case-covered-elsewhere>... —
+# assert that every directory under tests/fixtures/rule4b was passed to
+# rule4b_parity by this case file, except the ones named here. A fixture nobody
+# asserts on is the failure mode that matters most: the tree still looks
+# complete, the suite still passes, and the outcome it was built to pin down is
+# no longer covered by anything.
+rule4b_assert_every_fixture_exercised() {
+  local dir name on_disk=''
+  for dir in "$RULE4B_FIXTURES"/*/; do
+    name="${dir%/}"
+    name="${name##*/}"
+    case " $* " in
+      *" ${name} "*) continue ;;
+    esac
+    on_disk="${on_disk}${name}
+"
+  done
+  assert_eq "$(printf '%s' "$on_disk" | LC_ALL=C sort)" \
+    "$(printf '%s' "$RULE4B_EXERCISED" | LC_ALL=C sort)" \
+    'every fixture under tests/fixtures/rule4b is asserted on by a case here'
 }
 
 # rule4b_safe_field_parity <value> <limit> <expected> <label> [... more quads] —
