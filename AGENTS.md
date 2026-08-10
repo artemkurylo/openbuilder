@@ -9,10 +9,10 @@ bus. The instance is **off by default** — `ob-idle-stop` powers it down, the `
 powers it up when GitHub has work. `docs/architecture.md` is the design authority, `docs/runbook.md` the
 operational one.
 
-## Two standing obligations
+## Three standing obligations
 
 Everything in this repository is operated unattended, at 3am, by something that cannot ask a question.
-That makes two habits load-bearing rather than polite.
+That makes three habits load-bearing rather than polite.
 
 ### 1. Extract the lesson, every time
 
@@ -54,6 +54,23 @@ update whichever of these it just made wrong:
 
 Quote log lines verbatim from the source rather than paraphrasing them — an operator greps for the string
 they actually saw. Mark anything you did not observe yourself as unverified, and say what would verify it.
+
+### 3. Delegate the review; never review in the session that wrote the code
+
+A pull request is reviewed by a **fresh subagent** with no memory of writing it — `openbuilder review`,
+or a `reviewer` agent dispatched for that pull request alone. The session that planned the cards or wrote
+the diff MUST NOT also produce the verdict, even when it is a different model and even when it would be
+faster.
+
+The reason is not process hygiene, it is measurement error. A session that has already convinced itself a
+design is correct re-reads its own reasoning in the diff and calls that agreement. It also knows which
+acceptance items it checked by hand ten minutes ago and quietly trusts them, which is exactly how a
+reported pass becomes an unverified one. A reviewer that starts from the cards, the PRD, the RFC and the
+diff has to earn every conclusion.
+
+So: dispatch the review, let it post its own verdict and label, and read the result as evidence rather
+than as a formality. When it disagrees with the session that wrote the code, that disagreement is the
+most valuable output the system produces — do not overrule it silently.
 
 ## House rules
 
