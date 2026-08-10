@@ -1,0 +1,22 @@
+[
+  {
+    "type": "file",
+    "name": "plan.md",
+    "sha": "blob-plan-md"
+  },
+  {
+    "type": "file",
+    "name": "story-01-x.md",
+    "sha": "blob-story-01-x"
+  },
+  {
+    "type": "file",
+    "name": "worklog.md",
+    "sha": "blob-worklog"
+  },
+  {
+    "type": "dir",
+    "name": "rounds",
+    "sha": "tree-rounds"
+  }
+]
